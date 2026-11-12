@@ -1,0 +1,303 @@
+// エントリーポイント:レンダラ・カメラ・入力・ゲームループの結線。
+
+import * as THREE from '../vendor/three.module.min.js';
+import { CONFIG, CHARACTERS, DEBUG } from './config.js';
+import { World } from './world.js';
+import { createCharacter } from './characters.js';
+import { ParticleFX } from './particles.js';
+import { UI } from './ui.js';
+import { BoardGame } from './board.js';
+import { MinigameManager } from './minigames/harness.js';
+import { audio } from './audio.js';
+import { dbg, installDebugApi } from './debug.js';
+
+// ============ レンダラ ============
+const canvas = document.getElementById('game-canvas');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CONFIG.PIXEL_RATIO_MAX));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 500);
+
+// ============ カメラリグ ============
+class CameraRig {
+  constructor(cam) {
+    this.camera = cam;
+    this.mode = 'overview';
+    this.followChar = null;
+    this.lookPoint = new THREE.Vector3();
+    this.manualPos = new THREE.Vector3();
+    this.manualLook = new THREE.Vector3();
+    this.pos = new THREE.Vector3(0, 38, 50);
+    this.look = new THREE.Vector3(0, 0, 0);
+    this.zoomPunch = 1;   // 1未満で一瞬ズームイン(ドラマ演出)
+    this.roll = 0;        // 目標ロール角(rad)。さかさま島などで使う
+    this._roll = 0;       // いまのロール角
+    this._rollRate = 0;   // 1秒あたり何rad回すか(0 なら回さない)
+    cam.position.copy(this.pos);
+  }
+
+  setOverview() { this.mode = 'overview'; }
+  setFollow(char) { this.mode = 'follow'; this.followChar = char; }
+  setLookAt(p) { this.mode = 'look'; this.lookPoint.copy(p); }
+  setFinale() { this.mode = 'finale'; }
+  // 島ぜんたいを真上気味から見下ろす(だいルーレット用)
+  setWheel() { this.mode = 'wheel'; }
+
+  // カメラを前後軸まわりに傾ける。どのモードとも直交して合成できる。
+  // 一定速で回すので、ゆりもどしが出ない(4歳児が酔わない)。
+  setRoll(angle, seconds = 2.5) {
+    this.roll = angle;
+    this._rollRate = seconds > 0 ? Math.abs(angle - this._roll) / seconds : Infinity;
+  }
+  setManual(pos, look) {
+    this.mode = 'manual';
+    this.manualPos.copy(pos);
+    this.manualLook.copy(look);
+  }
+
+  // 一瞬ぐっと寄る(大きい出目・ばくはつ・かみなり)
+  punch(amount = 0.75) { this.zoomPunch = amount; }
+
+  update(dt, aspect, t) {
+    // 縦画面では引き気味にして全体が見えるように
+    const pf = aspect < 1 ? Math.min(2.0, (1 / aspect) * 0.95) : 1;
+    const desiredPos = new THREE.Vector3();
+    const desiredLook = new THREE.Vector3();
+
+    this.zoomPunch += (1 - this.zoomPunch) * Math.min(1, dt * 2.2);
+    const zp = this.zoomPunch;
+
+    if (this.mode === 'overview') {
+      desiredPos.set(0, 34 * pf, 42 * pf);
+      desiredLook.set(0, 0.5, 0);
+    } else if (this.mode === 'follow' && this.followChar) {
+      const p = this.followChar.root.position;
+      const out = new THREE.Vector3(p.x, 0, p.z);
+      if (out.lengthSq() < 1) out.set(0, 0, 1);
+      out.normalize();
+      desiredPos.copy(p)
+        .addScaledVector(out, 6.8 * pf * zp)
+        .add(new THREE.Vector3(0, 4.4 * pf * zp, 0));
+      desiredLook.copy(p).add(new THREE.Vector3(0, 1, 0));
+    } else if (this.mode === 'look') {
+      desiredPos.copy(this.pos);
+      desiredLook.copy(this.lookPoint);
+    } else if (this.mode === 'manual') {
+      desiredPos.copy(this.manualPos);
+      desiredLook.copy(this.manualLook);
+    } else if (this.mode === 'finale') {
+      const a = t * 0.22;
+      desiredPos.set(Math.cos(a) * 12 * pf, 6.8 * pf, Math.sin(a) * 12 * pf);
+      desiredLook.set(0, 3.2, 0);
+    } else if (this.mode === 'wheel') {
+      // 地面のパイぜんたいと中央タワーの矢印を同時に見せる高さ
+      desiredPos.set(0, 30 * pf, 15 * pf);
+      desiredLook.set(0, 2.0, 0);
+    }
+
+    const k = 1 - Math.exp(-3.2 * dt);
+    this.pos.lerp(desiredPos, k);
+    this.look.lerp(desiredLook, k);
+
+    // ロールは一定速で目標へ寄せる。lookAt は up を見るので up を回すだけで傾く。
+    const step = this._rollRate * dt;
+    this._roll += Math.max(-step, Math.min(step, this.roll - this._roll));
+
+    this.camera.position.copy(this.pos);
+    if (Math.abs(this._roll) > 1e-4) {
+      const fwd = new THREE.Vector3().subVectors(this.look, this.pos).normalize();
+      this.camera.up.set(0, 1, 0).applyAxisAngle(fwd, this._roll);
+    } else {
+      this.camera.up.set(0, 1, 0);
+    }
+    this.camera.lookAt(this.look);
+    this.camera.fov = aspect < 1 ? 58 : 50;
+    this.camera.updateProjectionMatrix();
+  }
+}
+
+const rig = new CameraRig(camera);
+
+// ============ ワールドとキャラ ============
+const world = new World(scene);
+const fx = new ParticleFX(scene);
+const ui = new UI();
+
+// それぞれ別のゾーンの入口からスタート(島じゅうが舞台になる)
+const chars = CHARACTERS.map((def) => createCharacter(def));
+chars.forEach((c, i) => {
+  const a = (i / 4) * Math.PI * 2 + 0.6;
+  const offset = new THREE.Vector3(Math.cos(a) * 0.42, 0, Math.sin(a) * 0.42);
+  c.tileIndex = c.def.startTile;
+  c.root.position.copy(world.tiles[c.tileIndex].pos).add(offset);
+  c.faceTowards(world.tiles[(c.tileIndex + 1) % world.tiles.length].pos);
+  scene.add(c.root);
+});
+
+let playerIndex = 0;
+// スターゲットのスローモーション用。既定値は ?turbo= の加速係数(未指定なら 1)。
+let timeScale = CONFIG.TURBO;
+
+const mgManager = new MinigameManager({ chars, playerIndex, ui, boardScene: scene });
+const board = new BoardGame({
+  scene, world, chars, ui, fx, rig,
+  runMinigame: () => mgManager.run(),
+  setTimeScale: (s) => { timeScale = s; },
+});
+
+// ============ 入力 ============
+const getNdc = (e) => new THREE.Vector2(
+  (e.clientX / window.innerWidth) * 2 - 1,
+  -(e.clientY / window.innerHeight) * 2 + 1,
+);
+
+const tapLayer = document.getElementById('tap-layer');
+tapLayer.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  audio.unlock();
+  if (mgManager.active) {
+    dbg.push({ kind: 'input', to: 'minigame', why: 'accepted' });
+    mgManager.pointerDown(getNdc(e), { x: e.clientX, y: e.clientY });
+  } else if (board.tapHandler) {
+    // ボス・コースターなどボード上のタップイベント
+    dbg.push({ kind: 'input', to: 'board-tap', why: 'accepted' });
+    board.tapHandler(getNdc(e), { x: e.clientX, y: e.clientY });
+  } else {
+    dbg.push({ kind: 'input', to: 'none', why: 'no-handler' });
+  }
+}, { passive: false });
+tapLayer.addEventListener('pointermove', (e) => {
+  e.preventDefault();
+  if (mgManager.active) {
+    mgManager.pointerMove(getNdc(e), { x: e.clientX, y: e.clientY });
+  } else if (board.dragHandler) {
+    // 島変貌イベント中のよこドラッグ
+    board.dragHandler(getNdc(e), { x: e.clientX, y: e.clientY });
+  }
+}, { passive: false });
+
+document.addEventListener('pointerdown', () => audio.unlock(), { capture: true });
+// iOS のダブルタップズーム・ピンチ・長押しメニュー抑止
+document.addEventListener('dblclick', (e) => e.preventDefault(), { passive: false });
+document.addEventListener('gesturestart', (e) => e.preventDefault(), { passive: false });
+document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+const soundBtn = document.getElementById('btn-sound');
+soundBtn.addEventListener('pointerdown', (e) => {
+  e.stopPropagation();
+  audio.unlock();
+  audio.setMuted(!audio.muted);
+  soundBtn.textContent = audio.muted ? '🔇' : '🔊';
+});
+
+// ============ タイトル画面 ============
+const titleScreen = document.getElementById('title-screen');
+const charButtons = document.getElementById('char-buttons');
+const startBtn = document.getElementById('btn-start');
+
+CHARACTERS.forEach((def, i) => {
+  const b = document.createElement('button');
+  b.className = 'char-btn';
+  b.style.background = def.ui;
+  b.textContent = def.emoji;
+  b.setAttribute('aria-label', def.name);
+  b.addEventListener('pointerdown', () => {
+    audio.unlock();
+    audio.tap();
+    playerIndex = i;
+    [...charButtons.children].forEach((x, k) => x.classList.toggle('sel', k === i));
+    startBtn.disabled = false;
+  });
+  charButtons.appendChild(b);
+});
+
+startBtn.addEventListener('pointerdown', async () => {
+  audio.unlock();
+  audio.fanfare();
+  chars.forEach((c, i) => { c.isPlayer = i === playerIndex; });
+  mgManager.ctx.playerIndex = playerIndex;
+  titleScreen.classList.add('fade');
+  setTimeout(() => titleScreen.classList.add('hidden'), 600);
+
+  await board.start();
+
+  // ぜんぶ終わったら、タップでもういっかい
+  ui.showBanner(
+    '<span class="icon">🔁</span>タップで もういっかい あそぶ!',
+    1000 * 60 * 10,
+  );
+  const reload = () => {
+    board.finaleCleanup?.();   // けっか発表の紙ふぶきを止めてから積み直す
+    location.reload();
+  };
+  window.addEventListener('pointerdown', reload, { once: true });
+});
+
+// ============ リサイズ ============
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  mgManager.resize(w / h);
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 250));
+resize();
+
+// ============ メインループ ============
+const clock = new THREE.Clock();
+let firstFrame = true;
+
+function loop() {
+  requestAnimationFrame(loop);
+  const rawDt = clock.getDelta();
+  const activeDt = Math.min(CONFIG.MAX_ACTIVE_FRAME_DELTA, rawDt);
+  const dt = Math.min(CONFIG.MAX_SIMULATION_STEP, activeDt) * timeScale;
+  const t = clock.elapsedTime;
+  const aspect = window.innerWidth / Math.max(1, window.innerHeight);
+
+  world.update(dt);
+  chars.forEach((c) => c.update(dt));
+  board.update(dt);
+  fx.update(dt);
+  mgManager.update(dt, activeDt);
+
+  if (mgManager.active) {
+    const g = mgManager.active;
+    g.camera.aspect = aspect;
+    g.camera.updateProjectionMatrix();
+    renderer.render(g.scene, g.camera);
+  } else {
+    rig.update(dt, aspect, t);
+    renderer.render(scene, camera);
+  }
+
+  if (firstFrame) {
+    firstFrame = false;
+    document.getElementById('loading').classList.add('fade');
+  }
+}
+
+// バックグラウンド滞在時間を、復帰直後のゲーム時間として加算しない。
+document.addEventListener('visibilitychange', () => {
+  clock.getDelta();
+});
+// タブを閉じる・前のページへ戻るときの保険。けっか発表の紙ふぶきを止める。
+window.addEventListener('pagehide', () => board.finaleCleanup?.());
+loop();
+
+// ?event= のときだけ、E2E から島の状態を見られるようにする。
+// 通常プレイでは公開しないので、本番の面には影響しない。
+if (DEBUG.forceEvent || DEBUG.scenario) {
+  window.__debugWorld = world;
+  window.__debugBoard = board;   // _debugEventDone で イベントの完走を知らせる
+}
+// window.__kk = { snapshot, log, scenarios }。テスト用パラメータのときだけ窓が開く。
+installDebugApi({ board, world, chars, ui, mgManager });

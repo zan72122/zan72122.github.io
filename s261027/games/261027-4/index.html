@@ -1,0 +1,2013 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta name="robots" content="noindex,nofollow">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#17323b">
+<link rel="icon" href="data:,">
+<title>すいぞくかん</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#17323b;
+  touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
+  -webkit-tap-highlight-color:transparent;overscroll-behavior:none;position:fixed;inset:0}
+canvas{position:fixed;left:0;top:0;width:100%;height:100%;display:block;touch-action:none;outline:none}
+#sa{position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+</style>
+
+<script src="/gf-nav.js" defer></script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+(() => {
+'use strict';
+
+// ============================================================
+//  基本ユーティリティ
+// ============================================================
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+const hyp = Math.hypot;
+function mulberry(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const R = Math.random;
+const rr = (a, b) => a + R() * (b - a);
+function mk(w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h)); return c; }
+const rgbCache = {};
+function hexRGB(h) { let c = rgbCache[h]; if (!c) { const n = parseInt(h.slice(1), 16); c = rgbCache[h] = [(n >> 16) & 255, (n >> 8) & 255, n & 255]; } return c; }
+function rgba(h, a) { const c = hexRGB(h); return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+
+function smoothClosed(g, pts) {
+  const n = pts.length; const p0 = pts[n - 1], p1 = pts[0];
+  g.moveTo((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2);
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    g.quadraticCurveTo(a[0], a[1], (a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
+  }
+  g.closePath();
+}
+function blob(g, x, y, r, rng, irr, n) {
+  n = n || 12; irr = irr == null ? 0.24 : irr;
+  const ph = rng() * TAU, ph2 = rng() * TAU, k = 2 + ((rng() * 3) | 0);
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU;
+    const q = r * (1 + irr * (0.55 * Math.sin(a * k + ph) + 0.3 * Math.sin(a * (k + 3) + ph2) + 0.35 * (rng() - 0.5)));
+    pts.push([x + Math.cos(a) * q, y + Math.sin(a) * q]);
+  }
+  g.beginPath(); smoothClosed(g, pts);
+}
+// 水彩の一筆：にじみ＋縁の顔料だまり＋内側のむら
+function wash(g, x, y, r, col, a, rng, edge) {
+  blob(g, x, y, r, rng, 0.28, 14);
+  g.globalAlpha = a; g.fillStyle = col; g.fill();
+  if (edge !== 0) { g.globalAlpha = Math.min(1, a * 1.7); g.strokeStyle = col; g.lineWidth = Math.max(0.7, r * 0.035); g.stroke(); }
+  blob(g, x + (rng() - 0.5) * r * 0.35, y + (rng() - 0.5) * r * 0.35, r * (0.4 + rng() * 0.3), rng, 0.3, 10);
+  g.globalAlpha = a * 0.7; g.fill();
+  g.globalAlpha = 1;
+}
+
+// ============================================================
+//  キャンバスとレイアウト
+// ============================================================
+const cvs = document.getElementById('c');
+const ctx = cvs.getContext('2d');
+const saEl = document.getElementById('sa');
+let W = 1, H = 1, DPR = 1, S = 1, FR = 12, hR = 50, sR = 50;
+const G = { x: 0, y: 0, w: 0, h: 0 };
+const gx = u => G.x + u * G.w, gy = v => G.y + v * G.h;
+const floorV = u => 0.865 + 0.022 * Math.sin(u * 7 + 1) + 0.012 * Math.sin(u * 17 + 2);
+
+// ============================================================
+//  事前生成テクスチャ（サイズ非依存）
+// ============================================================
+// 紙の質感
+const paperTile = (() => {
+  const n = 192, c = mk(n, n), g = c.getContext('2d'), r = mulberry(5);
+  const id = g.createImageData(n, n), d = id.data;
+  const cg = []; for (let i = 0; i < 64; i++) cg.push(r());
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    const u = x / n * 8, v = y / n * 8, i0 = u | 0, j0 = v | 0, fu = u - i0, fv = v - j0;
+    const q = (a, b) => cg[(a & 7) + (b & 7) * 8];
+    const lo = lerp(lerp(q(i0, j0), q(i0 + 1, j0), fu), lerp(q(i0, j0 + 1), q(i0 + 1, j0 + 1), fu), fv);
+    const v0 = 255 - r() * 26 - lo * 18;
+    const p = (y * n + x) * 4;
+    d[p] = v0; d[p + 1] = v0 - 4; d[p + 2] = v0 - 10; d[p + 3] = 255;
+  }
+  g.putImageData(id, 0, 0);
+  g.strokeStyle = 'rgba(150,130,110,0.10)'; g.lineWidth = 0.6;
+  for (let i = 0; i < 70; i++) {
+    g.beginPath(); let x = r() * n, y = r() * n, a = r() * TAU; g.moveTo(x, y);
+    for (let k = 0; k < 4; k++) { a += (r() - 0.5); x += Math.cos(a) * 6; y += Math.sin(a) * 6; g.lineTo(x, y); }
+    g.stroke();
+  }
+  return c;
+})();
+// 顔料の粒状（グラニュレーション）
+const granTile = (() => {
+  const n = 128, c = mk(n, n), g = c.getContext('2d'), r = mulberry(9);
+  for (let i = 0; i < 900; i++) {
+    const x = r() * n, y = r() * n, s = 0.4 + r() * 1.6;
+    g.fillStyle = 'rgba(30,25,40,' + (0.15 + r() * 0.5) + ')';
+    g.beginPath(); g.arc(x, y, s, 0, TAU); g.fill();
+  }
+  for (let i = 0; i < 40; i++) { g.globalAlpha = 0.12; blob(g, r() * n, r() * n, 4 + r() * 9, r, 0.4, 8); g.fillStyle = '#201a30'; g.fill(); }
+  g.globalAlpha = 1;
+  return c;
+})();
+// 消去ブラシ（にじんだ丸）
+const brushes = [0, 1, 2].map(k => {
+  const n = 128, c = mk(n, n), g = c.getContext('2d'), r = mulberry(20 + k);
+  for (let j = 0; j < 6; j++) {
+    const ox = 64 + (r() - 0.5) * 10, oy = 64 + (r() - 0.5) * 10, rad = 52 + r() * 10;
+    const gr = g.createRadialGradient(ox, oy, 0, ox, oy, rad);
+    gr.addColorStop(0, 'rgba(255,255,255,0.55)'); gr.addColorStop(0.5, 'rgba(255,255,255,0.42)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, n, n);
+  }
+  return c;
+});
+function glowSprite(hex, n) {
+  n = n || 64; const c = mk(n, n), g = c.getContext('2d'), h = n / 2;
+  const gr = g.createRadialGradient(h, h, 0, h, h, h);
+  gr.addColorStop(0, rgba(hex, 1)); gr.addColorStop(0.22, rgba(hex, 0.55)); gr.addColorStop(0.55, rgba(hex, 0.14)); gr.addColorStop(1, rgba(hex, 0));
+  g.fillStyle = gr; g.fillRect(0, 0, n, n); return c;
+}
+const GLOW = { gold: glowSprite('#ffd36b'), aqua: glowSprite('#7ff0ff'), pink: glowSprite('#ff9ad5'), white: glowSprite('#ffffff'), lav: glowSprite('#c4a8ff'), mint: glowSprite('#9dffc9'), teal: glowSprite('#5fd6d0') };
+const sparkSpr = (() => {
+  const n = 64, c = mk(n, n), g = c.getContext('2d'), h = n / 2;
+  g.drawImage(GLOW.white, 16, 16, 32, 32);
+  g.fillStyle = 'rgba(255,255,255,0.95)';
+  g.beginPath(); g.ellipse(h, h, 30, 2.2, 0, 0, TAU); g.fill();
+  g.beginPath(); g.ellipse(h, h, 2.2, 30, 0, 0, TAU); g.fill();
+  g.globalAlpha = 0.5; g.beginPath(); g.ellipse(h, h, 14, 1.4, Math.PI / 4, 0, TAU); g.fill();
+  g.beginPath(); g.ellipse(h, h, 14, 1.4, -Math.PI / 4, 0, TAU); g.fill();
+  return c;
+})();
+const bubbleSpr = (() => {
+  const n = 64, c = mk(n, n), g = c.getContext('2d'), h = n / 2, r = 30;
+  const gr = g.createRadialGradient(h - 4, h - 4, 2, h, h, r);
+  gr.addColorStop(0, 'rgba(220,250,255,0.05)'); gr.addColorStop(0.75, 'rgba(190,240,250,0.16)');
+  gr.addColorStop(0.93, 'rgba(240,255,255,0.65)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = gr; g.beginPath(); g.arc(h, h, r, 0, TAU); g.fill();
+  g.strokeStyle = 'rgba(120,200,215,0.45)'; g.lineWidth = 1.4; g.beginPath(); g.arc(h, h, r - 2, 0.4, 2.6); g.stroke();
+  g.fillStyle = 'rgba(255,255,255,0.85)'; g.beginPath(); g.ellipse(h - 10, h - 11, 7, 4, -0.7, 0, TAU); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.4)'; g.beginPath(); g.arc(h + 9, h + 10, 3, 0, TAU); g.fill();
+  return c;
+})();
+const flakeSprs = ['#4f8a45', '#6fae5c', '#3c7446', '#8fbf68'].map((col, i) => {
+  const n = 24, c = mk(n, n), g = c.getContext('2d'), r = mulberry(40 + i);
+  wash(g, 12, 12, 7, col, 0.7, r);
+  return c;
+});
+const PARTY_GLOW = ['gold', 'aqua', 'pink'];
+const GF_COL = { gold: ['#ffe58f', '#fff6c9', '#e0a530'], aqua: ['#8ff4ff', '#e2fdff', '#3cb8c9'], pink: ['#ffb0dc', '#ffe6f4', '#e0609f'] };
+
+// 藻（汚れ）テクスチャ ― 正規化座標で保持（回転・リサイズで状態を保つ）
+const DW = 640, DH = 640;
+function buildAlgae(seed) {
+  const c = mk(DW, DH), g = c.getContext('2d'), r = mulberry(seed);
+  g.fillStyle = 'rgba(86,136,76,0.8)'; g.fillRect(0, 0, DW, DH);
+  const cols = ['#4d8a45', '#6fae5c', '#3c7446', '#8fbf68', '#5c9a70', '#7aa44c', '#a3c46e', '#356b3f', '#6f9a3a'];
+  for (let i = 0; i < 300; i++) {
+    const rad = 8 + Math.pow(r(), 2) * 95;
+    wash(g, r() * DW, r() * DH, rad, cols[(r() * cols.length) | 0], 0.05 + r() * 0.12, r);
+  }
+  for (let i = 0; i < 90; i++) { blob(g, r() * DW, r() * DH, 3 + r() * 13, r, 0.4, 9); g.fillStyle = 'rgba(38,78,40,0.28)'; g.fill(); }
+  for (let i = 0; i < 2200; i++) {
+    g.fillStyle = r() < 0.6 ? 'rgba(40,82,42,0.35)' : 'rgba(170,210,120,0.3)';
+    g.beginPath(); g.arc(r() * DW, r() * DH, 0.5 + r() * 1.6, 0, TAU); g.fill();
+  }
+  for (let i = 0; i < 220; i++) {
+    g.beginPath(); let x = r() * DW, y = r() * DH, a = r() * TAU; g.moveTo(x, y);
+    for (let k = 0; k < 6; k++) { a += (r() - 0.5) * 1.2; x += Math.cos(a) * 7; y += Math.sin(a) * 7; g.lineTo(x, y); }
+    g.strokeStyle = r() < 0.5 ? 'rgba(167,208,124,0.3)' : 'rgba(47,99,55,0.3)'; g.lineWidth = 0.6 + r() * 1.3; g.stroke();
+  }
+  // 透明度のむら（低周波）＋粒状
+  const id = g.getImageData(0, 0, DW, DH), d = id.data;
+  const N = 9, cg = []; for (let i = 0; i < N * N; i++) cg.push(0.84 + r() * 0.3);
+  for (let y = 0; y < DH; y++) {
+    const v = y / DH * (N - 1), j0 = v | 0, fv = v - j0;
+    for (let x = 0; x < DW; x++) {
+      const u = x / DW * (N - 1), i0 = u | 0, fu = u - i0;
+      const i1 = Math.min(N - 1, i0 + 1), j1 = Math.min(N - 1, j0 + 1);
+      const lo = lerp(lerp(cg[i0 + j0 * N], cg[i1 + j0 * N], fu), lerp(cg[i0 + j1 * N], cg[i1 + j1 * N], fu), fv);
+      const p = (y * DW + x) * 4;
+      d[p + 3] = Math.min(250, d[p + 3] * lo * (0.86 + r() * 0.24));
+    }
+  }
+  g.putImageData(id, 0, 0);
+  return c;
+}
+const dirt = mk(DW, DH), dctx = dirt.getContext('2d');
+let algaeSeed = 101;
+// 掃除の進み具合グリッド（d=汚れ残量）
+const GX = 36, GY = 36, grid = new Float32Array(GX * GY);
+
+// ウミガメの甲羅（水彩模様）
+const SHELL = (() => {
+  const w = 260, h = 150, c = mk(w, h), g = c.getContext('2d'), r = mulberry(77);
+  const cx = w / 2, by = h * 0.9;
+  const dome = () => { g.beginPath(); g.moveTo(cx - 122, by - 6); g.bezierCurveTo(cx - 112, by - 122, cx + 92, by - 138, cx + 124, by - 10); g.quadraticCurveTo(cx, by + 8, cx - 122, by - 6); g.closePath(); };
+  dome();
+  const gr = g.createRadialGradient(cx - 40, by - 100, 10, cx, by - 40, 150);
+  gr.addColorStop(0, '#d8c06a'); gr.addColorStop(0.5, '#93984a'); gr.addColorStop(1, '#55703a');
+  g.fillStyle = gr; g.fill();
+  g.save(); dome(); g.clip();
+  const cols = ['#4f8a6a', '#c08a40', '#d9a35a', '#8a6a3a', '#c98a7a', '#6aa58a', '#e0b860'];
+  const sc = [];
+  [[-62, -88, 30], [-4, -96, 31], [54, -84, 29]].forEach(p => sc.push(p));
+  [[-100, -42, 24], [-52, -46, 25], [0, -50, 25], [52, -46, 25], [100, -38, 23]].forEach(p => sc.push(p));
+  for (let i = 0; i < 13; i++) sc.push([-118 + i * 19.5, -10 + Math.abs(i - 6) * 0.6, 11]);
+  sc.forEach(p => {
+    const x = cx + p[0], y = by + p[1], s = p[2];
+    const pts = []; const rot = r() * 0.4;
+    for (let k = 0; k < 6; k++) { const a = k / 6 * TAU + rot; pts.push([x + Math.cos(a) * s * (0.95 + r() * 0.12), y + Math.sin(a) * s * 0.82 * (0.95 + r() * 0.12)]); }
+    g.beginPath(); g.moveTo(pts[0][0], pts[0][1]); for (let k = 1; k < 6; k++) g.lineTo(pts[k][0], pts[k][1]); g.closePath();
+    g.globalAlpha = 0.5; g.fillStyle = cols[(r() * cols.length) | 0]; g.fill();
+    g.globalAlpha = 0.6; g.lineJoin = 'round'; g.strokeStyle = '#5a3f1e'; g.lineWidth = s > 15 ? 3.2 : 2; g.stroke();
+    g.globalAlpha = 0.35; g.strokeStyle = '#f6e3a0'; g.lineWidth = 1.2;
+    g.beginPath(); g.arc(x - s * 0.15, y - s * 0.15, s * 0.45, Math.PI, Math.PI * 1.6); g.stroke();
+    wash(g, x + (r() - 0.5) * s * 0.4, y + (r() - 0.5) * s * 0.4, s * 0.45, cols[(r() * cols.length) | 0], 0.25, r);
+  });
+  g.globalAlpha = 0.28; g.fillStyle = g.createPattern(granTile, 'repeat'); g.fillRect(0, 0, w, h);
+  g.globalAlpha = 1;
+  const hl = g.createRadialGradient(cx - 50, by - 105, 4, cx - 50, by - 105, 70);
+  hl.addColorStop(0, 'rgba(255,255,235,0.55)'); hl.addColorStop(1, 'rgba(255,255,235,0)');
+  g.fillStyle = hl; g.fillRect(0, 0, w, h);
+  g.restore();
+  dome(); g.globalAlpha = 0.75; g.strokeStyle = '#4b3a1e'; g.lineWidth = 3; g.stroke(); g.globalAlpha = 1;
+  return { c, ox: cx, oy: by, w, h, base: 248 };
+})();
+
+// 手（お手本）
+const HAND = (() => {
+  const w = 150, h = 210, c = mk(w, h), g = c.getContext('2d'), r = mulberry(31);
+  const tipX = 60, tipY = 14;
+  const shape = () => {
+    g.beginPath();
+    g.moveTo(tipX - 16, 40); g.quadraticCurveTo(tipX - 16, tipY, tipX, tipY); g.quadraticCurveTo(tipX + 16, tipY, tipX + 16, 40);
+    g.lineTo(tipX + 17, 98);
+    g.quadraticCurveTo(tipX + 28, 84, tipX + 40, 96); g.quadraticCurveTo(tipX + 52, 88, tipX + 62, 102);
+    g.quadraticCurveTo(tipX + 76, 100, tipX + 78, 120);
+    g.quadraticCurveTo(tipX + 84, 170, tipX + 50, 196); g.quadraticCurveTo(tipX + 10, 210, tipX - 18, 186);
+    g.quadraticCurveTo(tipX - 50, 160, tipX - 48, 132); g.quadraticCurveTo(tipX - 46, 112, tipX - 30, 118);
+    g.quadraticCurveTo(tipX - 20, 124, tipX - 16, 132);
+    g.closePath();
+  };
+  shape(); g.fillStyle = '#f8dcc8'; g.globalAlpha = 0.96; g.fill();
+  g.save(); shape(); g.clip();
+  wash(g, tipX + 30, 170, 50, '#f0b49c', 0.35, r);
+  wash(g, tipX - 4, 50, 14, '#ffffff', 0.35, r, 0);
+  g.restore();
+  shape(); g.globalAlpha = 0.85; g.strokeStyle = '#d0907a'; g.lineWidth = 3; g.lineJoin = 'round'; g.stroke();
+  g.globalAlpha = 0.5; g.lineWidth = 2;
+  g.beginPath(); g.moveTo(tipX + 18, 110); g.quadraticCurveTo(tipX + 28, 104, tipX + 38, 112); g.stroke();
+  g.beginPath(); g.moveTo(tipX + 40, 114); g.quadraticCurveTo(tipX + 50, 108, tipX + 60, 118); g.stroke();
+  g.beginPath(); g.ellipse(tipX, tipY + 12, 7, 5, 0, 0, TAU); g.globalAlpha = 0.35; g.fillStyle = '#fff4ee'; g.fill();
+  g.globalAlpha = 1;
+  return { c, tipX, tipY, w, h };
+})();
+
+// 光の帯
+const raySpr = (() => {
+  const w = 64, h = 512, c = mk(w, h), g = c.getContext('2d');
+  const gr = g.createLinearGradient(0, 0, w, 0);
+  gr.addColorStop(0, 'rgba(255,255,240,0)'); gr.addColorStop(0.5, 'rgba(255,255,240,1)'); gr.addColorStop(1, 'rgba(255,255,240,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, w, h);
+  g.globalCompositeOperation = 'destination-in';
+  const gv = g.createLinearGradient(0, 0, 0, h); gv.addColorStop(0, 'rgba(0,0,0,1)'); gv.addColorStop(0.6, 'rgba(0,0,0,0.35)'); gv.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = gv; g.fillRect(0, 0, w, h);
+  return c;
+})();
+
+// ============================================================
+//  サイズ依存レイヤー
+// ============================================================
+let bgC = null, floorDay = null, floorNight = null, frameC = null, handleSpr = null, spongeSpr = null, shadowSpr = null;
+let paperPat = null, granPat = null, nightGradA = null, nightGradB = null;
+let coralTips = [], vents = [], weeds = [], lightRays = [];
+
+function buildBG() {
+  const s = 0.5, w = Math.ceil(W * s), h = Math.ceil(H * s);
+  const c = mk(w, h), g = c.getContext('2d'), r = mulberry(11);
+  const gr = g.createLinearGradient(0, 0, 0, h);
+  gr.addColorStop(0, '#a6e4d8'); gr.addColorStop(0.32, '#5dc3bf'); gr.addColorStop(0.7, '#2f91a3'); gr.addColorStop(1, '#1f6480');
+  g.fillStyle = gr; g.fillRect(0, 0, w, h);
+  const cols = ['#7fd6c4', '#4fb3b0', '#9ad0e6', '#b7a6dc', '#3e9a8f', '#6ec6d8', '#2f7f96', '#8fe0c8', '#c4b4e6'];
+  const m = Math.max(w, h);
+  for (let i = 0; i < 46; i++) wash(g, r() * w, r() * h * 1.05, (0.06 + r() * 0.22) * m, cols[(r() * cols.length) | 0], 0.05 + r() * 0.07, r);
+  // 遠くの岩と海藻の影
+  for (let i = 0; i < 9; i++) wash(g, r() * w, h * (0.78 + r() * 0.2), (0.05 + r() * 0.1) * m, '#2a6c84', 0.22, r);
+  g.lineCap = 'round';
+  for (let i = 0; i < 12; i++) {
+    let x = r() * w, y = h * (0.85 + r() * 0.1); const hh = h * (0.18 + r() * 0.3);
+    g.beginPath(); g.moveTo(x, y);
+    for (let k = 1; k <= 6; k++) g.lineTo(x + Math.sin(k * 0.9 + i) * 6, y - hh * k / 6);
+    g.strokeStyle = 'rgba(40,110,120,0.18)'; g.lineWidth = 3 + r() * 4; g.stroke();
+  }
+  const top = g.createRadialGradient(w * 0.45, -h * 0.1, 10, w * 0.45, -h * 0.1, h * 0.8);
+  top.addColorStop(0, 'rgba(255,255,230,0.45)'); top.addColorStop(1, 'rgba(255,255,230,0)');
+  g.fillStyle = top; g.fillRect(0, 0, w, h);
+  const vg = g.createRadialGradient(w / 2, h * 0.45, m * 0.25, w / 2, h * 0.5, m * 0.8);
+  vg.addColorStop(0, 'rgba(10,50,70,0)'); vg.addColorStop(1, 'rgba(10,50,70,0.45)');
+  g.fillStyle = vg; g.fillRect(0, 0, w, h);
+  bgC = c;
+}
+
+function buildFloor() {
+  const c = mk(W, H), g = c.getContext('2d'), r = mulberry(23);
+  coralTips = [];
+  const fy = u => gy(floorV(u));
+  // 砂
+  g.beginPath(); g.moveTo(0, H);
+  for (let i = 0; i <= 40; i++) { const u = i / 40; g.lineTo(gx(u), fy(u)); }
+  g.lineTo(W, H); g.closePath();
+  const sg = g.createLinearGradient(0, gy(0.84), 0, H);
+  sg.addColorStop(0, '#d7cfa6'); sg.addColorStop(0.5, '#b9b48e'); sg.addColorStop(1, '#8f9a86');
+  g.fillStyle = sg; g.fill();
+  for (let i = 0; i < 30; i++) { const u = r(); wash(g, gx(u), fy(u) + r() * G.h * 0.1, S * (0.03 + r() * 0.07), r() < 0.5 ? '#e8dfb8' : '#a8a07a', 0.18, r); }
+  // 岩
+  const rocks = [[0.05, 0.11, '#5d6f86'], [0.93, 0.1, '#665f86'], [0.66, 0.085, '#596f80'], [0.3, 0.06, '#6c7488'], [0.82, 0.05, '#7a6a8c'], [0.16, 0.05, '#5a7a86']];
+  rocks.forEach(k => {
+    const x = gx(k[0]), y = fy(k[0]) + S * 0.02, rad = S * k[1];
+    blob(g, x, y, rad, r, 0.2, 14); g.fillStyle = k[2]; g.globalAlpha = 0.95; g.fill();
+    g.save(); blob(g, x, y, rad, r, 0.2, 14); g.clip();
+    wash(g, x - rad * 0.3, y - rad * 0.4, rad * 0.6, '#a9b6c8', 0.35, r);
+    wash(g, x + rad * 0.3, y + rad * 0.2, rad * 0.7, '#2f3a52', 0.35, r);
+    wash(g, x, y - rad * 0.2, rad * 0.4, '#7fa08a', 0.25, r);
+    g.globalAlpha = 0.3; g.fillStyle = g.createPattern(granTile, 'repeat'); g.fillRect(x - rad * 1.5, y - rad * 1.5, rad * 3, rad * 3);
+    g.restore();
+    blob(g, x, y, rad, r, 0.2, 14); g.globalAlpha = 0.55; g.strokeStyle = '#2b3448'; g.lineWidth = 2; g.stroke(); g.globalAlpha = 1;
+  });
+  // サンゴ
+  const branch = (x, y, len, ang, w0, col, depth) => {
+    const x2 = x + Math.cos(ang) * len, y2 = y + Math.sin(ang) * len;
+    g.strokeStyle = col; g.lineCap = 'round';
+    g.globalAlpha = 0.55; g.lineWidth = w0 * 1.5; g.beginPath(); g.moveTo(x, y); g.quadraticCurveTo(x + (r() - 0.5) * len * 0.4, (y + y2) / 2, x2, y2); g.stroke();
+    g.globalAlpha = 0.8; g.lineWidth = w0; g.stroke();
+    if (depth > 0) {
+      const n = 2 + (r() < 0.3 ? 1 : 0);
+      for (let i = 0; i < n; i++) branch(x2, y2, len * (0.6 + r() * 0.2), ang + (i - (n - 1) / 2) * 0.55 + (r() - 0.5) * 0.3, w0 * 0.72, col, depth - 1);
+    } else { coralTips.push([(x2 - G.x) / G.w, (y2 - G.y) / G.h]); g.globalAlpha = 0.9; g.fillStyle = '#ffe3ef'; g.beginPath(); g.arc(x2, y2, w0 * 0.55, 0, TAU); g.fill(); }
+  };
+  const fan = (x, y, rad, col) => {
+    g.globalAlpha = 0.3; blob(g, x, y - rad * 0.6, rad * 0.75, r, 0.25, 12); g.fillStyle = col; g.fill();
+    g.strokeStyle = col; g.lineWidth = 1.4; g.globalAlpha = 0.7;
+    for (let i = 0; i < 14; i++) { const a = -Math.PI * 0.92 + i / 13 * Math.PI * 0.84; g.beginPath(); g.moveTo(x, y); g.quadraticCurveTo(x + Math.cos(a) * rad * 0.5, y + Math.sin(a) * rad * 0.7, x + Math.cos(a) * rad, y + Math.sin(a) * rad * 1.25); g.stroke(); coralTips.push([(x + Math.cos(a) * rad - G.x) / G.w, (y + Math.sin(a) * rad * 1.25 - G.y) / G.h]); }
+    g.globalAlpha = 1;
+  };
+  const brain = (x, y, rad) => {
+    blob(g, x, y, rad, r, 0.12, 14); g.fillStyle = '#f0a65a'; g.globalAlpha = 0.9; g.fill();
+    g.save(); blob(g, x, y, rad, r, 0.12, 14); g.clip();
+    wash(g, x + rad * 0.3, y + rad * 0.3, rad * 0.8, '#c8673a', 0.4, r);
+    g.strokeStyle = 'rgba(150,70,30,0.45)'; g.lineWidth = 1.5;
+    for (let i = 0; i < 9; i++) { g.beginPath(); let px = x - rad + r() * rad * 2, py = y - rad + r() * rad * 2; g.moveTo(px, py); for (let k = 0; k < 5; k++) { px += (r() - 0.5) * rad * 0.5; py += (r() - 0.5) * rad * 0.5; g.lineTo(px, py); } g.stroke(); }
+    g.restore(); g.globalAlpha = 1; coralTips.push([(x - G.x) / G.w, (y - rad - G.y) / G.h]);
+  };
+  const tubes = (x, y, s, col) => {
+    for (let i = 0; i < 4; i++) {
+      const tx = x + (i - 1.5) * s * 0.35, th = s * (0.6 + r() * 0.8), tw = s * 0.28;
+      g.globalAlpha = 0.85; g.fillStyle = col; g.beginPath(); g.moveTo(tx - tw / 2, y); g.lineTo(tx - tw / 2 * 0.85, y - th); g.lineTo(tx + tw / 2 * 0.85, y - th); g.lineTo(tx + tw / 2, y); g.closePath(); g.fill();
+      g.globalAlpha = 0.6; g.fillStyle = '#25304a'; g.beginPath(); g.ellipse(tx, y - th, tw * 0.4, tw * 0.15, 0, 0, TAU); g.fill();
+      g.globalAlpha = 0.3; g.strokeStyle = '#fff'; g.lineWidth = 1.2; g.beginPath(); g.moveTo(tx - tw * 0.25, y - 4); g.lineTo(tx - tw * 0.22, y - th + 4); g.stroke();
+      coralTips.push([(tx - G.x) / G.w, (y - th - G.y) / G.h]);
+    }
+    g.globalAlpha = 1;
+  };
+  const anem = (x, y, s) => {
+    g.lineCap = 'round';
+    for (let i = 0; i < 18; i++) {
+      const a = -Math.PI / 2 + (i / 17 - 0.5) * 2.2; g.strokeStyle = i % 2 ? '#c896e6' : '#f2a4c8';
+      g.globalAlpha = 0.7; g.lineWidth = s * 0.08; g.beginPath(); g.moveTo(x, y);
+      g.quadraticCurveTo(x + Math.cos(a) * s * 0.4, y + Math.sin(a) * s * 0.6, x + Math.cos(a) * s * 0.75, y + Math.sin(a) * s * 0.9); g.stroke();
+    }
+    g.globalAlpha = 1; coralTips.push([(x - G.x) / G.w, (y - s * 0.8 - G.y) / G.h]);
+  };
+  const items = [
+    () => branch(gx(0.1), fy(0.1), S * 0.07, -Math.PI / 2, S * 0.018, '#f39ab0', 3),
+    () => fan(gx(0.24), fy(0.24), S * 0.11, '#a77ad0'),
+    () => brain(gx(0.4), fy(0.4) + S * 0.01, S * 0.05),
+    () => tubes(gx(0.78), fy(0.78) + S * 0.01, S * 0.09, '#5ec2b4'),
+    () => branch(gx(0.88), fy(0.88), S * 0.065, -Math.PI / 2 - 0.15, S * 0.016, '#ff9d6c', 3),
+    () => anem(gx(0.47), fy(0.47) + S * 0.01, S * 0.08),
+    () => fan(gx(0.72), fy(0.72), S * 0.08, '#f08ab0'),
+    () => tubes(gx(0.02), fy(0.02) + S * 0.01, S * 0.07, '#e8c25a'),
+    () => branch(gx(0.33), fy(0.33), S * 0.05, -Math.PI / 2 + 0.2, S * 0.013, '#ffb3c8', 2),
+    () => anem(gx(0.97), fy(0.97), S * 0.07)
+  ];
+  items.forEach(f => f());
+  g.globalAlpha = 0.18; g.globalCompositeOperation = 'source-atop'; g.fillStyle = g.createPattern(granTile, 'repeat'); g.fillRect(0, 0, W, H);
+  g.globalCompositeOperation = 'source-over'; g.globalAlpha = 1;
+  floorDay = c;
+  // 夜：藍色に沈めて、サンゴの先が光る
+  const n = mk(W, H), ng = n.getContext('2d');
+  ng.drawImage(c, 0, 0);
+  ng.globalCompositeOperation = 'source-atop'; ng.fillStyle = 'rgba(28,20,86,0.62)'; ng.fillRect(0, 0, W, H);
+  ng.globalCompositeOperation = 'lighter';
+  coralTips.forEach((t, i) => { const s = S * (0.03 + (i % 3) * 0.012); ng.globalAlpha = 0.7; ng.drawImage([GLOW.pink, GLOW.aqua, GLOW.lav, GLOW.gold][i % 4], gx(t[0]) - s, gy(t[1]) - s, s * 2, s * 2); });
+  ng.globalAlpha = 1; ng.globalCompositeOperation = 'source-over';
+  floorNight = n;
+  vents = [0.2, 0.52, 0.83].map(u => ({ u, t: R() * 2 }));
+  weeds = [];
+  const wr = mulberry(3);
+  [0.03, 0.07, 0.17, 0.35, 0.62, 0.9, 0.95, 0.985].forEach((u, i) => weeds.push({ u: u + (wr() - 0.5) * 0.02, h: 0.18 + wr() * 0.2, w: 0.012 + wr() * 0.01, col: ['#4f9a5a', '#6fae4c', '#3f8a6a', '#7aa84a'][i % 4], ph: wr() * TAU }));
+  lightRays = [];
+  for (let i = 0; i < 5; i++) lightRays.push({ u: 0.1 + i * 0.2 + (wr() - 0.5) * 0.08, w: 0.06 + wr() * 0.08, sl: 0.25 + wr() * 0.15, ph: wr() * TAU });
+}
+
+function buildFrame() {
+  const c = mk(W * Math.min(DPR, 1.5), H * Math.min(DPR, 1.5)), g = c.getContext('2d'), r = mulberry(61);
+  const k = c.width / W; g.scale(k, k);
+  const rad = Math.max(10, FR * 0.9);
+  const inner = () => { g.beginPath(); if (g.roundRect) g.roundRect(G.x, G.y, G.w, G.h, rad); else g.rect(G.x, G.y, G.w, G.h); };
+  // ガラス表面：反射とガラスの厚み
+  g.save(); inner(); g.clip();
+  const d1 = g.createLinearGradient(G.x, G.y, G.x + G.w, G.y + G.h);
+  d1.addColorStop(0, 'rgba(255,255,255,0.10)'); d1.addColorStop(0.18, 'rgba(255,255,255,0.0)');
+  d1.addColorStop(0.42, 'rgba(255,255,255,0.0)'); d1.addColorStop(0.47, 'rgba(255,255,255,0.08)'); d1.addColorStop(0.52, 'rgba(255,255,255,0.0)');
+  d1.addColorStop(0.56, 'rgba(255,255,255,0.05)'); d1.addColorStop(0.6, 'rgba(255,255,255,0)'); d1.addColorStop(1, 'rgba(255,255,255,0.04)');
+  g.fillStyle = d1; g.fillRect(G.x, G.y, G.w, G.h);
+  g.lineWidth = FR * 1.6; g.strokeStyle = 'rgba(180,240,235,0.13)'; inner(); g.stroke();
+  g.lineWidth = FR * 0.5; g.strokeStyle = 'rgba(8,40,52,0.35)'; inner(); g.stroke();
+  g.restore();
+  // 窓枠
+  g.beginPath(); g.rect(0, 0, W, H);
+  if (g.roundRect) g.roundRect(G.x, G.y, G.w, G.h, rad); else g.rect(G.x, G.y, G.w, G.h);
+  const fg = g.createLinearGradient(0, 0, W, H);
+  fg.addColorStop(0, '#2d4f5a'); fg.addColorStop(0.5, '#1d3a45'); fg.addColorStop(1, '#16303a');
+  g.fillStyle = fg; g.fill('evenodd');
+  g.save(); g.beginPath(); g.rect(0, 0, W, H); if (g.roundRect) g.roundRect(G.x, G.y, G.w, G.h, rad); else g.rect(G.x, G.y, G.w, G.h); g.clip('evenodd');
+  for (let i = 0; i < 40; i++) {
+    const side = i % 4; let x, y;
+    if (side === 0) { x = r() * W; y = r() * G.y; } else if (side === 1) { x = r() * W; y = G.y + G.h + r() * (H - G.y - G.h); }
+    else if (side === 2) { x = r() * G.x; y = r() * H; } else { x = G.x + G.w + r() * (W - G.x - G.w); y = r() * H; }
+    wash(g, x, y, FR * (0.8 + r() * 2), ['#3f6a72', '#24414e', '#4b5f7a', '#2f5a5a'][i % 4], 0.25, r);
+  }
+  g.globalAlpha = 0.3; g.fillStyle = g.createPattern(granTile, 'repeat'); g.fillRect(0, 0, W, H); g.globalAlpha = 1;
+  g.restore();
+  g.lineWidth = 2.5; g.strokeStyle = 'rgba(170,215,215,0.5)'; inner(); g.stroke();
+  g.lineWidth = 1; g.strokeStyle = 'rgba(10,25,30,0.6)';
+  g.beginPath(); if (g.roundRect) g.roundRect(G.x - 3, G.y - 3, G.w + 6, G.h + 6, rad + 3); else g.rect(G.x - 3, G.y - 3, G.w + 6, G.h + 6); g.stroke();
+  frameC = c;
+}
+
+function buildHandle() {
+  const k = DPR, n = hR * 2.6 * k, c = mk(n, n), g = c.getContext('2d'), h = n / 2, rr0 = hR * k, r = mulberry(17);
+  // 陶器の取っ手
+  const body = g.createRadialGradient(h - rr0 * 0.35, h - rr0 * 0.4, rr0 * 0.1, h, h, rr0);
+  body.addColorStop(0, '#fffdf7'); body.addColorStop(0.55, '#f7ebe0'); body.addColorStop(0.85, '#e7d2c6'); body.addColorStop(1, '#cfb2a6');
+  g.fillStyle = body; g.beginPath(); g.arc(h, h, rr0, 0, TAU); g.fill();
+  g.save(); g.beginPath(); g.arc(h, h, rr0, 0, TAU); g.clip();
+  const w1 = g.createRadialGradient(h + rr0 * 0.45, h + rr0 * 0.5, 0, h + rr0 * 0.45, h + rr0 * 0.5, rr0 * 0.7);
+  w1.addColorStop(0, 'rgba(242,184,168,0.35)'); w1.addColorStop(1, 'rgba(242,184,168,0)'); g.fillStyle = w1; g.fillRect(0, 0, n, n);
+  const w2 = g.createRadialGradient(h - rr0 * 0.6, h + rr0 * 0.3, 0, h - rr0 * 0.6, h + rr0 * 0.3, rr0 * 0.5);
+  w2.addColorStop(0, 'rgba(184,220,216,0.3)'); w2.addColorStop(1, 'rgba(184,220,216,0)'); g.fillStyle = w2; g.fillRect(0, 0, n, n);
+  g.restore();
+  g.strokeStyle = 'rgba(160,120,105,0.55)'; g.lineWidth = 2 * k; g.beginPath(); g.arc(h, h, rr0 - k, 0, TAU); g.stroke();
+  g.strokeStyle = 'rgba(255,255,255,0.6)'; g.lineWidth = 2 * k; g.beginPath(); g.arc(h, h, rr0 * 0.8, Math.PI * 1.0, Math.PI * 1.6); g.stroke();
+  g.strokeStyle = 'rgba(150,110,95,0.25)'; g.lineWidth = 2.5 * k; g.beginPath(); g.arc(h, h, rr0 * 0.8, 0.1, Math.PI * 0.8); g.stroke();
+  // 中心のくぼみ
+  const dr = rr0 * 0.3;
+  const dim = g.createRadialGradient(h + dr * 0.35, h + dr * 0.35, dr * 0.1, h, h, dr);
+  dim.addColorStop(0, '#fffaf3'); dim.addColorStop(0.7, '#ecdccf'); dim.addColorStop(1, '#cdb3a5');
+  g.fillStyle = dim; g.beginPath(); g.arc(h, h, dr, 0, TAU); g.fill();
+  g.strokeStyle = 'rgba(140,100,85,0.35)'; g.lineWidth = 1.5 * k; g.beginPath(); g.arc(h, h, dr, Math.PI * 0.9, Math.PI * 1.9); g.stroke();
+  g.strokeStyle = 'rgba(255,255,255,0.8)'; g.beginPath(); g.arc(h, h, dr, 0.1, Math.PI * 0.8); g.stroke();
+  g.fillStyle = 'rgba(255,255,255,0.75)'; g.beginPath(); g.ellipse(h - rr0 * 0.42, h - rr0 * 0.48, rr0 * 0.22, rr0 * 0.1, -0.7, 0, TAU); g.fill();
+  g.globalAlpha = 0.07; g.fillStyle = g.createPattern(granTile, 'repeat'); g.beginPath(); g.arc(h, h, rr0, 0, TAU); g.fill(); g.globalAlpha = 1;
+  handleSpr = c;
+  // 内側のスポンジ
+  const s = mk(n, n), sg = s.getContext('2d');
+  sg.fillStyle = '#b9e2e6'; sg.beginPath(); sg.arc(h, h, rr0 * 1.02, 0, TAU); sg.fill();
+  sg.strokeStyle = 'rgba(70,140,150,0.7)'; sg.lineWidth = 2 * k; sg.stroke();
+  const sp = sg.createRadialGradient(h - rr0 * 0.2, h - rr0 * 0.2, rr0 * 0.1, h, h, rr0 * 0.88);
+  sp.addColorStop(0, '#ffeaa0'); sp.addColorStop(0.7, '#f7c868'); sp.addColorStop(1, '#e3a34c');
+  sg.fillStyle = sp; sg.beginPath(); sg.arc(h, h, rr0 * 0.88, 0, TAU); sg.fill();
+  sg.save(); sg.beginPath(); sg.arc(h, h, rr0 * 0.88, 0, TAU); sg.clip();
+  for (let i = 0; i < 110; i++) {
+    const a = r() * TAU, d = Math.sqrt(r()) * rr0 * 0.86;
+    sg.fillStyle = 'rgba(190,120,40,' + (0.2 + r() * 0.3) + ')';
+    sg.beginPath(); sg.ellipse(h + Math.cos(a) * d, h + Math.sin(a) * d, (0.8 + r() * 2.2) * k, (0.6 + r() * 1.5) * k, r() * 3, 0, TAU); sg.fill();
+  }
+  wash(sg, h + rr0 * 0.3, h + rr0 * 0.35, rr0 * 0.5, '#e09a50', 0.25, r);
+  sg.restore();
+  sg.strokeStyle = 'rgba(200,130,50,0.6)'; sg.lineWidth = 1.5 * k; sg.beginPath(); sg.arc(h, h, rr0 * 0.88, 0, TAU); sg.stroke();
+  spongeSpr = s;
+  const sh = mk(n, n), shg = sh.getContext('2d');
+  const sgr = shg.createRadialGradient(h, h, rr0 * 0.5, h, h, rr0 * 1.25);
+  sgr.addColorStop(0, 'rgba(5,30,40,0.55)'); sgr.addColorStop(1, 'rgba(5,30,40,0)');
+  shg.fillStyle = sgr; shg.fillRect(0, 0, n, n);
+  shadowSpr = sh;
+}
+
+function buildOverlays() {
+  paperPat = ctx.createPattern(paperTile, 'repeat');
+  granPat = ctx.createPattern(granTile, 'repeat');
+  nightGradA = ctx.createLinearGradient(0, 0, 0, H);
+  nightGradA.addColorStop(0, '#5b4cb0'); nightGradA.addColorStop(0.5, '#33287e'); nightGradA.addColorStop(1, '#1a1446');
+  nightGradB = ctx.createLinearGradient(0, 0, 0, H);
+  nightGradB.addColorStop(0, '#8a80d8'); nightGradB.addColorStop(1, '#5a52a8');
+}
+
+// ============================================================
+//  世界の状態
+// ============================================================
+let T = 0;
+const P = { phase: 'clean', pT: 0, nightT: 0, dirtA: 1, clean: 0, cleanTimer: 0, dawnT: 0, ev: {}, idle: 0, hintCount: 0, partyMusic: 0, mantaDisc: false, flow: { x: 0, y: 0 }, flowT: 0, nextCurrent: 12, special: 0 };
+const handle = { x: 0, y: 0, press: 0, wob: 0, wobV: 0, sheen: 0 };
+const sponge = { x: 0, y: 0, vx: 0, vy: 0, px: 0, py: 0, spd: 0, jel: 0, jelV: 0, dx: 1, dy: 0, sqAcc: 0, rev: 0, lagx: 0, lagy: 0 };
+const drag = { id: null, ox: 0, oy: 0, virtual: false, active: false };
+let sweepId = null;
+const fishes = [], gfish = [], bubbles = [], flakes = [], sparks = [], ripples = [], trail = [], plankton = [];
+const schools = [], gschools = [];
+const MAXB = 150, MAXF = 130, MAXS = 170;
+let shark, ray, turtle, manta;
+let firstDragDone = false;
+
+function spongeTarget() {
+  return { x: handle.x + (handle.x - (G.x + G.w / 2)) / G.w * hR * 0.3 + hR * 0.12, y: handle.y + (handle.y - (G.y + G.h / 2)) / G.h * hR * 0.3 + hR * 0.2 };
+}
+
+function initWorld() {
+  handle.x = G.x + G.w / 2; handle.y = G.y + G.h / 2;
+  const st = spongeTarget(); sponge.x = sponge.px = st.x; sponge.y = sponge.py = st.y;
+  shark = { x: gx(0.3), y: gy(0.19), vx: 0, vy: 0, dir: 1, face: 1, ph: 0, wig: 0, roll: 0, look: 0, disc: false, a: 0, tgx: 0, tgy: 0, cd: 0, glimpse: false };
+  ray = { x: gx(0.2), y: gy(0.52), vx: 0, vy: 0, fph: 0, rot: 0, flip: 0, flipTo: 0, flipTimer: 0, sc: 1, disc: false, glimpse: false, spin: 0, burst: 0, a: 0, cd: 0, gl: 0 };
+  turtle = { x: gx(0.6), y: gy(floorV(0.6)) + S * 0.015, vx: 0, vy: 0, awake: 0, state: 'rest', stT: 0, face: 1, dir: 1, fph: 0, look: 0, bubT: 2, disc: false, a: 0, cd: 0, burst: 0, tx: 0.6, gl: 0 };
+  manta = { x: gx(0.5), y: gy(0.42), vx: 0, vy: 0, a: 0, depth: 0, fph: 0, head: 0, mode: 'far', k: 0, sx: 0, sy: 0, loop: 0, cd: 0, burst: 0 };
+  const types = ['clown', 'tang', 'pink', 'yellow', 'aqua'];
+  const sDefs = [[0.33, 0.36, 'clown', 6], [0.7, 0.6, 'tang', 6], [0.62, 0.3, 'pink', 5], [0.4, 0.66, 'yellow', 4], [0.75, 0.42, 'aqua', 5]];
+  schools.length = 0; fishes.length = 0;
+  sDefs.forEach((d, si) => {
+    const sc = { tu: d[0], tv: d[1], timer: 2 + R() * 4 };
+    schools.push(sc);
+    for (let i = 0; i < d[3]; i++) {
+      fishes.push(mkFish(gx(d[0]) + rr(-1, 1) * S * 0.1, gy(d[1]) + rr(-1, 1) * S * 0.08, d[2], si, S * rr(0.055, 0.085)));
+    }
+  });
+  // 取っ手のまわりをくるくる泳ぐ子
+  const pk = mkFish(handle.x + hR * 1.8, handle.y, 'pink', -1, S * 0.08); pk.peek = true; pk.orb = 0; fishes.push(pk);
+  const pk2 = mkFish(handle.x - hR * 1.8, handle.y + hR, 'clown', -1, S * 0.07); pk2.peek = true; pk2.orb = Math.PI; fishes.push(pk2);
+  plankton.length = 0;
+  for (let i = 0; i < 110; i++) plankton.push({ x: gx(R()), y: gy(R()), hu: R(), hv: 0.05 + Math.pow(R(), 1.3) * 0.75, ph: R() * TAU, s: rr(0.6, 1.6), c: ['white', 'aqua', 'lav', 'gold', 'mint'][(R() * 5) | 0], vx: 0, vy: 0, b: 0 });
+  resetDirt(true);
+}
+function mkFish(x, y, type, school, L) {
+  return { x, y, vx: rr(-1, 1) * 20, vy: 0, L, type, school, ph: R() * TAU, face: 1, tilt: 0, ox: rr(-1, 1), oy: rr(-1, 1), look: 0, react: 0, a: 1, glow: false, peek: false, wag: 0.6 + R() * 0.3, spd: rr(0.8, 1.2) };
+}
+function resetDirt(initial) {
+  dctx.globalCompositeOperation = 'source-over'; dctx.globalAlpha = 1;
+  dctx.clearRect(0, 0, DW, DH);
+  dctx.drawImage(buildAlgae(algaeSeed), 0, 0);
+  algaeSeed += 7;
+  grid.fill(1);
+  // 取っ手の周りだけ少しきれい
+  for (let i = 0; i < 3; i++) eraseAt(sponge.x + rr(-4, 4), sponge.y + rr(-4, 4), sR * 1.75, 0.3);
+}
+
+function remapAll(o) {
+  const mx = x => G.x + (x - o.x) / o.w * G.w, my = y => G.y + (y - o.y) / o.h * G.h;
+  const m = e => { e.x = mx(e.x); e.y = my(e.y); };
+  [handle, sponge, shark, ray, turtle, manta].forEach(m);
+  sponge.px = mx(sponge.px); sponge.py = my(sponge.py);
+  fishes.forEach(m); gfish.forEach(m); bubbles.forEach(m); flakes.forEach(m); sparks.forEach(m); ripples.forEach(m); trail.forEach(m); plankton.forEach(m);
+  clampHandle();
+}
+
+// ============================================================
+//  汚れの消去（軌跡そのものを記録）
+// ============================================================
+function eraseAt(x, y, r, a) {
+  const sx = DW / G.w, sy = DH / G.h;
+  const cx = (x - G.x) * sx, cy = (y - G.y) * sy;
+  dctx.globalCompositeOperation = 'destination-out';
+  dctx.globalAlpha = clamp(a, 0, 1);
+  dctx.drawImage(brushes[(R() * 3) | 0], cx - r * sx, cy - r * sy, 2 * r * sx, 2 * r * sy);
+  dctx.globalCompositeOperation = 'source-over'; dctx.globalAlpha = 1;
+  // グリッドも同じ形で更新
+  const cw = G.w / GX, ch = G.h / GY;
+  const i0 = Math.max(0, Math.floor((x - r - G.x) / cw)), i1 = Math.min(GX - 1, Math.floor((x + r - G.x) / cw));
+  const j0 = Math.max(0, Math.floor((y - r - G.y) / ch)), j1 = Math.min(GY - 1, Math.floor((y + r - G.y) / ch));
+  let removed = 0;
+  for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+    const px = G.x + (i + 0.5) * cw, py = G.y + (j + 0.5) * ch;
+    const d = hyp(px - x, py - y) / r; if (d >= 1) continue;
+    const f = clamp((1 - d) * 1.8, 0, 1) * 0.96;
+    const k = j * GX + i, before = grid[k];
+    grid[k] = before * (1 - a * f);
+    removed += before - grid[k];
+  }
+  return removed;
+}
+function dirtAt(x, y) {
+  const i = clamp(Math.floor((x - G.x) / G.w * GX), 0, GX - 1), j = clamp(Math.floor((y - G.y) / G.h * GY), 0, GY - 1);
+  return grid[j * GX + i] * P.dirtA;
+}
+function visAt(pts) { let s = 0; for (const p of pts) s += 1 - dirtAt(p[0], p[1]); return s / pts.length; }
+
+// ============================================================
+//  音（Web Audio 合成）
+// ============================================================
+const AU = { c: null, voices: 0, gates: {}, mus: { next: 0, step: 0, chord: 0, vol: 0 }, drip: 3 };
+function audioInit() {
+  if (AU.c) { if (AU.c.state !== 'running') AU.c.resume().catch(() => {}); return; }
+  const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+  let c; try { c = new AC(); } catch (e) { return; }
+  AU.c = c;
+  const comp = c.createDynamicsCompressor();
+  comp.threshold.value = -20; comp.knee.value = 14; comp.ratio.value = 5; comp.attack.value = 0.004; comp.release.value = 0.25;
+  const master = c.createGain(); master.gain.setValueAtTime(0.0001, c.currentTime); master.gain.exponentialRampToValueAtTime(0.8, c.currentTime + 0.6);
+  master.connect(comp); comp.connect(c.destination);
+  const fx = c.createGain(); fx.gain.value = 0.32;
+  const d1 = c.createDelay(1), d2 = c.createDelay(1); d1.delayTime.value = 0.19; d2.delayTime.value = 0.31;
+  const f1 = c.createGain(), f2 = c.createGain(); f1.gain.value = 0.4; f2.gain.value = 0.35;
+  const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3000;
+  fx.connect(d1); fx.connect(d2); d1.connect(f1); f1.connect(d2); d2.connect(f2); f2.connect(d1);
+  d1.connect(lp); d2.connect(lp); lp.connect(master);
+  const nb = c.createBuffer(1, c.sampleRate * 2, c.sampleRate), nd = nb.getChannelData(0);
+  for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+  AU.noise = nb; AU.master = master; AU.fx = fx;
+  // しゃーっ（速い擦り）
+  const s1 = c.createBufferSource(); s1.buffer = nb; s1.loop = true;
+  const bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1200; bp.Q.value = 0.9;
+  const sg = c.createGain(); sg.gain.value = 0;
+  s1.connect(bp); bp.connect(sg); sg.connect(master); s1.start();
+  AU.sw = { g: sg, f: bp };
+  // 水の環境音
+  const s2 = c.createBufferSource(); s2.buffer = nb; s2.loop = true; s2.loopStart = 0.5;
+  const lp2 = c.createBiquadFilter(); lp2.type = 'lowpass'; lp2.frequency.value = 320;
+  const ag = c.createGain(); ag.gain.value = 0.022;
+  s2.connect(lp2); lp2.connect(ag); ag.connect(master); s2.start(0, 0.7);
+  AU.amb = ag;
+  c.resume().catch(() => {});
+}
+function gate(k, gap) { if (!AU.c) return false; const t = AU.c.currentTime; if (AU.gates[k] && t - AU.gates[k] < gap) return false; AU.gates[k] = t; return true; }
+function canVoice() { return AU.c && AU.c.state === 'running' && AU.voices < 26; }
+function envG(t, v, att, dec, dest) {
+  const g = AU.c.createGain();
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, v), t + att); g.gain.exponentialRampToValueAtTime(0.0001, t + att + dec);
+  g.connect(dest || AU.master); return g;
+}
+function osc(type, f, t, dur, dest) {
+  const o = AU.c.createOscillator(); o.type = type; o.frequency.setValueAtTime(Math.min(f, AU.c.sampleRate * 0.4), t); o.connect(dest);
+  o.start(t); o.stop(t + dur + 0.05); AU.voices++; o.onended = () => { AU.voices--; try { o.disconnect(); } catch (e) {} }; return o;
+}
+function bell(f, v, when, dec, fxAmt) {
+  if (!canVoice()) return; const c = AU.c, t = c.currentTime + (when || 0); dec = dec || 1.2;
+  const g = envG(t, v, 0.005, dec); if (fxAmt !== 0) { const s = c.createGain(); s.gain.value = fxAmt == null ? 0.8 : fxAmt; g.connect(s); s.connect(AU.fx); }
+  osc('sine', f, t, dec + 0.02, g);
+  const g2 = c.createGain(); g2.gain.value = 0.18; g2.connect(g); osc('sine', f * 2.756, t, dec * 0.6, g2);
+  const g3 = c.createGain(); g3.gain.value = 0.06; g3.connect(g); osc('sine', f * 5.4, t, dec * 0.3, g3);
+}
+function noiseBurst(t, dur, f0, f1, q, v, dest) {
+  const c = AU.c, s = c.createBufferSource(); s.buffer = AU.noise;
+  const bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = q; bp.frequency.setValueAtTime(f0, t); bp.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  const g = envG(t, v, Math.min(0.03, dur * 0.3), dur, dest);
+  s.connect(bp); bp.connect(g); s.start(t, Math.random()); s.stop(t + dur + 0.08);
+  AU.voices++; s.onended = () => { AU.voices--; try { s.disconnect(); } catch (e) {} };
+}
+const SND = {
+  squeak(p) {
+    if (!canVoice() || !gate('sq', 0.09)) return; const c = AU.c, t = c.currentTime;
+    const g = envG(t, 0.045, 0.012, 0.11);
+    const o = osc('triangle', p, t, 0.14, g); o.frequency.exponentialRampToValueAtTime(p * 1.28, t + 0.05); o.frequency.exponentialRampToValueAtTime(p * 0.92, t + 0.12);
+    noiseBurst(t, 0.07, 2600, 1800, 3, 0.02);
+  },
+  squish() { if (!canVoice()) return; const t = AU.c.currentTime; noiseBurst(t, 0.16, 500, 1600, 1.4, 0.07); const g = envG(t, 0.05, 0.01, 0.14); const o = osc('sine', 300, t, 0.16, g); o.frequency.exponentialRampToValueAtTime(620, t + 0.12); },
+  pop(size) {
+    if (!canVoice() || !gate('pop', 0.035)) return; const c = AU.c, t = c.currentTime;
+    const f = clamp(900 / Math.max(0.5, size), 280, 1500);
+    const g = envG(t, 0.11, 0.004, 0.1); const o = osc('sine', f, t, 0.12, g); o.frequency.exponentialRampToValueAtTime(f * 2.3, t + 0.07);
+    const s = c.createGain(); s.gain.value = 0.5; g.connect(s); s.connect(AU.fx);
+    bell(f * 3, 0.025, 0.03, 0.25);
+  },
+  tink(x) { if (!gate('tink', 0.12)) return; bell(1900 + (x || 0) * 600, 0.05, 0, 0.5, 0.5); if (canVoice()) noiseBurst(AU.c.currentTime, 0.04, 4000, 3000, 2, 0.015); },
+  polish() { if (!gate('pol', 0.28)) return; bell(2637, 0.04, 0, 0.6); bell(3520, 0.03, 0.06, 0.6); },
+  chime() { [1046.5, 1318.5, 1568, 2093].forEach((f, i) => bell(f, 0.07, i * 0.09, 1.4)); },
+  softChime() { [784, 1046.5, 1318.5].forEach((f, i) => bell(f, 0.05, i * 0.14, 1.8)); },
+  fanfare() { [523.25, 659.25, 783.99, 1046.5, 1318.5, 1568, 2093].forEach((f, i) => bell(f, 0.06, i * 0.11, 2.2)); },
+  whoosh(v) { if (!canVoice() || !gate('wh', 0.8)) return; noiseBurst(AU.c.currentTime, 1.6, 250, 900, 0.8, v || 0.06); },
+  blub(n, base) { if (!canVoice()) return; for (let i = 0; i < n; i++) { const t = AU.c.currentTime + i * 0.11; const g = envG(t, 0.06, 0.005, 0.09); const o = osc('sine', base * (1 + i * 0.15), t, 0.1, g); o.frequency.exponentialRampToValueAtTime(base * 2 * (1 + i * 0.15), t + 0.07); } },
+  boo(f0, f1) { if (!canVoice()) return; const t = AU.c.currentTime; const lp = AU.c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 900; lp.connect(AU.master); const g = envG(t, 0.09, 0.04, 0.45, lp); const o = osc('triangle', f0, t, 0.5, g); o.frequency.exponentialRampToValueAtTime(f1, t + 0.25); o.frequency.exponentialRampToValueAtTime(f0 * 1.1, t + 0.45); },
+  pip(f) { if (!canVoice() || !gate('pip', 0.05)) return; const t = AU.c.currentTime; const g = envG(t, 0.05, 0.004, 0.08); const o = osc('sine', f, t, 0.1, g); o.frequency.exponentialRampToValueAtTime(f * 1.5, t + 0.05); },
+  drip() { const f = [1568, 1760, 2093, 2349, 2637][(R() * 5) | 0]; bell(f, 0.018, 0, 0.9); }
+};
+const PENT = [523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.5, 1568, 1760];
+const CHORDS = [[261.63, 392], [220, 329.63], [174.61, 261.63], [196, 293.66]];
+function pad(f, dur, v) {
+  if (!canVoice()) return; const c = AU.c, t = c.currentTime;
+  const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 900; lp.connect(AU.master);
+  const g = c.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(v, t + 1.6); g.gain.setValueAtTime(v, t + dur - 1.6); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  g.connect(lp); const s = c.createGain(); s.gain.value = 0.4; g.connect(s); s.connect(AU.fx);
+  osc('triangle', f, t, dur, g); osc('sine', f * 1.003, t, dur, g);
+}
+function audioUpdate(dt) {
+  if (!AU.c || AU.c.state !== 'running') return;
+  const t = AU.c.currentTime;
+  // 擦過音
+  const vn = sponge.spd / S;
+  const want = drag.active ? clamp((vn - 0.6) / 1.8, 0, 1) * 0.2 : 0;
+  AU.sw.g.gain.setTargetAtTime(want, t, 0.05);
+  AU.sw.f.frequency.setTargetAtTime(900 + vn * 500, t, 0.08);
+  // 昼の水滴
+  if (P.phase !== 'party') { AU.drip -= dt; if (AU.drip < 0) { AU.drip = rr(3, 6); SND.drip(); } }
+  // パーティー音楽
+  const m = AU.mus;
+  if (P.partyMusic > 0) {
+    if (m.next < t) m.next = t + 0.05;
+    while (m.next < t + 0.25) {
+      const step = m.step % 16;
+      if (step === 0) { const ch = CHORDS[m.chord % 4]; pad(ch[0], 6.6, 0.028 * P.partyMusic); pad(ch[1], 6.6, 0.018 * P.partyMusic); m.chord++; }
+      const when = m.next - t;
+      if (step % 2 === 0 && R() < 0.75) bell(PENT[(R() * PENT.length) | 0], 0.035 * P.partyMusic, when, 1.6);
+      if (step % 4 === 3 && R() < 0.4) bell(PENT[5 + ((R() * 5) | 0)] * 2, 0.018 * P.partyMusic, when, 0.8);
+      m.next += 0.42; m.step++;
+    }
+  }
+}
+
+// ============================================================
+//  パーティクル
+// ============================================================
+function addBubble(x, y, r, vx, vy, opt) {
+  if (bubbles.length >= MAXB) { if (opt && opt.big) bubbles.shift(); else return null; }
+  const b = { x, y, r, vx: vx || 0, vy: vy || -rr(20, 40), ph: R() * TAU, life: 0, big: !!(opt && opt.big), sp: !!(opt && opt.sp), glow: opt && opt.glow };
+  bubbles.push(b); return b;
+}
+function addFlake(x, y, vx, vy) {
+  if (flakes.length >= MAXF) return;
+  flakes.push({ x, y, vx, vy, s: rr(0.4, 1.1) * S * 0.016, rot: R() * TAU, vr: rr(-2, 2), life: 0, max: rr(1.6, 3), k: (R() * 4) | 0 });
+}
+function addSpark(x, y, s, vx, vy, col, max) {
+  if (sparks.length >= MAXS) sparks.shift();
+  sparks.push({ x, y, s, vx: vx || 0, vy: vy || 0, life: 0, max: max || rr(0.5, 1.1), col: col || 'white', star: R() < 0.35 });
+}
+function burstSparks(x, y, n, rad, col) {
+  for (let i = 0; i < n; i++) { const a = R() * TAU, v = rr(0.3, 1) * rad * 2.2; addSpark(x, y, rr(4, 10), Math.cos(a) * v, Math.sin(a) * v, col || ['white', 'gold', 'aqua', 'pink'][(R() * 4) | 0]); }
+}
+function ringSparks(x, y, rad, n, col) {
+  for (let i = 0; i < n; i++) { const a = i / n * TAU; addSpark(x + Math.cos(a) * rad * 0.6, y + Math.sin(a) * rad * 0.6, rr(6, 12), Math.cos(a) * rad * 0.9, Math.sin(a) * rad * 0.9, col, rr(0.8, 1.3)); }
+}
+
+// ============================================================
+//  入力（ポインター1本を管理）
+// ============================================================
+function markInteract() { P.idle = 0; if (hint.on) stopHint(); }
+function clampHandle() {
+  handle.x = clamp(handle.x, G.x + hR * 0.9, G.x + G.w - hR * 0.9);
+  handle.y = clamp(handle.y, G.y + hR * 0.9, G.y + G.h - hR * 0.9);
+}
+function onDown(e) {
+  e.preventDefault();
+  audioInit(); markInteract();
+  const x = e.clientX, y = e.clientY;
+  if (drag.id === null && !drag.virtual && hyp(x - handle.x, y - handle.y) < hR * 1.7) {
+    drag.id = e.pointerId; drag.active = true; drag.ox = handle.x - x; drag.oy = handle.y - y;
+    try { cvs.setPointerCapture(e.pointerId); } catch (er) {}
+    pressStart();
+    return;
+  }
+  if (drag.id === null && sweepId === null) { sweepId = e.pointerId; try { cvs.setPointerCapture(e.pointerId); } catch (er) {} }
+  tapAt(x, y);
+}
+function onMove(e) {
+  if (e.pointerId === drag.id) {
+    e.preventDefault(); P.idle = 0;
+    handle.x = e.clientX + drag.ox; handle.y = e.clientY + drag.oy; clampHandle();
+  } else if (e.pointerId === sweepId) {
+    P.idle = 0; popBubblesAt(e.clientX, e.clientY, 6);
+  }
+}
+function onUp(e) {
+  if (e.pointerId === drag.id) { drag.id = null; drag.active = false; pressEnd(); }
+  if (e.pointerId === sweepId) sweepId = null;
+  try { if (cvs.hasPointerCapture && cvs.hasPointerCapture(e.pointerId)) cvs.releasePointerCapture(e.pointerId); } catch (er) {}
+}
+cvs.addEventListener('pointerdown', onDown, { passive: false });
+cvs.addEventListener('pointermove', onMove, { passive: false });
+cvs.addEventListener('pointerup', onUp);
+cvs.addEventListener('pointercancel', onUp);
+cvs.addEventListener('lostpointercapture', e => { if (e.pointerId === drag.id) { drag.id = null; drag.active = false; pressEnd(); } if (e.pointerId === sweepId) sweepId = null; });
+window.addEventListener('blur', () => { if (drag.id !== null) { drag.id = null; drag.active = false; pressEnd(); } sweepId = null; });
+['touchstart', 'touchmove', 'touchend', 'gesturestart', 'gesturechange', 'dblclick', 'contextmenu', 'selectstart'].forEach(n =>
+  document.addEventListener(n, e => { if (e.cancelable) e.preventDefault(); }, { passive: false }));
+
+function pressStart() {
+  handle.press = 1; sponge.jelV -= 9;
+  // 最初のタップだけで目に見えて変わる：強めにひと拭き
+  let rem = eraseAt(sponge.x, sponge.y, sR * 1.45, 0.85);
+  for (let i = 0; i < 3; i++) rem += eraseAt(sponge.x + rr(-0.25, 0.25) * sR, sponge.y + rr(-0.25, 0.25) * sR, sR, 0.4);
+  for (let i = 0; i < 16; i++) { const a = R() * TAU; addBubble(sponge.x + Math.cos(a) * sR * 1.05, sponge.y + Math.sin(a) * sR * 1.05, rr(3, 8) * S / 400, Math.cos(a) * 40, -rr(30, 90)); }
+  const nf = Math.min(16, 4 + rem * 1.5);
+  for (let i = 0; i < nf; i++) { const a = R() * TAU; addFlake(sponge.x + Math.cos(a) * sR, sponge.y + Math.sin(a) * sR, Math.cos(a) * rr(20, 60), Math.sin(a) * rr(20, 60)); }
+  pushTrail(sponge.x, sponge.y, rem > 0.3 ? 0 : 1);
+  SND.squish();
+  if (!firstDragDone) { firstDragDone = true; fishes.forEach(f => { if (f.peek) f.peekRelease = 0.5 + R() * 3; }); }
+}
+function pressEnd() { sponge.jelV += 6; handle.wobV += 3; }
+
+function tapAt(x, y) {
+  // 泡
+  if (popBubblesAt(x, y, 14)) return;
+  // 生き物（見えている所だけ）
+  const visible = 1 - dirtAt(x, y) > 0.5;
+  if (visible && x > G.x && x < G.x + G.w && y > G.y && y < G.y + G.h) {
+    const c = pickCreature(x, y);
+    if (c) { reactCreature(c, x, y); return; }
+  }
+  // それ以外は小さな水のふるえだけ
+  if (ripples.length > 7) ripples.shift();
+  ripples.push({ x, y, t: 0 });
+  SND.tink((x - G.x) / G.w);
+  handle.wobV += 5;
+  if (P.nightT > 0.3) plankton.forEach(p => { const d = hyp(p.x - x, p.y - y); if (d < S * 0.25) { p.b = 1; p.vx += (x - p.x) * 0.8; p.vy += (y - p.y) * 0.8; } });
+}
+function popBubblesAt(x, y, pad) {
+  let hit = false;
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    if (b.r < 3.5) continue;
+    if (hyp(b.x - x, b.y - y) < b.r + pad) { popBubble(i); hit = true; if (pad > 10) break; }
+  }
+  return hit;
+}
+function popBubble(i) {
+  const b = bubbles[i]; bubbles.splice(i, 1);
+  const n = clamp(Math.round(b.r / 3), 3, 14);
+  for (let k = 0; k < n; k++) { const a = R() * TAU, v = rr(0.5, 1.2) * b.r * 3; addSpark(b.x, b.y, rr(3, 7) * (b.sp ? 1.5 : 1), Math.cos(a) * v, Math.sin(a) * v, b.sp ? ['gold', 'pink', 'aqua'][k % 3] : (P.nightT > 0.4 ? ['aqua', 'gold', 'pink', 'white'][k % 4] : 'white'), rr(0.4, 0.9)); }
+  SND.pop(b.r / (S * 0.02));
+  if (b.sp) { SND.chime(); ringSparks(b.x, b.y, b.r * 3, 14, 'gold'); }
+  // 近くの光る魚が集まってくる
+  gfish.forEach(f => { if (hyp(f.x - b.x, f.y - b.y) < S * 0.3) { f.attract = 1.2; f.ax = b.x; f.ay = b.y; } });
+}
+
+// ============================================================
+//  お手本の手（言葉なしの誘導）
+// ============================================================
+const hint = { on: false, t: 0, kind: 'drag', sx: 0, sy: 0, dx: 0, dy: 0, tx: 0, ty: 0, alpha: 0 };
+function startHint() {
+  hint.on = true; hint.t = 0; P.hintCount++;
+  if (P.phase === 'party') {
+    hint.kind = 'tap';
+    let tgt = bubbles.find(b => b.sp) || bubbles.find(b => b.big && b.y > G.y + G.h * 0.3);
+    if (!tgt) { tgt = { x: turtle.x + turtle.face * S * 0.15, y: turtle.y - S * 0.08 }; hint.tgtCreature = turtle; } else hint.tgtCreature = null;
+    hint.bub = tgt.r ? tgt : null;
+    hint.tx = tgt.x; hint.ty = tgt.y;
+  } else {
+    hint.kind = 'drag';
+    // まだ見つけていない子の方向へ少しだけ
+    let goal = null;
+    if (!ray.disc) goal = [ray.x, ray.y]; else if (!turtle.disc) goal = [turtle.x, turtle.y - S * 0.05]; else if (!shark.disc) goal = [shark.x, shark.y]; else goal = [gx(R()), gy(R())];
+    let dx = goal[0] - handle.x, dy = goal[1] - handle.y; const d = hyp(dx, dy) || 1;
+    const len = Math.min(d, S * 0.16); hint.dx = dx / d * len; hint.dy = dy / d * len;
+    hint.sx = handle.x; hint.sy = handle.y;
+  }
+}
+function stopHint() {
+  if (hint.on && hint.kind === 'drag' && drag.virtual) { drag.virtual = false; drag.active = false; pressEnd(); }
+  hint.on = false;
+}
+function updateHint(dt) {
+  if (drag.id !== null) P.idle = 0;
+  P.idle += dt;
+  const first = P.hintCount === 0;
+  if (!hint.on && P.idle > (first ? 4.5 : 14) && P.phase !== 'dawn' && drag.id === null) { startHint(); P.idle = first ? 0 : -2; }
+  if (!hint.on) { hint.alpha = Math.max(0, hint.alpha - dt * 3); return; }
+  hint.t += dt; const t = hint.t;
+  if (hint.kind === 'drag') {
+    hint.alpha = t < 0.5 ? t / 0.5 : t > 2.9 ? Math.max(0, 1 - (t - 2.9) / 0.5) : 1;
+    if (t < 0.6) { const k = smooth(t / 0.6); hint.x = lerp(handle.x + hR * 0.9, handle.x, k); hint.y = lerp(handle.y + hR * 1.4, handle.y, k); hint.press = 0; }
+    else if (t < 0.85) { hint.x = handle.x; hint.y = handle.y; hint.press = (t - 0.6) / 0.25; if (!drag.virtual) { drag.virtual = true; drag.active = true; pressStart(); } }
+    else if (t < 2.25) { const k = smooth((t - 0.85) / 1.4); handle.x = hint.sx + hint.dx * k + Math.sin(k * Math.PI * 3) * hR * 0.1; handle.y = hint.sy + hint.dy * k; clampHandle(); hint.x = handle.x; hint.y = handle.y; hint.press = 1; }
+    else if (t < 2.5) { if (drag.virtual) { drag.virtual = false; drag.active = false; pressEnd(); } hint.press = 1 - (t - 2.25) / 0.25; hint.x = handle.x; hint.y = handle.y; }
+    else { hint.x = handle.x + (t - 2.5) * hR * 1.2; hint.y = handle.y + (t - 2.5) * hR * 1.6; hint.press = 0; }
+    if (t > 3.4) { hint.on = false; }
+  } else {
+    if (hint.bub) { hint.tx = hint.bub.x; hint.ty = hint.bub.y; }
+    hint.alpha = t < 0.5 ? t / 0.5 : t > 2.0 ? Math.max(0, 1 - (t - 2.0) / 0.5) : 1;
+    const k = smooth(t / 0.9); hint.x = lerp(hint.tx + S * 0.15, hint.tx, k); hint.y = lerp(hint.ty + S * 0.2, hint.ty, k);
+    hint.press = t > 0.9 && t < 1.3 ? Math.sin((t - 0.9) / 0.4 * Math.PI) : 0;
+    if (t > 1.1 && !hint.tapped) {
+      hint.tapped = true;
+      const i = hint.bub ? bubbles.indexOf(hint.bub) : -1;
+      if (i >= 0) popBubble(i); else if (hint.tgtCreature) reactCreature(hint.tgtCreature, hint.tx, hint.ty);
+    }
+    if (t > 2.5) { hint.on = false; hint.tapped = false; }
+  }
+}
+
+// ============================================================
+//  取っ手とスポンジの物理・掃除
+// ============================================================
+function updateSponge(dt) {
+  const tg = spongeTarget();
+  sponge.px = sponge.x; sponge.py = sponge.y;
+  const k = 900, c = 2 * Math.sqrt(k) * 0.72;
+  const n = Math.max(1, Math.ceil(dt / 0.006)), h = dt / n;
+  for (let i = 0; i < n; i++) {
+    const ax = k * (tg.x - sponge.x) - c * sponge.vx, ay = k * (tg.y - sponge.y) - c * sponge.vy;
+    sponge.vx += ax * h; sponge.vy += ay * h; sponge.x += sponge.vx * h; sponge.y += sponge.vy * h;
+  }
+  // ズレを大きくしない
+  let lx = sponge.x - tg.x, ly = sponge.y - tg.y; const ld = hyp(lx, ly), mx = sR * 0.55;
+  if (ld > mx) { sponge.x = tg.x + lx / ld * mx; sponge.y = tg.y + ly / ld * mx; lx = sponge.x - tg.x; ly = sponge.y - tg.y; }
+  sponge.lagx = lx; sponge.lagy = ly;
+  const mvx = sponge.x - sponge.px, mvy = sponge.y - sponge.py, mv = hyp(mvx, mvy);
+  const inst = mv / Math.max(dt, 1e-3);
+  sponge.spd += (inst - sponge.spd) * Math.min(1, dt * 12);
+  // ぷるんとした弾性
+  sponge.jelV += (-260 * sponge.jel - 9 * sponge.jelV) * dt; sponge.jel += sponge.jelV * dt;
+  handle.wobV += (-300 * handle.wob - 10 * handle.wobV) * dt; handle.wob += handle.wobV * dt;
+  handle.press += ((drag.active ? 1 : 0) - handle.press) * Math.min(1, dt * 14);
+
+  if (!drag.active) { sponge.sqAcc = 0; return; }
+  const vn = sponge.spd / S;
+  const fast = clamp((vn - 0.5) / 2, 0, 1), slow = 1 - clamp(vn / 0.9, 0, 1);
+  const r = sR * (1.02 + 0.16 * slow - 0.12 * fast);
+  let removed = 0;
+  if (mv > 0.5) {
+    const steps = Math.ceil(mv / (r * 0.2));
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      removed += eraseAt(lerp(sponge.px, sponge.x, t), lerp(sponge.py, sponge.y, t), r, 0.3);
+    }
+    // 方向の切り返し（小さな往復で磨き上げ）
+    const dx = mvx / mv, dy = mvy / mv;
+    if (inst > S * 0.12 && dx * sponge.dx + dy * sponge.dy < -0.25) {
+      sponge.rev = Math.min(4, sponge.rev + 1);
+      const d0 = dirtAt(sponge.x, sponge.y);
+      removed += eraseAt(sponge.x, sponge.y, r * 0.95, 0.55);
+      if (d0 < 0.3) { addSpark(sponge.x + rr(-0.5, 0.5) * sR, sponge.y + rr(-0.5, 0.5) * sR, rr(14, 24), 0, -10, 'white', 0.8); SND.polish(); }
+    }
+    if (inst > S * 0.05) { sponge.dx = dx; sponge.dy = dy; }
+    // 音：ゆっくり→きゅっきゅっ
+    if (vn > 0.04 && vn < 1.1) { sponge.sqAcc += mv; if (sponge.sqAcc > sR * 0.75) { sponge.sqAcc = 0; SND.squeak(rr(1050, 1500)); } }
+    pushTrail(sponge.x, sponge.y, removed * P.dirtA > 0.05 ? 0 : 1);
+  } else {
+    // 押しっぱなしでもじわじわ
+    removed += eraseAt(sponge.x + rr(-3, 3), sponge.y + rr(-3, 3), r * 0.95, 0.07);
+  }
+  sponge.rev = Math.max(0, sponge.rev - dt * 2);
+  removed *= P.dirtA;
+  // はがれた藻と泡
+  const nflR = removed * 1.6, nfl = Math.floor(nflR) + (R() < nflR % 1 ? 1 : 0);
+  for (let i = 0; i < nfl && i < 8; i++) {
+    const a = R() * TAU, rad = r * rr(0.6, 1.0);
+    const sp = 0.25 + fast * 0.6;
+    addFlake(sponge.x + Math.cos(a) * rad, sponge.y + Math.sin(a) * rad, mvx / dt * sp * 0.5 + Math.cos(a) * 15, mvy / dt * sp * 0.5 + Math.sin(a) * 15);
+  }
+  const nbR = dt * (3 + vn * 22), nb = Math.floor(nbR) + (R() < nbR % 1 ? 1 : 0);
+  for (let i = 0; i < nb; i++) {
+    const a = R() * TAU;
+    addBubble(sponge.x + Math.cos(a) * r * 0.9, sponge.y + Math.sin(a) * r * 0.9, rr(1.5, 5) * S / 420, mvx / dt * (0.1 + fast * 0.3) + rr(-10, 10), -rr(25, 70) + mvy / dt * fast * 0.2);
+  }
+}
+function pushTrail(x, y, pearl) {
+  const last = trail[trail.length - 1];
+  if (last && hyp(last.x - x, last.y - y) < 4 && T - last.t < 0.05) return;
+  trail.push({ x, y, t: T, pearl: pearl || P.phase === 'party' ? 1 : 0 });
+  if (trail.length > 90) trail.shift();
+  if (pearl && R() < 0.35) addSpark(x + rr(-0.4, 0.4) * sR, y + rr(-0.4, 0.4) * sR, rr(4, 9), 0, -6, ['white', 'pink', 'aqua'][(R() * 3) | 0], 0.9);
+}
+
+// ============================================================
+//  生き物
+// ============================================================
+function spongeNear(x, y, d) { return drag.active && hyp(sponge.x - x, sponge.y - y) < d; }
+function rayPts() { const Rr = S * 0.19 * ray.sc; return [[ray.x, ray.y], [ray.x - Rr * 0.6, ray.y], [ray.x + Rr * 0.6, ray.y], [ray.x, ray.y - Rr * 0.35], [ray.x, ray.y + Rr * 0.3]]; }
+function turtlePts() { const L = S * 0.3; return [[turtle.x, turtle.y - L * 0.22], [turtle.x - L * 0.25, turtle.y - L * 0.15], [turtle.x + L * 0.25, turtle.y - L * 0.15], [turtle.x + turtle.face * L * 0.58, turtle.y - L * 0.05]]; }
+function sharkPts() { const L = S * 0.5; return [[shark.x, shark.y], [shark.x + shark.face * L * 0.3, shark.y], [shark.x - shark.face * L * 0.25, shark.y], [shark.x + shark.face * L * 0.1, shark.y - L * 0.1]]; }
+
+function discover(c, x, y, big) {
+  c.disc = true; c.gl = 1;
+  SND.chime();
+  ringSparks(x, y, S * (big ? 0.18 : 0.12), 16, 'gold');
+  burstSparks(x, y, 10, S * 0.1);
+}
+
+function updateCreatures(dt) {
+  const party = P.phase === 'party';
+  const dawn = P.phase === 'dawn';
+  // ---- サメ
+  {
+    const sh = shark, L = S * 0.5;
+    if (party && P.pT > 8) {
+      sh.a += dt * TAU / 26;
+      const tx = gx(0.5) + Math.sin(sh.a) * G.w * 0.33, ty = gy(0.33) + Math.sin(sh.a * 2) * G.h * 0.09;
+      const vx = (tx - sh.x) * 1.4, vy = (ty - sh.y) * 1.4;
+      sh.vx += (vx - sh.vx) * Math.min(1, dt * 2); sh.vy += (vy - sh.vy) * Math.min(1, dt * 2);
+      if (sh.vx > 6) sh.dir = 1; else if (sh.vx < -6) sh.dir = -1;
+    } else {
+      const spd = G.w * (sh.disc ? 0.05 : 0.065) * (1 + sh.wig * 0.8);
+      if (sh.dir > 0 && sh.x > gx(0.84)) sh.dir = -1; if (sh.dir < 0 && sh.x < gx(0.16)) sh.dir = 1;
+      sh.vx += (sh.dir * spd - sh.vx) * Math.min(1, dt * 0.7);
+      const ty = gy(0.19) + Math.sin(T * 0.35) * G.h * 0.025 + (sh.disc ? S * 0.02 : 0);
+      sh.vy = (ty - sh.y) * 1.2;
+    }
+    sh.x += sh.vx * dt; sh.y += sh.vy * dt;
+    sh.face += (sh.dir - sh.face) * Math.min(1, dt * 1.8);
+    sh.ph += dt * (2.6 + sh.wig * 6);
+    sh.wig = Math.max(0, sh.wig - dt * 0.6); sh.look = Math.max(0, sh.look - dt * 0.4); sh.cd -= dt; sh.gl = Math.max(0, (sh.gl || 0) - dt * 0.5);
+    if (sh.roll > 0) sh.roll = Math.min(1.0001, sh.roll + dt * 0.9); if (sh.roll >= 1) sh.roll = 0;
+    if (P.phase === 'clean' && !sh.disc) {
+      const v = visAt(sharkPts());
+      if (v > 0.42) { discover(sh, sh.x, sh.y, true); sh.look = 1; SND.boo(220, 330); }
+    }
+  }
+  // ---- エイ
+  {
+    const r = ray, Rr = S * 0.19;
+    let tx, ty, scT = 1;
+    if (party && P.pT > 8) {
+      r.a += dt * TAU / 18;
+      tx = gx(0.3) + Math.cos(r.a) * G.w * 0.16; ty = gy(0.5) + Math.sin(r.a) * G.h * 0.12; scT = 1.18 + 0.12 * Math.sin(r.a);
+      if (Math.sin(r.a) > 0.97 && r.flipTimer <= 0) { r.flipTo = 1; r.flipTimer = 3; }
+    } else {
+      tx = gx(0.2) + Math.sin(T * 0.4) * G.w * 0.025; ty = gy(0.52) + Math.sin(T * 0.6) * G.h * 0.025;
+      if (r.disc) {
+        scT = 1.2;
+        if (spongeNear(r.x, r.y, S * 0.5)) { tx += clamp(sponge.x - tx, -G.w * 0.1, G.w * 0.1) * 0.5; ty += clamp(sponge.y - ty, -G.h * 0.1, G.h * 0.1) * 0.4; }
+        if (spongeNear(r.x, r.y, S * 0.32) && r.flipTimer <= 0 && r.cd <= 0) { r.flipTo = 1; r.flipTimer = 2.6; r.cd = 6; SND.blub(2, 500); }
+      }
+    }
+    const vx = (tx - r.x) * 1.3, vy = (ty - r.y) * 1.3;
+    r.vx += (vx - r.vx) * Math.min(1, dt * 2); r.vy += (vy - r.vy) * Math.min(1, dt * 2);
+    r.x += r.vx * dt; r.y += r.vy * dt;
+    r.sc += (scT - r.sc) * Math.min(1, dt * 1.2);
+    let rotT = clamp(r.vx / (S * 0.6), -0.5, 0.5);
+    if (r.disc && drag.active && !party) rotT = clamp(Math.atan2(sponge.x - r.x, -(sponge.y - r.y)) * 0.35, -0.55, 0.55);
+    r.rot += (rotT - r.rot) * Math.min(1, dt * 2.5);
+    r.fph += dt * (1.5 + (r.disc ? 0.9 : 0) + r.burst * 4); r.burst = Math.max(0, r.burst - dt * 0.7);
+    r.flipTimer -= dt; if (r.flipTimer <= 0) r.flipTo = 0;
+    r.flip += (r.flipTo - r.flip) * Math.min(1, dt * 2.6);
+    if (r.spin > 0) { r.spin += dt * 0.8; if (r.spin > 1) r.spin = 0; }
+    r.cd -= dt; r.gl = Math.max(0, r.gl - dt * 0.5);
+    if (P.phase === 'clean') {
+      const v = visAt(rayPts());
+      if (!r.glimpse && v > 0.25) { r.glimpse = true; r.burst = 0.6; }
+      if (!r.disc && v > 0.45) { discover(r, r.x, r.y, true); r.burst = 1.2; SND.blub(3, 420); }
+    }
+    // ひれで泡の列をゆらす
+    const fv = Math.cos(r.fph) * (1 + r.burst);
+    bubbles.forEach(b => { const d = hyp(b.x - r.x, b.y - r.y); if (d < Rr * 1.8 * r.sc) b.vx += fv * (b.x > r.x ? 1 : -1) * 60 * dt * (1 - d / (Rr * 1.8 * r.sc)); });
+  }
+  // ---- ウミガメ
+  {
+    const tu = turtle, L = S * 0.3;
+    const homeX = gx(0.6), homeY = gy(floorV(0.6)) + S * 0.015;
+    tu.stT += dt;
+    if (tu.state === 'rest') {
+      tu.awake = Math.max(0, tu.awake - dt * 0.6);
+      tu.x += (homeX - tu.x) * Math.min(1, dt * 1.5); tu.y += (homeY - tu.y) * Math.min(1, dt * 1.5);
+      tu.vx = 0;
+      if (P.phase === 'clean') {
+        const L2 = L; const facePt = [[tu.x + tu.face * L2 * 0.55, tu.y - L2 * 0.04], [tu.x + tu.face * L2 * 0.68, tu.y - L2 * 0.1]];
+        const vf = visAt(facePt), vb = visAt(turtlePts());
+        if (vf > 0.5 || vb > 0.55) { tu.state = 'wake'; tu.stT = 0; if (!tu.disc) discover(tu, tu.x + L * 0.4, tu.y - L * 0.1, false); SND.blub(3, 380); }
+      }
+      if (party && P.pT > 8) { tu.state = 'wake'; tu.stT = 0; }
+    } else if (tu.state === 'wake') {
+      tu.awake = Math.min(1, tu.awake + dt * 0.9);
+      tu.bubT -= dt; if (tu.bubT < 0) { tu.bubT = 0.35; addBubble(tu.x + tu.face * L * 0.72, tu.y - L * 0.12, rr(2, 5) * S / 400, tu.face * 10, -40); }
+      if (tu.stT > 2) { tu.state = 'swim'; tu.stT = 0; tu.tx = 0.3; tu.bubT = 3; }
+    } else if (tu.state === 'swim') {
+      tu.awake = Math.min(1, tu.awake + dt);
+      let tx, ty;
+      if (party && P.pT > 8) { tu.a += dt * TAU / 30; tx = gx(0.5) + Math.sin(tu.a) * G.w * 0.3; ty = gy(0.7) + Math.sin(tu.a * 2.3) * G.h * 0.04; }
+      else if (dawn) { tx = homeX; ty = homeY; if (hyp(tu.x - homeX, tu.y - homeY) < S * 0.02) { tu.state = 'rest'; tu.stT = 0; } }
+      else {
+        if (Math.abs(tu.x - gx(tu.tx)) < S * 0.03) tu.tx = tu.tx < 0.5 ? rr(0.6, 0.82) : rr(0.18, 0.4);
+        tx = gx(tu.tx); ty = gy(0.76) + Math.sin(T * 0.5) * G.h * 0.02;
+      }
+      const vx = clamp((tx - tu.x) * 0.8, -S * 0.12, S * 0.12), vy = clamp((ty - tu.y) * 0.8, -S * 0.1, S * 0.1);
+      tu.vx += (vx - tu.vx) * Math.min(1, dt * 1.5); tu.vy += (vy - tu.vy) * Math.min(1, dt * 1.5);
+      tu.x += tu.vx * dt; tu.y += tu.vy * dt;
+      if (tu.vx > 3) tu.dir = 1; else if (tu.vx < -3) tu.dir = -1;
+      tu.bubT -= dt;
+      if (tu.bubT < 0) {
+        tu.bubT = party ? rr(5, 9) : rr(3, 6);
+        // 鼻先で泡を押し出す
+        const b = addBubble(tu.x + tu.face * L * 0.75, tu.y - L * 0.12, party ? S * rr(0.03, 0.045) : rr(2, 5) * S / 400, tu.face * (party ? 70 : 15), party ? -18 : -40, { big: party });
+        if (b && party) SND.blub(1, 300);
+      }
+    }
+    tu.face += (tu.dir - tu.face) * Math.min(1, dt * 2);
+    tu.fph += dt * (tu.state === 'swim' ? 2.2 + tu.burst * 5 : tu.state === 'wake' ? 1.2 : 0.3);
+    tu.burst = Math.max(0, tu.burst - dt * 0.6); tu.look = Math.max(0, tu.look - dt * 0.35); tu.cd -= dt; tu.gl = Math.max(0, tu.gl - dt * 0.5);
+  }
+  // ---- マンタ
+  {
+    const m = manta;
+    let tx, ty, dT;
+    if (m.mode === 'far') {
+      m.a += dt * TAU / 40;
+      tx = gx(0.5) + Math.cos(m.a) * G.w * 0.26; ty = gy(0.42) + Math.sin(m.a * 2) * G.h * 0.07; dT = 0;
+    } else if (m.mode === 'approach') {
+      m.k += dt / 6.5;
+      const k = m.k;
+      if (k < 0.45) { const q = smooth(k / 0.45); tx = lerp(m.sx, gx(0.5), q); ty = lerp(m.sy, gy(0.45), q); dT = q; }
+      else { const q = smooth((k - 0.45) / 0.55); tx = lerp(gx(0.5), gx(0.85), q); ty = lerp(gy(0.45), gy(0.3), q); dT = 1 - q * 0.3; }
+      if (k >= 1) { m.mode = 'party'; m.a = 0; }
+    } else if (m.mode === 'party') {
+      m.a += dt * TAU / 34;
+      tx = gx(0.5) + Math.cos(m.a) * G.w * 0.32; ty = gy(0.42) + Math.sin(m.a) * G.h * 0.17; dT = 0.45 + 0.3 * Math.sin(m.a * 2 + 1);
+    } else { // back
+      m.a += dt * TAU / 40; tx = gx(0.5) + Math.cos(m.a) * G.w * 0.26; ty = gy(0.42) + Math.sin(m.a * 2) * G.h * 0.07; dT = 0;
+      if (Math.abs(m.depth) < 0.05) m.mode = 'far';
+    }
+    const fk = m.mode === 'approach' ? 3 : 1;
+    m.vx += ((tx - m.x) * fk - m.vx) * Math.min(1, dt * 1.5); m.vy += ((ty - m.y) * fk - m.vy) * Math.min(1, dt * 1.5);
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    m.depth += (dT - m.depth) * Math.min(1, dt * (m.mode === 'approach' ? 2.5 : 0.8));
+    const sp = hyp(m.vx, m.vy);
+    if (sp > 4) { let hd = Math.atan2(m.vy, m.vx); let d = hd - m.head; while (d > Math.PI) d -= TAU; while (d < -Math.PI) d += TAU; m.head += d * Math.min(1, dt * 1.2); }
+    m.fph += dt * (0.9 + m.burst * 2.5); m.burst = Math.max(0, m.burst - dt * 0.4);
+    if (m.loop > 0) { m.loop += dt / 3; if (m.loop >= 1) m.loop = 0; }
+    m.cd -= dt;
+    if (P.phase === 'clean' && !P.mantaDisc && P.clean > 0.38) { P.mantaDisc = true; SND.softChime(); m.burst = 1; }
+    // 大きな水流
+    if (party && P.pT > 14) {
+      P.nextCurrent -= dt;
+      if (P.nextCurrent < 0) { P.nextCurrent = rr(13, 20); makeCurrent(Math.cos(m.head), Math.sin(m.head), 1); }
+    }
+  }
+}
+function makeCurrent(dx, dy, k) {
+  P.flow.x = dx * S * 0.35 * k; P.flow.y = dy * S * 0.35 * k; P.flowT = 3;
+  manta.burst = 1.2; SND.whoosh(0.05);
+  for (let i = 0; i < 8; i++) addBubble(manta.x + rr(-1, 1) * S * 0.2, manta.y + rr(-1, 1) * S * 0.1, rr(3, 8) * S / 400, dx * 60, dy * 60 - 30);
+}
+
+// ---- 魚
+function updateFish(dt) {
+  const party = P.phase === 'party';
+  schools.forEach(sc => {
+    sc.timer -= dt;
+    if (sc.timer < 0) { sc.timer = rr(3, 7); sc.tu = rr(0.14, 0.86); sc.tv = rr(0.14, 0.76); }
+  });
+  const recent = trail.length && T - trail[trail.length - 1].t < 0.6 ? trail[trail.length - 1] : null;
+  const L5 = S * 0.5;
+  const all = fishes.concat(gfish);
+  for (let i = 0; i < all.length; i++) {
+    const f = all[i];
+    let tx, ty, maxS = f.L * 3.2 * f.spd;
+    if (f.glow) {
+      const sc = gschools[f.school]; const sl = slotTarget(sc, f.idx, sc.fish.length);
+      tx = sl[0]; ty = sl[1]; maxS = S * 0.45;
+      if (f.emerge > 0) { f.emerge -= dt; tx = f.ex; ty = f.ey - (1.2 - f.emerge) * S * 0.2; }
+      if (f.attract > 0) { f.attract -= dt; tx = f.ax + Math.cos(T * 3 + f.idx) * S * 0.06; ty = f.ay + Math.sin(T * 3 + f.idx) * S * 0.06; }
+      if (P.phase === 'dawn') { f.a = Math.max(0, f.a - dt * 0.3); } else f.a = Math.min(1, f.a + dt * 0.8);
+    } else if (f.peek && !(f.peekRelease <= 0)) {
+      f.orb += dt * 0.65;
+      tx = handle.x + Math.cos(f.orb) * hR * 1.9; ty = handle.y + Math.sin(f.orb) * hR * 1.5;
+      maxS = S * 0.4;
+      if (f.peekRelease !== undefined) { f.peekRelease -= dt; if (f.peekRelease <= 0) { f.peek = false; f.school = (R() * schools.length) | 0; } }
+    } else {
+      const sc = schools[Math.max(0, f.school)];
+      tx = gx(sc.tu) + f.ox * S * 0.09 + Math.sin(T * 0.7 + f.ph) * S * 0.02; ty = gy(sc.tv) + f.oy * S * 0.06;
+    }
+    // きれいなガラスを磨くと光の筋を追いかける
+    if (recent && recent.pearl && !f.peek && hyp(f.x - recent.x, f.y - recent.y) < S * 0.35) { tx = recent.x + Math.cos(f.ph) * S * 0.05; ty = recent.y + Math.sin(f.ph) * S * 0.05; maxS *= 1.4; }
+    let ax = (tx - f.x) * 1.6 - f.vx * 0.9, ay = (ty - f.y) * 1.6 - f.vy * 0.9;
+    // サメが来たら道をあける
+    const sd = hyp(f.x - shark.x, f.y - shark.y);
+    if (sd < L5 * 0.75 && !f.glow) { const k = (1 - sd / (L5 * 0.75)) * S * 9; ax += (f.x - shark.x) / (sd + 1) * k * 0.5; ay += (f.y - shark.y) / (sd + 1) * k; maxS *= 1.8; }
+    // 群れの間隔
+    for (let j = i + 1; j < all.length && j < i + 14; j++) {
+      const o = all[j]; const dx = f.x - o.x, dy = f.y - o.y, d = Math.abs(dx) + Math.abs(dy), m = (f.L + o.L) * 0.6;
+      if (d < m && d > 0.01) { const k = (m - d) / m * 80; ax += dx / d * k; ay += dy / d * k; o.vx -= dx / d * k * dt; o.vy -= dy / d * k * dt; }
+    }
+    if (P.flowT > 0) { ax += P.flow.x * P.flowT * 0.6; ay += P.flow.y * P.flowT * 0.6; }
+    f.vx += ax * dt; f.vy += ay * dt;
+    if (f.react > 0) { maxS *= 1 + f.react * 2; f.react = Math.max(0, f.react - dt * 1.2); }
+    const sp = hyp(f.vx, f.vy); if (sp > maxS) { f.vx *= maxS / sp; f.vy *= maxS / sp; }
+    f.x += f.vx * dt; f.y += f.vy * dt;
+    f.x = clamp(f.x, G.x - S * 0.05, G.x + G.w + S * 0.05); f.y = clamp(f.y, G.y + S * 0.03, G.y + G.h * 0.9);
+    const want = f.vx > 4 ? 1 : f.vx < -4 ? -1 : (f.face >= 0 ? 1 : -1);
+    f.face += (want - f.face) * Math.min(1, dt * 5);
+    f.tilt += (clamp(Math.atan2(f.vy, Math.abs(f.vx) + 5) * 0.7, -0.6, 0.6) - f.tilt) * Math.min(1, dt * 4);
+    f.ph += dt * (5 + sp / f.L * 2 + f.react * 12);
+    f.look = Math.max(0, f.look - dt * 0.6);
+  }
+  for (let i = gfish.length - 1; i >= 0; i--) if (gfish[i].a <= 0 && P.phase === 'dawn') gfish.splice(i, 1);
+}
+
+// 光る魚の隊形
+const FORMS = ['ring', 'ribbon', 'heart', 'eight', 'star', 'wave'];
+function slotTarget(sc, i, n) {
+  const t = T - sc.t0, cx = gx(sc.cu), cy = gy(sc.cv), k = i / n;
+  switch (sc.form) {
+    case 'ring': { const a = k * TAU + t * 0.6 * sc.sgn, rad = S * (0.15 + sc.id * 0.03); return [cx + Math.cos(a) * rad, cy + Math.sin(a) * rad * 0.8]; }
+    case 'ribbon': return [cx + (k - 0.5) * G.w * 0.55 + Math.sin(t * 0.3) * G.w * 0.06, cy + Math.sin(k * 7 - t * 2.2) * S * 0.07];
+    case 'heart': { const a = k * TAU + t * 0.25; const s = Math.sin(a); const hx = 16 * s * s * s, hy = -(13 * Math.cos(a) - 5 * Math.cos(2 * a) - 2 * Math.cos(3 * a) - Math.cos(4 * a)); const q = S * 0.011; return [cx + hx * q, cy + hy * q]; }
+    case 'eight': { const a = k * TAU + t * 0.55 * sc.sgn; return [cx + Math.sin(a) * S * 0.28, cy + Math.sin(a) * Math.cos(a) * S * 0.18]; }
+    case 'star': { const a = k * TAU + t * 0.3; const rad = S * 0.17 * (0.62 + 0.38 * Math.cos(5 * (a - t * 0.3))); return [cx + Math.cos(a) * rad, cy + Math.sin(a) * rad]; }
+    default: { const a = k * TAU * 1.5 + t; return [cx + (k - 0.5) * G.w * 0.5, cy + Math.cos(a) * S * 0.12 * Math.sin(t * 0.7 + k * 3)]; }
+  }
+}
+function spawnGlowSchool(idx) {
+  const col = PARTY_GLOW[idx % 3];
+  const tip = coralTips.length ? coralTips[(R() * coralTips.length) | 0] : [0.5, 0.85];
+  const sc = { id: idx, col, fish: [], form: FORMS[idx % FORMS.length], t0: T, cu: rr(0.3, 0.7), cv: rr(0.3, 0.6), timer: rr(8, 12), sgn: R() < 0.5 ? -1 : 1 };
+  gschools.push(sc);
+  const n = 14;
+  for (let i = 0; i < n; i++) {
+    const f = mkFish(gx(tip[0]) + rr(-1, 1) * S * 0.03, gy(tip[1]), col, gschools.length - 1, S * rr(0.045, 0.06));
+    f.glow = true; f.idx = i; f.a = 0; f.emerge = 1.2 + i * 0.05; f.ex = f.x; f.ey = f.y; f.vy = -S * 0.3;
+    sc.fish.push(f); gfish.push(f);
+  }
+  burstSparks(gx(tip[0]), gy(tip[1]), 14, S * 0.08, col);
+  [0, 1, 2].forEach(j => bell(PENT[4 + j * 2 + idx % 2], 0.04, j * 0.08, 1.3));
+}
+function updateGlowSchools(dt) {
+  gschools.forEach(sc => {
+    sc.timer -= dt;
+    if (sc.timer < 0) {
+      sc.timer = rr(8, 13);
+      let f; do { f = FORMS[(R() * FORMS.length) | 0]; } while (f === sc.form);
+      sc.form = f; sc.t0 = T; sc.sgn = R() < 0.5 ? -1 : 1;
+      if (f === 'ring' && vents.length) { const v = vents[(R() * vents.length) | 0]; sc.cu = v.u; sc.cv = rr(0.45, 0.62); }
+      else { sc.cu = rr(0.3, 0.7); sc.cv = rr(0.28, 0.62); }
+    }
+  });
+}
+
+// ---- 生き物のタップ反応
+function pickCreature(x, y) {
+  let best = null, bd = 1e9;
+  const consider = (o, d) => { if (d < bd) { bd = d; best = o; } };
+  const all = fishes.concat(gfish);
+  for (const f of all) { const d = hyp(f.x - x, f.y - y); if (d < Math.max(f.L * 0.9, 26)) consider(f, d / Math.max(f.L, 20) * 0.6); }
+  { const L = S * 0.5, lx = (x - shark.x) * Math.sign(shark.face || 1), ly = y - shark.y; if (Math.abs(lx) < L * 0.6 && Math.abs(ly) < L * 0.18) consider(shark, hyp(lx / L, ly / L) * 1.2); }
+  { const Rr = S * 0.19 * ray.sc, d = hyp(x - ray.x, y - ray.y); if (d < Rr * 1.0) consider(ray, d / Rr); }
+  { const L = S * 0.3, lx = (x - turtle.x) * Math.sign(turtle.face || 1), ly = y - turtle.y; if (lx > -L * 0.6 && lx < L * 0.85 && ly > -L * 0.55 && ly < L * 0.15) consider(turtle, hyp(lx / L, (ly + L * 0.2) / L)); }
+  if (manta.depth > 0.35) { const Rr = S * 0.42 * lerp(0.6, 1.25, manta.depth), d = hyp(x - manta.x, y - manta.y); if (d < Rr * 0.75) consider(manta, d / Rr + 0.3); }
+  return best;
+}
+function reactCreature(c, x, y) {
+  if (c === shark) {
+    const k = (R() * 3) | 0;
+    if (k === 0) { shark.wig = 1.2; SND.boo(240, 360); }
+    else if (k === 1) { shark.look = 1; for (let i = 0; i < 4; i++) addBubble(shark.x + shark.face * S * 0.22, shark.y, rr(3, 6) * S / 400, shark.face * 20, -50); SND.blub(2, 340); }
+    else { shark.roll = 0.001; SND.boo(200, 300); }
+    burstSparks(x, y, 6, S * 0.06);
+  } else if (c === ray) {
+    const k = (R() * 3) | 0;
+    if (k === 0) { ray.flipTo = 1; ray.flipTimer = 2.8; SND.blub(2, 520); }
+    else if (k === 1) { ray.burst = 1.5; ray.vy -= S * 0.4; SND.whoosh(0.035); for (let i = 0; i < 6; i++) addBubble(ray.x + rr(-1, 1) * S * 0.15, ray.y, rr(2, 6) * S / 400, rr(-20, 20), -60); }
+    else { ray.spin = 0.001; SND.boo(330, 500); }
+    burstSparks(x, y, 6, S * 0.06, 'aqua');
+  } else if (c === turtle) {
+    const k = (R() * 3) | 0;
+    if (turtle.state === 'rest') { turtle.state = 'wake'; turtle.stT = 0; }
+    if (k === 0) { turtle.look = 1.2; SND.pip(700); setTimeout(() => SND.pip(880), 120); }
+    else if (k === 1) { for (let i = 0; i < 6; i++) addBubble(turtle.x + turtle.face * S * 0.21, turtle.y - S * 0.04 - i * 3, rr(2, 6) * S / 400, turtle.face * 25, -40 - i * 12); SND.blub(4, 360); }
+    else { turtle.burst = 1.4; SND.whoosh(0.03); }
+    burstSparks(x, y, 6, S * 0.06, 'gold');
+  } else if (c === manta) {
+    const k = (R() * 2) | 0;
+    if (k === 0 && manta.loop === 0) { manta.loop = 0.001; SND.boo(160, 240); }
+    else { makeCurrent(Math.cos(manta.head), Math.sin(manta.head), 0.8); }
+    burstSparks(x, y, 8, S * 0.08, 'lav');
+  } else {
+    const f = c, k = (R() * 3) | 0;
+    if (k === 0) { f.look = 1.2; SND.pip(900 + R() * 400); }
+    else if (k === 1) { f.react = 1; f.vx += (f.x - x) * 4; f.vy += (f.y - y) * 4; SND.pip(1200); }
+    else { addBubble(f.x + f.face * f.L * 0.5, f.y, rr(2, 4) * S / 400, 0, -40); addBubble(f.x + f.face * f.L * 0.5, f.y - 4, rr(1.5, 3) * S / 400, 0, -50); SND.blub(2, 600); f.react = 0.4; }
+    all_near(f, x, y);
+    burstSparks(x, y, 4, S * 0.04, f.glow ? f.type : 'white');
+  }
+}
+function all_near(f, x, y) {
+  fishes.concat(gfish).forEach(o => { if (o !== f && hyp(o.x - x, o.y - y) < S * 0.15) { o.react = Math.max(o.react, 0.5); o.vx += (o.x - x) * 2; o.vy += (o.y - y) * 2; } });
+}
+
+// ============================================================
+//  フェーズ（掃除 → パーティー → 夜明け → また掃除）
+// ============================================================
+function updatePhase(dt) {
+  P.cleanTimer -= dt;
+  if (P.cleanTimer < 0) { P.cleanTimer = 0.25; let s = 0; for (let i = 0; i < grid.length; i++) s += grid[i]; P.clean = 1 - s / grid.length; }
+  if (P.phase === 'clean') {
+    // 窓がかなりきれいになると、残りの藻がうすくなる
+    P.dirtA += (lerp(1, 0.78, smooth((P.clean - 0.45) / 0.25)) - P.dirtA) * Math.min(1, dt * 0.8);
+    const found = (ray.disc ? 1 : 0) + (turtle.disc ? 1 : 0) + (shark.disc ? 1 : 0);
+    if ((P.clean > 0.6 && found >= 2) || P.clean > 0.74) startParty();
+  } else if (P.phase === 'party') {
+    P.pT += dt; const t = P.pT;
+    P.dirtA = Math.max(0, P.dirtA - dt / 2.5);
+    if (t < 1.6 && R() < 0.8) { const k = t / 1.6; const x = G.x + G.w * k * 1.3 - G.w * 0.15 + rr(-1, 1) * S * 0.05; addSpark(x, G.y + G.h * (1 - k) * 0.9 + rr(-1, 1) * S * 0.2, rr(10, 20), 0, 0, 'white', 0.9); }
+    if (t > 1.0 && !P.ev.manta) { P.ev.manta = 1; manta.mode = 'approach'; manta.k = 0; manta.sx = manta.x; manta.sy = manta.y; manta.burst = 1.5; SND.whoosh(0.06); }
+    P.nightT = smooth((t - 2.6) / 6);
+    if (t > 2.4 && !P.ev.music) { P.ev.music = 1; }
+    if (P.ev.music) P.partyMusic = Math.min(1, P.partyMusic + dt / 4);
+    if (t > 4.6 && !P.ev.g0) { P.ev.g0 = 1; spawnGlowSchool(0); }
+    if (t > 6.1 && !P.ev.g1) { P.ev.g1 = 1; spawnGlowSchool(1); }
+    if (t > 7.6 && !P.ev.g2) { P.ev.g2 = 1; spawnGlowSchool(2); }
+    if (t > 8 && !P.ev.gather) { P.ev.gather = 1; SND.softChime(); [ray, shark, turtle].forEach(c => c.a = 0); turtle.a = 0; }
+    if (t > 9.5 && !P.ev.vents) { P.ev.vents = 1; SND.blub(5, 260); }
+    updateGlowSchools(dt);
+    // 1サイクル：十分遊んだら夜明け→藻がまた少しずつ
+    if ((t > 140 && P.idle > 5) || t > 240) startDawn();
+  } else if (P.phase === 'dawn') {
+    P.dawnT += dt; const t = P.dawnT;
+    P.nightT = 1 - smooth(t / 7);
+    P.partyMusic = Math.max(0, P.partyMusic - dt / 4);
+    P.dirtA = smooth((t - 2) / 6);
+    if (t > 8.2) { P.phase = 'clean'; P.dirtA = 1; P.nightT = 0; gschools.length = 0; gfish.length = 0; }
+  }
+  // 泡の噴き出し口
+  const ventOn = P.phase === 'party' && P.ev.vents;
+  vents.forEach(v => {
+    v.t -= dt;
+    if (v.t < 0) {
+      if (ventOn) { v.t = rr(0.25, 0.7); addBubble(gx(v.u) + rr(-1, 1) * S * 0.02, gy(floorV(v.u)) - S * 0.02, S * (R() < 0.35 ? rr(0.028, 0.05) : rr(0.008, 0.02)), 0, -rr(30, 60), { big: true, glow: true }); }
+      else { v.t = rr(1.5, 4); addBubble(gx(v.u), gy(floorV(v.u)) - S * 0.02, rr(2, 4) * S / 400, 0, -30); }
+    }
+  });
+  // 目立つ泡（次に触るもの）を一つだけ
+  if (P.phase === 'party' && P.pT > 11) {
+    P.special -= dt;
+    if (P.special < 0 && !bubbles.some(b => b.sp)) { P.special = rr(4, 7); const v = vents[(R() * vents.length) | 0]; addBubble(gx(v.u), gy(floorV(v.u)) - S * 0.03, S * 0.055, 0, -22, { big: true, sp: true }); }
+  }
+  if (P.flowT > 0) P.flowT = Math.max(0, P.flowT - dt);
+}
+function startParty() {
+  P.phase = 'party'; P.pT = 0; P.ev = {}; P.nextCurrent = 14; P.special = 2;
+  SND.fanfare();
+  [ray, turtle, shark].forEach(c => { if (!c.disc) { c.disc = true; c.gl = 1; } });
+  turtle.a = 0;
+}
+function startDawn() {
+  P.phase = 'dawn'; P.dawnT = 0;
+  // 新しい藻を用意（表示は少しずつ）
+  dctx.globalCompositeOperation = 'source-over'; dctx.clearRect(0, 0, DW, DH);
+  dctx.drawImage(buildAlgae(algaeSeed), 0, 0); algaeSeed += 7;
+  grid.fill(1); P.dirtA = 0;
+  for (let i = 0; i < 3; i++) eraseAt(sponge.x + rr(-4, 4), sponge.y + rr(-4, 4), sR * 1.75, 0.3);
+  ray.disc = ray.glimpse = false; shark.disc = false; turtle.disc = false; P.mantaDisc = false;
+  if (turtle.state !== 'rest') { turtle.state = 'swim'; }
+  manta.mode = 'back';
+  SND.softChime();
+}
+
+// ============================================================
+//  パーティクル更新
+// ============================================================
+function updateParticles(dt) {
+  const fl = P.flowT > 0 ? P.flowT / 3 : 0;
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i]; b.life += dt; b.ph += dt * 3;
+    b.vx *= 1 - dt * 1.2; const rise = -(25 + b.r * 2.2) * (b.sp ? 0.5 : 1);
+    b.vy += (rise - b.vy) * Math.min(1, dt * 1.5);
+    b.x += (b.vx + Math.sin(b.ph) * b.r * 1.2 + P.flow.x * fl) * dt; b.y += (b.vy + P.flow.y * fl * 0.5) * dt;
+    if (b.y < G.y - b.r * 2 || b.x < G.x - 40 || b.x > G.x + G.w + 40) bubbles.splice(i, 1);
+  }
+  for (let i = flakes.length - 1; i >= 0; i--) {
+    const f = flakes[i]; f.life += dt; f.vx *= 1 - dt * 1.4; f.vy *= 1 - dt * 1.4; f.vy += 14 * dt;
+    f.x += (f.vx + Math.sin(f.life * 2 + f.rot) * 6 + P.flow.x * fl) * dt; f.y += (f.vy + P.flow.y * fl) * dt; f.rot += f.vr * dt;
+    if (f.life > f.max) flakes.splice(i, 1);
+  }
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const s = sparks[i]; s.life += dt; s.vx *= 1 - dt * 2.5; s.vy *= 1 - dt * 2.5; s.x += s.vx * dt; s.y += s.vy * dt;
+    if (s.life > s.max) sparks.splice(i, 1);
+  }
+  for (let i = ripples.length - 1; i >= 0; i--) { ripples[i].t += dt; if (ripples[i].t > 1) ripples.splice(i, 1); }
+  while (trail.length && T - trail[0].t > 2.2) trail.shift();
+  if (P.nightT > 0.01) {
+    const gather = smooth((P.pT - 6) / 4);
+    plankton.forEach(p => {
+      p.ph += dt * (1 + p.s); p.b = Math.max(0, p.b - dt * 0.8);
+      const hx = gx(p.hu) + Math.sin(T * 0.1 + p.ph * 0.1) * S * 0.03, hy = gy(p.hv) + Math.cos(T * 0.13 + p.ph * 0.1) * S * 0.02;
+      p.vx += ((hx - p.x) * 0.25 * gather - p.vx * 0.5) * dt + P.flow.x * fl * dt * 0.8; p.vy += ((hy - p.y) * 0.25 * gather - p.vy * 0.5) * dt + P.flow.y * fl * dt * 0.8;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+    });
+  }
+}
+
+// ============================================================
+//  描画：生き物
+// ============================================================
+const FT = {
+  clown: { b: '#f28a3a', b2: '#ffc27a', e: '#a8481c', st: '#fff8ee', fin: '#f6a15a', h: 0.38 },
+  tang: { b: '#3d7fd6', b2: '#8fc0f4', e: '#1f4890', st: '#1d2f6a', fin: '#ffd24a', h: 0.42 },
+  pink: { b: '#f08bb4', b2: '#ffd0e2', e: '#b04b78', st: '#ffe3a0', fin: '#ffd27a', h: 0.4 },
+  yellow: { b: '#f7cd3e', b2: '#fff3a8', e: '#b98a12', st: '#2b2b45', fin: '#ffe58a', h: 0.58 },
+  aqua: { b: '#3fc1b8', b2: '#b0f2e4', e: '#1d7f78', st: '#ffffff', fin: '#8be0f0', h: 0.36 },
+  gold: { b: '#ffd86b', b2: '#fff6c9', e: '#d79a2a', st: '#fff', fin: '#ffe9a0', h: 0.38 },
+  aquaG: { b: '#8ff4ff', b2: '#e2fdff', e: '#3cb8c9', st: '#fff', fin: '#c8fbff', h: 0.38 },
+  pinkG: { b: '#ffa8d8', b2: '#ffe6f4', e: '#e0609f', st: '#fff', fin: '#ffd0ec', h: 0.38 }
+};
+function fishPath(L, h, wag) {
+  const p = new Path2D(), tw = wag * L * 0.09;
+  p.moveTo(L * 0.5, 0);
+  p.bezierCurveTo(L * 0.47, -h * 0.85, L * 0.15, -h * 1.1, -L * 0.12, -h * 0.82);
+  p.quadraticCurveTo(-L * 0.27, -h * 0.5, -L * 0.32, -h * 0.14 + tw * 0.3);
+  p.quadraticCurveTo(-L * 0.42, -h * 0.4 + tw, -L * 0.54, -h * 0.95 + tw);
+  p.quadraticCurveTo(-L * 0.45, tw, -L * 0.54, h * 0.95 + tw);
+  p.quadraticCurveTo(-L * 0.42, h * 0.4 + tw, -L * 0.32, h * 0.14 + tw * 0.3);
+  p.quadraticCurveTo(-L * 0.27, h * 0.5, -L * 0.12, h * 0.82);
+  p.bezierCurveTo(L * 0.15, h * 1.1, L * 0.47, h * 0.85, L * 0.5, 0);
+  p.closePath(); return p;
+}
+function drawFish(f) {
+  const t = f.glow ? FT[f.type === 'gold' ? 'gold' : f.type === 'aqua' ? 'aquaG' : 'pinkG'] : FT[f.type];
+  const L = f.L, h = L * t.h * 0.5;
+  const alpha = f.a;
+  if (alpha <= 0.01) return;
+  ctx.save(); ctx.translate(f.x, f.y);
+  if (f.glow) {
+    ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.5 * alpha * (0.8 + 0.2 * Math.sin(T * 4 + f.idx));
+    const g = GLOW[f.type] || GLOW.white; ctx.drawImage(g, -L * 1.5, -L * 1.5, L * 3, L * 3);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  let fx = f.face * (1 - 0.45 * clamp(f.look, 0, 1)); if (Math.abs(fx) < 0.08) fx = fx < 0 ? -0.08 : 0.08;
+  ctx.scale(fx, 1); ctx.rotate(f.tilt);
+  const wag = Math.sin(f.ph) * (f.wag + f.react * 0.6);
+  const p = fishPath(L, h, wag);
+  ctx.globalAlpha = 0.16 * alpha; ctx.strokeStyle = t.b; ctx.lineWidth = L * 0.1; ctx.stroke(p);
+  ctx.globalAlpha = 0.9 * alpha; ctx.fillStyle = t.b; ctx.fill(p);
+  ctx.save(); ctx.clip(p);
+  ctx.globalAlpha = 0.5 * alpha; ctx.fillStyle = t.b2; ctx.beginPath(); ctx.ellipse(L * 0.05, h * 0.6, L * 0.4, h * 0.6, 0, 0, TAU); ctx.fill();
+  ctx.globalAlpha = 0.22 * alpha; ctx.fillStyle = t.e; ctx.beginPath(); ctx.ellipse(-L * 0.02, -h * 0.85, L * 0.42, h * 0.45, 0, 0, TAU); ctx.fill();
+  ctx.globalAlpha = 0.9 * alpha;
+  if (f.type === 'clown') {
+    ctx.fillStyle = t.st; ctx.strokeStyle = rgba('#3a2a2a', 0.5); ctx.lineWidth = Math.max(0.8, L * 0.02);
+    [[L * 0.2, L * 0.065], [-L * 0.12, L * 0.06]].forEach(s => { ctx.beginPath(); ctx.ellipse(s[0], 0, s[1], h * 1.1, 0, 0, TAU); ctx.fill(); ctx.stroke(); });
+  } else if (f.type === 'tang') {
+    ctx.fillStyle = t.st; ctx.globalAlpha = 0.6 * alpha; ctx.beginPath(); ctx.moveTo(L * 0.25, -h * 0.4); ctx.quadraticCurveTo(-L * 0.05, -h * 0.9, -L * 0.3, -h * 0.1); ctx.quadraticCurveTo(-L * 0.05, -h * 0.3, L * 0.25, -h * 0.4); ctx.fill();
+  } else if (f.type === 'pink') {
+    ctx.fillStyle = t.st; [[0.05, -0.2], [-0.12, 0.1], [0.15, 0.25], [-0.02, -0.5]].forEach(s => { ctx.beginPath(); ctx.arc(L * s[0], h * s[1], L * 0.035, 0, TAU); ctx.fill(); });
+  } else if (f.type === 'yellow') {
+    ctx.fillStyle = t.st; ctx.globalAlpha = 0.55 * alpha; ctx.beginPath(); ctx.ellipse(L * 0.3, 0, L * 0.04, h, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(-L * 0.18, -h * 0.3, L * 0.05, 0, TAU); ctx.fill();
+  } else if (f.type === 'aqua') {
+    ctx.strokeStyle = t.st; ctx.globalAlpha = 0.6 * alpha; ctx.lineWidth = L * 0.03; ctx.beginPath(); ctx.moveTo(L * 0.35, -h * 0.05); ctx.quadraticCurveTo(0, -h * 0.25, -L * 0.3, 0); ctx.stroke();
+  }
+  ctx.globalAlpha = 0.2 * alpha; ctx.fillStyle = granPat; ctx.fillRect(-L, -h * 1.5, L * 2, h * 3);
+  ctx.restore();
+  ctx.globalAlpha = 0.8 * alpha; ctx.fillStyle = t.fin;
+  ctx.beginPath(); ctx.moveTo(L * 0.12, -h * 0.85); ctx.quadraticCurveTo(-L * 0.05, -h * 1.45, -L * 0.22, -h * 1.15); ctx.quadraticCurveTo(-L * 0.2, -h * 0.8, -L * 0.12, -h * 0.75); ctx.closePath(); ctx.fill();
+  ctx.save(); ctx.translate(L * 0.08, h * 0.25); ctx.rotate(0.5 + Math.sin(f.ph * 1.3) * 0.3); ctx.globalAlpha = 0.6 * alpha; ctx.beginPath(); ctx.ellipse(-L * 0.06, 0, L * 0.09, h * 0.22, 0, 0, TAU); ctx.fill(); ctx.restore();
+  ctx.globalAlpha = 0.55 * alpha; ctx.strokeStyle = t.e; ctx.lineWidth = Math.max(0.8, L * 0.028); ctx.stroke(p);
+  // 目
+  const er = L * 0.075 * (1 + 0.5 * clamp(f.look, 0, 1));
+  ctx.globalAlpha = alpha; ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(L * 0.3, -h * 0.18, er, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#1b1b2a'; ctx.beginPath(); ctx.arc(L * 0.31 + er * 0.1, -h * 0.18, er * 0.62, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(L * 0.3 + er * 0.25, -h * 0.18 - er * 0.3, er * 0.25, 0, TAU); ctx.fill();
+  if (f.look > 0.2) { ctx.globalAlpha = 0.5 * alpha; ctx.fillStyle = '#ff8fa8'; ctx.beginPath(); ctx.ellipse(L * 0.22, h * 0.25, L * 0.05, L * 0.03, 0, 0, TAU); ctx.fill(); }
+  ctx.restore();
+}
+
+// 輪郭のゆらぎ
+const wob = (i, s) => Math.sin(T * 0.9 + i * 1.7) * s;
+
+function drawShark() {
+  const sh = shark, L = S * 0.5 * (sh.disc && P.phase !== 'party' ? 1.05 : 1);
+  ctx.save(); ctx.translate(sh.x, sh.y);
+  let fx = sh.face; if (Math.abs(fx) < 0.1) fx = fx < 0 ? -0.1 : 0.1;
+  const rollY = sh.roll > 0 ? Math.cos(sh.roll * TAU) : 1;
+  ctx.scale(fx, rollY < 0 ? Math.min(-0.15, rollY) : Math.max(0.15, rollY));
+  ctx.rotate(clamp(sh.vy / (S * 0.6), -0.25, 0.25) * Math.sign(fx));
+  if (sh.gl > 0) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = sh.gl * 0.5; ctx.drawImage(GLOW.gold, -L * 0.7, -L * 0.45, L * 1.4, L * 0.9); ctx.globalCompositeOperation = 'source-over'; }
+  const N = 16, top = [], bot = [], amp = 1 + sh.wig;
+  const yc = s => Math.sin(sh.ph - s * 3) * s * s * L * 0.06 * amp;
+  for (let i = 0; i <= N; i++) {
+    const s = i / N, x = L * (0.5 - s), c = yc(s);
+    const h = s < 0.3 ? L * 0.12 * Math.pow(Math.sin(s / 0.3 * Math.PI / 2), 0.6) + L * 0.012 : L * 0.12 * (1 - (s - 0.3) / 0.7 * 0.82) + L * 0.012 * (1 - s);
+    top.push([x, c - h * 1.08 + wob(i, L * 0.002)]); bot.push([x, c + h * 0.92 + wob(i + 9, L * 0.002)]);
+  }
+  const body = new Path2D();
+  body.moveTo(L * 0.505, yc(0));
+  for (let i = 0; i < N; i++) { const a = top[i], b = top[i + 1]; body.quadraticCurveTo(a[0], a[1], (a[0] + b[0]) / 2, (a[1] + b[1]) / 2); }
+  body.lineTo(top[N][0], top[N][1]); body.lineTo(bot[N][0], bot[N][1]);
+  for (let i = N; i > 0; i--) { const a = bot[i], b = bot[i - 1]; body.quadraticCurveTo(a[0], a[1], (a[0] + b[0]) / 2, (a[1] + b[1]) / 2); }
+  body.closePath();
+  const col = '#6f8fa8', edge = '#3e5870';
+  // 尾びれ
+  const tx = -L * 0.5, ty = yc(1), ta = Math.cos(sh.ph - 3) * 0.32 * amp;
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ta);
+  const tail = new Path2D();
+  tail.moveTo(L * 0.02, -L * 0.02); tail.quadraticCurveTo(-L * 0.08, -L * 0.1, -L * 0.2, -L * 0.23);
+  tail.quadraticCurveTo(-L * 0.13, -L * 0.07, -L * 0.1, 0); tail.quadraticCurveTo(-L * 0.12, L * 0.06, -L * 0.16, L * 0.15);
+  tail.quadraticCurveTo(-L * 0.06, L * 0.08, L * 0.02, L * 0.02); tail.closePath();
+  ctx.globalAlpha = 0.92; ctx.fillStyle = col; ctx.fill(tail); ctx.globalAlpha = 0.5; ctx.strokeStyle = edge; ctx.lineWidth = Math.max(1, L * 0.007); ctx.stroke(tail);
+  ctx.restore();
+  // 背びれ
+  const i1 = 5, i2 = 8, a1 = top[i1], a2 = top[i2];
+  const fin = new Path2D(); fin.moveTo(a1[0] + L * 0.01, a1[1] + L * 0.01);
+  fin.quadraticCurveTo(a1[0] - L * 0.02, a1[1] - L * 0.12, a1[0] - L * 0.09, a1[1] - L * 0.17);
+  fin.quadraticCurveTo(a2[0] + L * 0.02, a2[1] - L * 0.06, a2[0], a2[1] + L * 0.01); fin.closePath();
+  ctx.globalAlpha = 0.92; ctx.fillStyle = '#5f7f99'; ctx.fill(fin); ctx.globalAlpha = 0.5; ctx.strokeStyle = edge; ctx.stroke(fin);
+  // 2つめの小さなひれ
+  const b1 = top[12]; ctx.globalAlpha = 0.85; ctx.beginPath(); ctx.moveTo(b1[0] + L * 0.02, b1[1] + 2); ctx.lineTo(b1[0] - L * 0.03, b1[1] - L * 0.045); ctx.lineTo(b1[0] - L * 0.03, b1[1] + 2); ctx.closePath(); ctx.fillStyle = '#5f7f99'; ctx.fill();
+  // 胸びれ
+  const p1 = bot[4], pa = 0.15 * Math.sin(sh.ph * 0.7);
+  ctx.save(); ctx.translate(p1[0], p1[1] - L * 0.01); ctx.rotate(pa);
+  const pf = new Path2D(); pf.moveTo(L * 0.03, 0); pf.quadraticCurveTo(-L * 0.04, L * 0.08, -L * 0.1, L * 0.13); pf.quadraticCurveTo(-L * 0.06, L * 0.03, -L * 0.06, 0); pf.closePath();
+  ctx.globalAlpha = 0.9; ctx.fillStyle = '#7c9bb2'; ctx.fill(pf); ctx.globalAlpha = 0.5; ctx.strokeStyle = edge; ctx.stroke(pf);
+  ctx.restore();
+  // 体
+  ctx.globalAlpha = 0.14; ctx.strokeStyle = col; ctx.lineWidth = L * 0.035; ctx.stroke(body);
+  const gr = ctx.createLinearGradient(0, -L * 0.13, 0, L * 0.12);
+  gr.addColorStop(0, '#5a7b96'); gr.addColorStop(0.42, '#8eaabd'); gr.addColorStop(0.6, '#eef2ee'); gr.addColorStop(1, '#f8f6ef');
+  ctx.globalAlpha = 0.95; ctx.fillStyle = gr; ctx.fill(body);
+  ctx.save(); ctx.clip(body);
+  ctx.globalAlpha = 0.18; ctx.fillStyle = '#b7a6dc'; ctx.beginPath(); ctx.ellipse(-L * 0.05, -L * 0.04, L * 0.3, L * 0.05, 0, 0, TAU); ctx.fill();
+  ctx.globalAlpha = 0.2; ctx.fillStyle = '#3a5a78'; ctx.beginPath(); ctx.ellipse(L * 0.1, -L * 0.1, L * 0.25, L * 0.05, 0, 0, TAU); ctx.fill();
+  ctx.globalAlpha = 0.2; ctx.fillStyle = granPat; ctx.fillRect(-L * 0.6, -L * 0.2, L * 1.2, L * 0.4);
+  ctx.restore();
+  ctx.globalAlpha = 0.6; ctx.strokeStyle = edge; ctx.lineWidth = Math.max(1.1, L * 0.008); ctx.stroke(body);
+  // 顔（やさしい目とにっこり）
+  const ey = yc(0.14) - L * 0.035, ex = L * 0.36, er = L * (0.022 + 0.008 * sh.look);
+  ctx.globalAlpha = 1; ctx.fillStyle = '#22283a'; ctx.beginPath(); ctx.arc(ex, ey, er, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(ex + er * 0.3, ey - er * 0.35, er * 0.38, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(ex - er * 0.3, ey + er * 0.3, er * 0.15, 0, TAU); ctx.fill();
+  ctx.globalAlpha = 0.45; ctx.fillStyle = '#ff9fb2'; ctx.beginPath(); ctx.ellipse(ex - L * 0.01, ey + L * 0.04, L * 0.025, L * 0.013, 0, 0, TAU); ctx.fill();
+  ctx.globalAlpha = 0.75; ctx.strokeStyle = '#4a5468'; ctx.lineWidth = Math.max(1.2, L * 0.006); ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(L * 0.455, ey + L * 0.045); ctx.quadraticCurveTo(L * 0.42, ey + L * (0.065 + 0.02 * sh.look), L * 0.385, ey + L * 0.05); ctx.stroke();
+  ctx.globalAlpha = 0.35; for (let i = 0; i < 3; i++) { const gx0 = L * (0.25 - i * 0.025); ctx.beginPath(); ctx.moveTo(gx0, ey + L * 0.005); ctx.quadraticCurveTo(gx0 - L * 0.012, ey + L * 0.03, gx0, ey + L * 0.055); ctx.stroke(); }
+  ctx.restore();
+}
+
+function rayPath(Rr, flap) {
+  const fy = flap * Rr * 0.26, p = new Path2D(), w = 1 - Math.abs(flap) * 0.06;
+  p.moveTo(0, -Rr * 0.55);
+  p.bezierCurveTo(Rr * 0.35, -Rr * 0.56, Rr * 0.75 * w, -Rr * 0.25 + fy * 0.5, Rr * 1.0 * w, -Rr * 0.02 + fy);
+  p.bezierCurveTo(Rr * 0.82 * w, Rr * 0.22 + fy * 0.6, Rr * 0.42, Rr * 0.36, Rr * 0.16, Rr * 0.48);
+  p.quadraticCurveTo(0, Rr * 0.6, -Rr * 0.16, Rr * 0.48);
+  p.bezierCurveTo(-Rr * 0.42, Rr * 0.36, -Rr * 0.82 * w, Rr * 0.22 + fy * 0.6, -Rr * 1.0 * w, -Rr * 0.02 + fy);
+  p.bezierCurveTo(-Rr * 0.75 * w, -Rr * 0.25 + fy * 0.5, -Rr * 0.35, -Rr * 0.56, 0, -Rr * 0.55);
+  p.closePath(); return p;
+}
+function drawRay() {
+  const r = ray, Rr = S * 0.19 * r.sc;
+  ctx.save(); ctx.translate(r.x, r.y); ctx.rotate(r.rot + (r.spin > 0 ? smooth(r.spin) * TAU : 0));
+  if (r.gl > 0 || P.nightT > 0) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = Math.max(r.gl * 0.5, P.nightT * 0.35); ctx.drawImage(P.nightT > 0.3 ? GLOW.aqua : GLOW.gold, -Rr * 1.4, -Rr * 1.2, Rr * 2.8, Rr * 2.6); ctx.globalCompositeOperation = 'source-over'; }
+  const fc = Math.cos(r.flip * Math.PI); const belly = fc < 0;
+  ctx.scale(Math.max(0.06, Math.abs(fc)), 1);
+  const flap = Math.sin(r.fph) * (1 + r.burst * 0.6);
+  // しっぽ
+  ctx.strokeStyle = belly ? '#d8c8c0' : '#5a6f6a'; ctx.lineCap = 'round'; ctx.globalAlpha = 0.85;
+  const sw = Math.sin(r.fph * 0.7) * Rr * 0.18;
+  ctx.lineWidth = Rr * 0.05; ctx.beginPath(); ctx.moveTo(0, Rr * 0.5); ctx.quadraticCurveTo(sw * 0.5, Rr * 0.9, sw, Rr * 1.15); ctx.stroke();
+  ctx.lineWidth = Rr * 0.025; ctx.beginPath(); ctx.moveTo(sw, Rr * 1.15); ctx.quadraticCurveTo(sw * 1.3, Rr * 1.35, sw * 0.6, Rr * 1.55); ctx.stroke();
+  const p = rayPath(Rr, flap);
+  const base = belly ? '#f6eee6' : '#7fa8a0', edge = belly ? '#c9a8a0' : '#36585e';
+  ctx.globalAlpha = 0.15; ctx.strokeStyle = base; ctx.lineWidth = Rr * 0.06; ctx.stroke(p);
+  const gr = ctx.createRadialGradient(0, -Rr * 0.1, Rr * 0.05, 0, 0, Rr);
+  if (belly) { gr.addColorStop(0, '#fffaf4'); gr.addColorStop(0.7, '#f4e6e0'); gr.addColorStop(1, '#e6cfc8'); }
+  else { gr.addColorStop(0, '#a9c9b8'); gr.addColorStop(0.55, '#7fa8a0'); gr.addColorStop(1, '#5a8590'); }
+  ctx.globalAlpha = 0.95; ctx.fillStyle = gr; ctx.fill(p);
+  ctx.save(); ctx.clip(p);
+  if (!belly) {
+    const rs = mulberry(5);
+    for (let i = 0; i < 16; i++) { const x = (rs() - 0.5) * Rr * 1.7, y = (rs() - 0.4) * Rr * 0.7; ctx.globalAlpha = 0.45; ctx.fillStyle = i % 3 ? '#d8e8d0' : '#f6e8b0'; ctx.beginPath(); ctx.arc(x, y, Rr * (0.025 + rs() * 0.03), 0, TAU); ctx.fill(); }
+    ctx.globalAlpha = 0.2; ctx.fillStyle = '#3a5a5a'; ctx.beginPath(); ctx.ellipse(0, -Rr * 0.05, Rr * 0.25, Rr * 0.4, 0, 0, TAU); ctx.fill();
+  } else {
+    ctx.globalAlpha = 0.35; ctx.fillStyle = '#f6b7c0'; ctx.beginPath(); ctx.ellipse(-Rr * 0.6, Rr * 0.05, Rr * 0.3, Rr * 0.18, 0, 0, TAU); ctx.fill(); ctx.beginPath(); ctx.ellipse(Rr * 0.6, Rr * 0.05, Rr * 0.3, Rr * 0.18, 0, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 0.2; ctx.fillStyle = granPat; ctx.fillRect(-Rr * 1.1, -Rr * 0.7, Rr * 2.2, Rr * 1.4);
+  ctx.restore();
+  ctx.globalAlpha = 0.6; ctx.strokeStyle = edge; ctx.lineWidth = Math.max(1.1, Rr * 0.015); ctx.stroke(p);
+  ctx.globalAlpha = 1;
+  if (!belly) {
+    [-1, 1].forEach(s => { ctx.fillStyle = '#20302e'; ctx.beginPath(); ctx.arc(s * Rr * 0.16, -Rr * 0.3, Rr * 0.04, 0, TAU); ctx.fill(); ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(s * Rr * 0.16 + Rr * 0.012, -Rr * 0.315, Rr * 0.015, 0, TAU); ctx.fill(); });
+  } else {
+    // 腹側のかわいい顔（鼻孔と口）
+    [-1, 1].forEach(s => {
+      ctx.fillStyle = '#4a3a40'; ctx.beginPath(); ctx.ellipse(s * Rr * 0.11, -Rr * 0.14, Rr * 0.035, Rr * 0.05, s * 0.3, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(s * Rr * 0.11 + Rr * 0.01, -Rr * 0.16, Rr * 0.012, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 0.5; ctx.fillStyle = '#ff9fb2'; ctx.beginPath(); ctx.ellipse(s * Rr * 0.24, -Rr * 0.06, Rr * 0.05, Rr * 0.03, 0, 0, TAU); ctx.fill(); ctx.globalAlpha = 1;
+      ctx.strokeStyle = 'rgba(160,120,120,0.5)'; ctx.lineWidth = Math.max(1, Rr * 0.012);
+      for (let i = 0; i < 5; i++) { ctx.beginPath(); ctx.moveTo(s * Rr * (0.2 + i * 0.012), Rr * (0.05 + i * 0.045)); ctx.lineTo(s * Rr * (0.26 + i * 0.012), Rr * (0.06 + i * 0.045)); ctx.stroke(); }
+    });
+    ctx.strokeStyle = '#5a3a44'; ctx.lineWidth = Math.max(1.4, Rr * 0.022); ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(-Rr * 0.1, Rr * 0.02); ctx.quadraticCurveTo(0, Rr * 0.12, Rr * 0.1, Rr * 0.02); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawTurtle() {
+  const tu = turtle, L = S * 0.3 * (P.phase === 'party' ? 1.12 : 1);
+  ctx.save(); ctx.translate(tu.x, tu.y);
+  if (tu.gl > 0 || P.nightT > 0) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = Math.max(tu.gl * 0.5, P.nightT * 0.35); ctx.drawImage(P.nightT > 0.3 ? GLOW.mint : GLOW.gold, -L * 0.9, -L * 0.85, L * 1.8, L * 1.3); ctx.globalCompositeOperation = 'source-over'; }
+  let fx = tu.face; if (Math.abs(fx) < 0.1) fx = fx < 0 ? -0.1 : 0.1;
+  ctx.scale(fx, 1);
+  const aw = tu.awake, swim = tu.state === 'swim' ? 1 : 0;
+  ctx.rotate(-0.06 * aw + Math.sin(tu.fph * 0.5) * 0.03 * swim);
+  const skin = '#b9c47e', skinE = '#5f6b34';
+  const flipper = (px, py, len, wid, ang, dark) => {
+    ctx.save(); ctx.translate(px, py); ctx.rotate(ang);
+    const f = new Path2D(); f.moveTo(0, -wid * 0.5); f.quadraticCurveTo(len * 0.6, -wid * 0.9, len, 0); f.quadraticCurveTo(len * 0.5, wid * 0.6, 0, wid * 0.5); f.closePath();
+    ctx.globalAlpha = 0.95; ctx.fillStyle = dark ? '#98a364' : skin; ctx.fill(f);
+    ctx.globalAlpha = 0.35; ctx.fillStyle = '#7f8f4a'; ctx.beginPath(); ctx.arc(len * 0.4, 0, wid * 0.15, 0, TAU); ctx.arc(len * 0.65, -wid * 0.1, wid * 0.1, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 0.6; ctx.strokeStyle = skinE; ctx.lineWidth = Math.max(1, L * 0.008); ctx.stroke(f);
+    ctx.restore();
+  };
+  const sw = Math.sin(tu.fph);
+  // 奥のひれ
+  flipper(L * 0.2, -L * 0.04, L * 0.38, L * 0.1, lerp(0.75, 0.15 + sw * 0.8, aw * swim + (1 - swim) * aw * 0.2) + 0.25, true);
+  flipper(-L * 0.38, -L * 0.03, L * 0.16, L * 0.07, Math.PI - 0.4 + Math.sin(tu.fph + 1) * 0.25 * swim, true);
+  // 腹甲
+  ctx.globalAlpha = 0.95; ctx.fillStyle = '#ecdca2'; ctx.beginPath(); ctx.ellipse(0, -L * 0.015, L * 0.47, L * 0.045, 0, 0, TAU); ctx.fill();
+  // 頭と首
+  const hx = lerp(L * 0.5, L * 0.6, aw), hy = lerp(-L * 0.0, -L * 0.13, aw) + Math.sin(tu.fph * 0.5) * L * 0.01 * aw;
+  ctx.globalAlpha = 0.95; ctx.fillStyle = skin; ctx.beginPath(); ctx.moveTo(L * 0.35, -L * 0.1); ctx.quadraticCurveTo(hx - L * 0.05, hy - L * 0.06, hx, hy - L * 0.04); ctx.lineTo(hx, hy + L * 0.06); ctx.quadraticCurveTo(L * 0.42, L * 0.0, L * 0.35, -L * 0.0); ctx.closePath(); ctx.fill();
+  const lookF = clamp(tu.look, 0, 1);
+  ctx.save(); ctx.translate(hx, hy); ctx.rotate(lerp(0.35, -0.05, aw));
+  const head = new Path2D(); head.ellipse(L * 0.04, 0, L * (0.12 - lookF * 0.02), L * 0.095, 0, 0, TAU);
+  ctx.globalAlpha = 0.97; ctx.fillStyle = skin; ctx.fill(head);
+  ctx.globalAlpha = 0.35; ctx.fillStyle = '#7f8f4a'; ctx.beginPath(); ctx.arc(L * 0.0, -L * 0.05, L * 0.022, 0, TAU); ctx.arc(L * 0.07, -L * 0.06, L * 0.016, 0, TAU); ctx.arc(-L * 0.04, L * 0.0, L * 0.018, 0, TAU); ctx.fill();
+  ctx.globalAlpha = 0.6; ctx.strokeStyle = skinE; ctx.lineWidth = Math.max(1, L * 0.009); ctx.stroke(head);
+  ctx.globalAlpha = 1;
+  if (lookF > 0.1) {
+    // こっちを見る：二つの目
+    [-1, 1].forEach(s => { const ex = L * 0.05 + s * L * 0.045; ctx.fillStyle = '#1f2018'; ctx.beginPath(); ctx.arc(ex, -L * 0.015, L * 0.024, 0, TAU); ctx.fill(); ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(ex + L * 0.008, -L * 0.025, L * 0.009, 0, TAU); ctx.fill(); });
+    ctx.strokeStyle = '#4a4a2a'; ctx.lineWidth = Math.max(1, L * 0.008); ctx.beginPath(); ctx.arc(L * 0.05, L * 0.025, L * 0.025, 0.2, Math.PI - 0.2); ctx.stroke();
+    ctx.globalAlpha = 0.5; ctx.fillStyle = '#ff9fb2'; [-1, 1].forEach(s => { ctx.beginPath(); ctx.ellipse(L * 0.05 + s * L * 0.075, L * 0.02, L * 0.02, L * 0.012, 0, 0, TAU); ctx.fill(); });
+  } else if (aw > 0.25) {
+    ctx.fillStyle = '#1f2018'; ctx.beginPath(); ctx.arc(L * 0.075, -L * 0.025, L * 0.026, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(L * 0.083, -L * 0.035, L * 0.01, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#4a4a2a'; ctx.lineWidth = Math.max(1, L * 0.007); ctx.beginPath(); ctx.moveTo(L * 0.16, L * 0.02); ctx.quadraticCurveTo(L * 0.12, L * 0.045, L * 0.08, L * 0.035); ctx.stroke();
+    ctx.globalAlpha = 0.45; ctx.fillStyle = '#ff9fb2'; ctx.beginPath(); ctx.ellipse(L * 0.06, L * 0.03, L * 0.022, L * 0.013, 0, 0, TAU); ctx.fill();
+  } else {
+    ctx.strokeStyle = '#3a3a20'; ctx.lineWidth = Math.max(1.2, L * 0.008); ctx.beginPath(); ctx.arc(L * 0.075, -L * 0.03, L * 0.02, 0.2, Math.PI - 0.2); ctx.stroke();
+  }
+  ctx.restore();
+  // 甲羅
+  const k = L / SHELL.base;
+  ctx.globalAlpha = 1; ctx.drawImage(SHELL.c, -SHELL.ox * k, -SHELL.oy * k - L * 0.02, SHELL.w * k, SHELL.h * k);
+  // 手前のひれ
+  flipper(L * 0.22, -L * 0.0, L * 0.42, L * 0.11, lerp(0.7, 0.25 + Math.sin(tu.fph + 0.4) * 0.85, aw * swim + (1 - swim) * aw * 0.15), false);
+  flipper(-L * 0.36, -L * 0.0, L * 0.17, L * 0.075, Math.PI - 0.55 + Math.sin(tu.fph + 2) * 0.3 * swim, false);
+  ctx.restore();
+}
+
+function mantaPath(Rr, flap) {
+  const fy = flap * Rr * 0.32, p = new Path2D(), w = 1 - Math.abs(flap) * 0.08;
+  p.moveTo(Rr * 0.14, -Rr * 0.5);
+  p.bezierCurveTo(Rr * 0.45, -Rr * 0.48, Rr * 0.82 * w, -Rr * 0.18 + fy * 0.6, Rr * 1.06 * w, Rr * 0.04 + fy);
+  p.bezierCurveTo(Rr * 0.78 * w, Rr * 0.1 + fy * 0.5, Rr * 0.45, Rr * 0.2, Rr * 0.2, Rr * 0.42);
+  p.quadraticCurveTo(0, Rr * 0.52, -Rr * 0.2, Rr * 0.42);
+  p.bezierCurveTo(-Rr * 0.45, Rr * 0.2, -Rr * 0.78 * w, Rr * 0.1 + fy * 0.5, -Rr * 1.06 * w, Rr * 0.04 + fy);
+  p.bezierCurveTo(-Rr * 0.82 * w, -Rr * 0.18 + fy * 0.6, -Rr * 0.45, -Rr * 0.48, -Rr * 0.14, -Rr * 0.5);
+  p.quadraticCurveTo(0, -Rr * 0.44, Rr * 0.14, -Rr * 0.5);
+  p.closePath(); return p;
+}
+function drawManta() {
+  const m = manta, d = clamp(m.depth, 0, 1);
+  const Rr = S * 0.42 * lerp(0.62, 1.3, d);
+  const far = 1 - d;
+  ctx.save(); ctx.translate(m.x, m.y);
+  let rot = m.head + Math.PI / 2;
+  ctx.rotate(rot);
+  if (m.loop > 0) { const q = Math.sin(m.loop * Math.PI); ctx.scale(1 + q * 0.15, Math.cos(m.loop * TAU)); }
+  if (P.nightT > 0) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = P.nightT * 0.3 * (0.4 + d); ctx.drawImage(GLOW.lav, -Rr * 1.4, -Rr * 1.0, Rr * 2.8, Rr * 2.0); ctx.globalCompositeOperation = 'source-over'; }
+  const flap = Math.sin(m.fph) * (1 + m.burst * 0.4);
+  const p = mantaPath(Rr, flap);
+  const A = lerp(0.78, 0.92, d);
+  // しっぽと頭びれ
+  ctx.globalAlpha = A * 0.8; ctx.strokeStyle = '#1d3048'; ctx.lineCap = 'round'; ctx.lineWidth = Rr * 0.025;
+  ctx.beginPath(); ctx.moveTo(0, Rr * 0.48); ctx.quadraticCurveTo(Math.sin(m.fph) * Rr * 0.05, Rr * 0.75, 0, Rr * 0.95); ctx.stroke();
+  [-1, 1].forEach(s => { ctx.fillStyle = '#22385a'; ctx.beginPath(); ctx.ellipse(s * Rr * 0.125, -Rr * 0.53, Rr * 0.032, Rr * 0.085, s * 0.2, 0, TAU); ctx.fill(); });
+  ctx.globalAlpha = A * 0.15; ctx.strokeStyle = '#2b4a6a'; ctx.lineWidth = Rr * 0.05; ctx.stroke(p);
+  const gr = ctx.createRadialGradient(0, -Rr * 0.15, Rr * 0.05, 0, 0, Rr * 1.05);
+  gr.addColorStop(0, '#3f7090'); gr.addColorStop(0.45, '#28476a'); gr.addColorStop(1, '#1a2c48');
+  ctx.globalAlpha = A; ctx.fillStyle = gr; ctx.fill(p);
+  ctx.save(); ctx.clip(p);
+  // 白い肩の模様と水彩のむら（窓がきれいになるほどよく見える）
+  const det = P.phase === 'clean' ? lerp(0.35, 1, smooth(P.clean / 0.5)) : 1;
+  [-1, 1].forEach(s => {
+    ctx.save(); ctx.translate(s * Rr * 0.3, -Rr * 0.16); ctx.rotate(s * -0.5); ctx.scale(1, 0.38);
+    const pg = ctx.createRadialGradient(0, 0, 0, 0, 0, Rr * 0.2);
+    pg.addColorStop(0, 'rgba(236,244,246,0.8)'); pg.addColorStop(0.6, 'rgba(220,236,240,0.45)'); pg.addColorStop(1, 'rgba(220,236,240,0)');
+    ctx.globalAlpha = A * det; ctx.fillStyle = pg; ctx.beginPath(); ctx.arc(0, 0, Rr * 0.2, 0, TAU); ctx.fill();
+    ctx.restore();
+  });
+  const sh = ctx.createRadialGradient(0, -Rr * 0.1, 0, 0, -Rr * 0.1, Rr * 0.45);
+  sh.addColorStop(0, 'rgba(127,214,196,0.35)'); sh.addColorStop(1, 'rgba(127,214,196,0)');
+  ctx.globalAlpha = A * det; ctx.fillStyle = sh; ctx.fillRect(-Rr * 0.5, -Rr * 0.6, Rr, Rr);
+  [-1, 1].forEach(s => {
+    const wg = ctx.createRadialGradient(s * Rr * 0.7, Rr * 0.1, 0, s * Rr * 0.7, Rr * 0.1, Rr * 0.35);
+    wg.addColorStop(0, 'rgba(183,166,220,0.28)'); wg.addColorStop(1, 'rgba(183,166,220,0)');
+    ctx.fillStyle = wg; ctx.fillRect(s * Rr * 0.7 - Rr * 0.35, Rr * 0.1 - Rr * 0.35, Rr * 0.7, Rr * 0.7);
+  });
+  ctx.globalAlpha = A * 0.25; ctx.fillStyle = granPat; ctx.fillRect(-Rr * 1.1, -Rr * 0.6, Rr * 2.2, Rr * 1.2);
+  ctx.restore();
+  ctx.globalAlpha = A * 0.55; ctx.strokeStyle = '#122238'; ctx.lineWidth = Math.max(1.2, Rr * 0.008); ctx.stroke(p);
+  ctx.globalAlpha = A; [-1, 1].forEach(s => { ctx.fillStyle = '#0e1828'; ctx.beginPath(); ctx.arc(s * Rr * 0.19, -Rr * 0.42, Rr * 0.018, 0, TAU); ctx.fill(); ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(s * Rr * 0.19 + Rr * 0.006, -Rr * 0.426, Rr * 0.007, 0, TAU); ctx.fill(); });
+  // 遠くは水の色に溶ける
+  if (far > 0.02) { ctx.globalAlpha = far * 0.3; ctx.fillStyle = '#2a7088'; ctx.fill(p); }
+  ctx.restore();
+}
+
+// ============================================================
+//  描画：全体
+// ============================================================
+function drawWeeds() {
+  ctx.lineCap = 'round';
+  weeds.forEach((w, i) => {
+    const bx = gx(w.u), by = gy(floorV(clamp(w.u, 0, 1))) + S * 0.02, h = S * w.h, n = 7;
+    let px = bx, py = by;
+    for (let k = 1; k <= n; k++) {
+      const t = k / n, x = bx + Math.sin(T * 0.8 + w.ph + t * 2.2) * t * h * 0.18 + (P.flowT > 0 ? P.flow.x * P.flowT * 0.05 * t : 0), y = by - t * h;
+      ctx.strokeStyle = w.col; ctx.globalAlpha = 0.3; ctx.lineWidth = S * w.w * (1.6 - t) * 1.4; ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(x, y); ctx.stroke();
+      ctx.globalAlpha = 0.65; ctx.lineWidth = S * w.w * (1.2 - t * 0.8); ctx.stroke();
+      px = x; py = y;
+    }
+  });
+  ctx.globalAlpha = 1;
+}
+function drawLightRays() {
+  const a0 = 0.16 * (1 - P.nightT * 0.75);
+  if (a0 < 0.01) return;
+  ctx.globalCompositeOperation = 'lighter';
+  lightRays.forEach(r => {
+    const a = a0 * (0.55 + 0.45 * Math.sin(T * 0.25 + r.ph));
+    ctx.save(); ctx.globalAlpha = a; ctx.translate(gx(r.u) + Math.sin(T * 0.12 + r.ph) * S * 0.04, G.y - 10);
+    ctx.transform(1, 0, r.sl, 1, 0, 0);
+    ctx.drawImage(raySpr, -G.w * r.w / 2, 0, G.w * r.w, G.h * 0.95);
+    ctx.restore();
+  });
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+}
+function drawBubbles() {
+  const n = P.nightT;
+  for (const b of bubbles) {
+    const s = b.r * 2;
+    if ((b.glow || b.sp) && n > 0.1) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.35 * n; ctx.drawImage(GLOW.aqua, b.x - s * 1.2, b.y - s * 1.2, s * 2.4, s * 2.4); ctx.globalCompositeOperation = 'source-over'; }
+    if (b.sp) {
+      const q = 0.5 + 0.5 * Math.sin(T * 5);
+      ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.45 + 0.3 * q; ctx.drawImage(GLOW.gold, b.x - s * 1.4, b.y - s * 1.4, s * 2.8, s * 2.8); ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 0.7; ctx.strokeStyle = `hsl(${(T * 120) % 360},90%,75%)`; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(b.x, b.y, b.r * (1 + 0.04 * q), 0, TAU); ctx.stroke();
+    }
+    ctx.globalAlpha = Math.min(1, b.life * 4) * (0.85 + n * 0.15);
+    const sq = 1 + Math.sin(b.ph * 1.7) * 0.05;
+    ctx.drawImage(bubbleSpr, b.x - b.r * sq, b.y - b.r / sq, s * sq, s / sq);
+  }
+  ctx.globalAlpha = 1;
+}
+function drawFlakes() {
+  for (const f of flakes) {
+    const a = f.life < 0.15 ? f.life / 0.15 : 1 - smooth((f.life - f.max * 0.5) / (f.max * 0.5));
+    ctx.globalAlpha = a * 0.9; ctx.save(); ctx.translate(f.x, f.y); ctx.rotate(f.rot);
+    const s = f.s * (1 + f.life * 0.3); ctx.drawImage(flakeSprs[f.k], -s, -s * 0.7, s * 2, s * 1.4); ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+function drawSparks() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const s of sparks) {
+    const k = s.life / s.max, a = k < 0.2 ? k / 0.2 : 1 - (k - 0.2) / 0.8;
+    ctx.globalAlpha = a;
+    const z = s.s * (s.star ? 1.6 : 1);
+    ctx.drawImage(s.star ? sparkSpr : (GLOW[s.col] || GLOW.white), s.x - z, s.y - z, z * 2, z * 2);
+  }
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+}
+function drawPlankton() {
+  const n = P.nightT; if (n < 0.02) return;
+  const gath = P.phase === 'party' ? smooth((P.pT - 6) / 3) : 1;
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of plankton) {
+    const tw = 0.4 + 0.6 * Math.pow(0.5 + 0.5 * Math.sin(T * (1.3 + p.s) + p.ph * 3), 2);
+    ctx.globalAlpha = n * gath * tw * (0.7 + p.b);
+    const s = (3 + p.s * 3) * (1 + p.b);
+    ctx.drawImage(GLOW[p.c], p.x - s, p.y - s, s * 2, s * 2);
+  }
+  // サンゴのまたたき
+  for (let i = 0; i < coralTips.length; i += 2) {
+    const t = coralTips[i], tw = 0.5 + 0.5 * Math.sin(T * 1.7 + i);
+    ctx.globalAlpha = n * tw * 0.6; const s = S * 0.025;
+    ctx.drawImage([GLOW.pink, GLOW.aqua, GLOW.gold][i % 3], gx(t[0]) - s, gy(t[1]) - s, s * 2, s * 2);
+  }
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+}
+function drawTrail() {
+  if (trail.length < 2) return;
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  // 区切りごとに一本の線として描く（重なりで濃くならないように）
+  let i = 1;
+  while (i < trail.length) {
+    const kind = trail[i].pearl, start = i - 1;
+    let j = i;
+    while (j < trail.length && trail[j].pearl === kind && j - start < 6 && trail[j].t - trail[j - 1].t < 0.2) j++;
+    if (j === i) { i++; continue; }
+    const age = T - trail[j - 1].t;
+    const path = (ox, oy) => { ctx.beginPath(); ctx.moveTo(trail[start].x + ox, trail[start].y + oy); for (let k = start + 1; k < j; k++) ctx.lineTo(trail[k].x + ox, trail[k].y + oy); };
+    if (kind) {
+      const k = 1 - age / 2.2;
+      if (k > 0) {
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = k * 0.13; ctx.strokeStyle = ['#ffd9ec', '#d9f7ff', '#fff4d0'][start % 3]; ctx.lineWidth = sR * 0.55; path(0, 0); ctx.stroke();
+        ctx.globalAlpha = k * 0.45; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = Math.max(2, sR * 0.07); path(-sR * 0.15, -sR * 0.2); ctx.stroke();
+        ctx.globalCompositeOperation = 'source-over';
+      }
+    } else {
+      const k = 1 - age / 1.4;
+      if (k > 0) {
+        // 濡れたガラスの反射
+        ctx.globalAlpha = k * 0.14; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = sR * 0.5; path(-sR * 0.3, -sR * 0.35); ctx.stroke();
+        ctx.globalAlpha = k * 0.4; ctx.lineWidth = 2; path(-sR * 0.5, -sR * 0.55); ctx.stroke();
+      }
+    }
+    i = j;
+  }
+  ctx.globalAlpha = 1;
+}
+function drawSponge() {
+  const n = spongeSpr.width / DPR, h = n / 2;
+  const lx = sponge.lagx, ly = sponge.lagy, ld = hyp(lx, ly);
+  const st = clamp(ld / (sR * 0.55), 0, 1) * 0.16;
+  const press = handle.press;
+  ctx.save(); ctx.translate(sponge.x, sponge.y);
+  const ang = ld > 0.5 ? Math.atan2(ly, lx) : 0;
+  ctx.rotate(ang);
+  const j = sponge.jel * 0.012;
+  ctx.scale((1 + st + press * 0.05 + j), (1 - st * 0.6 + press * 0.05 - j));
+  ctx.rotate(-ang);
+  ctx.globalAlpha = 0.95; ctx.drawImage(spongeSpr, -h, -h, n, n);
+  ctx.restore();
+}
+function drawSpongeGhost() {
+  // 藻ごしにもスポンジの輪郭がうっすら見える
+  if (P.dirtA < 0.2) return;
+  ctx.globalAlpha = 0.28 * P.dirtA; ctx.strokeStyle = '#fff0b8'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(sponge.x, sponge.y, sR * 0.9, 0, TAU); ctx.stroke();
+  ctx.globalAlpha = 0.18 * P.dirtA; ctx.strokeStyle = '#d0f0f0'; ctx.beginPath(); ctx.arc(sponge.x, sponge.y, sR * 1.02, 0, TAU); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+function drawHandle() {
+  const n = handleSpr.width / DPR, h = n / 2;
+  const breath = drag.active || P.phase !== 'clean' ? 0 : Math.sin(T * 2.2) * 0.022;
+  const sc = 1 - handle.press * 0.07 + handle.wob * 0.02 + breath;
+  ctx.globalAlpha = 0.5 - handle.press * 0.15;
+  const so = hR * (0.16 - handle.press * 0.07);
+  ctx.drawImage(shadowSpr, handle.x - h * 1.05 + so * 0.7, handle.y - h * 1.05 + so, n * 1.05, n * 1.05);
+  ctx.globalAlpha = 1;
+  ctx.save(); ctx.translate(handle.x, handle.y); ctx.scale(sc, sc);
+  ctx.drawImage(handleSpr, -h, -h, n, n);
+  // ときどき陶器にきらりと光が走る
+  if (!drag.active) {
+    const ph = (T % 3.6) / 3.6;
+    if (ph < 0.3) {
+      const k = ph / 0.3;
+      ctx.save(); ctx.beginPath(); ctx.arc(0, 0, hR, 0, TAU); ctx.clip();
+      ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.35 * Math.sin(k * Math.PI);
+      ctx.rotate(-0.7); const x = lerp(-hR * 1.4, hR * 1.4, k);
+      const g = ctx.createLinearGradient(x - hR * 0.3, 0, x + hR * 0.3, 0); g.addColorStop(0, 'rgba(255,255,255,0)'); g.addColorStop(0.5, 'rgba(255,255,255,1)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g; ctx.fillRect(x - hR * 0.3, -hR * 1.2, hR * 0.6, hR * 2.4);
+      ctx.restore();
+    }
+  }
+  ctx.restore();
+}
+function drawRipples() {
+  ctx.lineWidth = 2;
+  for (const r of ripples) {
+    for (let k = 0; k < 2; k++) {
+      const t = r.t - k * 0.15; if (t <= 0) continue;
+      ctx.globalAlpha = (1 - t) * 0.45; ctx.strokeStyle = '#e8fbff';
+      ctx.beginPath(); ctx.ellipse(r.x, r.y, S * 0.07 * t + 4, S * 0.05 * t + 3, 0, 0, TAU); ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+function drawHint() {
+  if (hint.alpha <= 0.01 || hint.x === undefined) return;
+  const s = hR * 1.15 / HAND.w * 1.3 * (1 - (hint.press || 0) * 0.08);
+  ctx.save(); ctx.globalAlpha = hint.alpha * 0.85;
+  ctx.translate(hint.x, hint.y); ctx.rotate(-0.35); ctx.scale(s, s);
+  ctx.drawImage(HAND.c, -HAND.tipX, -HAND.tipY);
+  ctx.restore();
+  if (hint.press > 0.3) { ctx.globalAlpha = hint.alpha * 0.4 * hint.press; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(hint.x, hint.y, hR * 0.4 * (1.5 - hint.press * 0.5), 0, TAU); ctx.stroke(); ctx.globalAlpha = 1; }
+}
+function creatureHalo(x, y, r, col, a) {
+  if (a <= 0.01) return;
+  ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = a; ctx.drawImage(GLOW[col], x - r, y - r, r * 2, r * 2); ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+}
+
+function render() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(bgC, 0, 0, W, H);
+  drawLightRays();
+  ctx.save(); ctx.beginPath(); ctx.rect(G.x, G.y, G.w, G.h); ctx.clip();
+  const mantaNear = manta.depth > 0.5;
+  if (!mantaNear) drawManta();
+  ctx.drawImage(floorDay, 0, 0, W, H);
+  if (P.nightT > 0.01) { ctx.globalAlpha = P.nightT; ctx.drawImage(floorNight, 0, 0, W, H); ctx.globalAlpha = 1; }
+  drawWeeds();
+  // 夜の海（背景を藍色へ）
+  if (P.nightT > 0.01) {
+    ctx.globalCompositeOperation = 'multiply'; ctx.globalAlpha = P.nightT; ctx.fillStyle = nightGradA; ctx.fillRect(G.x, G.y, G.w, G.h);
+    ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+  }
+  drawTurtle();
+  drawRay();
+  const mantaFront = manta.depth > 0.88;
+  if (mantaNear && !mantaFront) drawManta();
+  for (const f of fishes) drawFish(f);
+  drawShark();
+  if (mantaFront) drawManta();
+  if (P.nightT > 0.01) {
+    ctx.globalCompositeOperation = 'multiply'; ctx.globalAlpha = P.nightT * 0.5; ctx.fillStyle = nightGradB; ctx.fillRect(G.x, G.y, G.w, G.h);
+    ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+  }
+  drawPlankton();
+  for (const f of gfish) drawFish(f);
+  drawBubbles();
+  drawFlakes();
+  // ガラス：スポンジ → 藻 → 濡れた反射
+  drawSponge();
+  if (P.dirtA > 0.005) { ctx.globalAlpha = P.dirtA; ctx.drawImage(dirt, G.x, G.y, G.w, G.h); ctx.globalAlpha = 1; }
+  drawSpongeGhost();
+  drawTrail();
+  drawSparks();
+  drawRipples();
+  ctx.restore();
+  ctx.drawImage(frameC, 0, 0, W, H);
+  drawHandle();
+  drawHint();
+  // 紙の質感
+  ctx.globalCompositeOperation = 'multiply'; ctx.globalAlpha = 0.4; ctx.fillStyle = paperPat; ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+}
+
+// ============================================================
+//  ループ
+// ============================================================
+let last = 0, rafId = 0, running = false;
+function frame(ts) {
+  if (!running) return;
+  let dt = (ts - last) / 1000; last = ts;
+  if (!(dt > 0)) dt = 0.016; dt = Math.min(dt, 1 / 30);
+  T += dt;
+  try {
+    updateHint(dt);
+    updateSponge(dt);
+    updatePhase(dt);
+    updateCreatures(dt);
+    updateFish(dt);
+    updateParticles(dt);
+    audioUpdate(dt);
+    render();
+  } catch (e) { if (window.console) console.warn(e); }
+  rafId = requestAnimationFrame(frame);
+}
+function start() { if (running) return; running = true; last = performance.now(); rafId = requestAnimationFrame(frame); }
+function stop() { running = false; cancelAnimationFrame(rafId); }
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { stop(); if (AU.c && AU.c.state === 'running') AU.c.suspend().catch(() => {}); if (drag.id !== null) { drag.id = null; drag.active = false; } }
+  else { start(); if (AU.c && AU.c.state === 'suspended' && firstDragDone) AU.c.resume().catch(() => {}); }
+});
+
+let firstLayout = true;
+function layout() {
+  const old = { x: G.x, y: G.y, w: G.w, h: G.h };
+  W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight);
+  let dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const maxPix = 2.6e6; if (W * H * dpr * dpr > maxPix) dpr = Math.max(1, Math.sqrt(maxPix / (W * H)));
+  DPR = dpr;
+  cvs.width = Math.round(W * DPR); cvs.height = Math.round(H * DPR);
+  const cs = getComputedStyle(saEl);
+  const sa = { t: parseFloat(cs.paddingTop) || 0, r: parseFloat(cs.paddingRight) || 0, b: parseFloat(cs.paddingBottom) || 0, l: parseFloat(cs.paddingLeft) || 0 };
+  FR = clamp(Math.min(W, H) * 0.03, 10, 30);
+  const l = Math.max(FR, sa.l + 6), r = Math.max(FR, sa.r + 6), t = Math.max(FR, sa.t + 6), b = Math.max(FR, sa.b + 6);
+  G.x = l; G.y = t; G.w = Math.max(50, W - l - r); G.h = Math.max(50, H - t - b);
+  S = Math.min(G.w, G.h);
+  hR = clamp(Math.min(W, H) * 0.115, 40, 92); sR = hR;
+  buildOverlays();
+  buildBG(); buildFloor(); buildFrame(); buildHandle();
+  if (firstLayout) { firstLayout = false; initWorld(); }
+  else if (old.w > 0) remapAll(old);
+}
+let rzT = 0;
+function onResize() { clearTimeout(rzT); rzT = setTimeout(() => { try { layout(); if (!running) render(); } catch (e) { if (window.console) console.warn(e); } }, 120); }
+window.addEventListener('resize', onResize);
+window.addEventListener('orientationchange', onResize);
+
+layout();
+render();
+start();
+
+// 自動テスト用の読み取り専用の状態
+window.__aquarium = { skip: t => { if (P.phase === 'party') P.pT = t; }, state: () => ({ phase: P.phase, clean: P.clean, night: P.nightT, ray: ray.disc, turtle: turtle.disc, shark: shark.disc, manta: P.mantaDisc, bubbles: bubbles.length, gfish: gfish.length, handle: [handle.x, handle.y], sponge: [sponge.x, sponge.y], G: [G.x, G.y, G.w, G.h], hR }) };
+})();
+</script>
+</body>
+</html>

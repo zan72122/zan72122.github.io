@@ -1,0 +1,877 @@
+/* ============================================================================
+ * render.js — Renderer, colour pipeline and post-processing stack
+ * ----------------------------------------------------------------------------
+ * Target look: a warm, softly-lit toy-photography frame.  The chain is
+ *
+ *   RenderPass → GTAO → Bloom → Grade(DOF+vignette+grain+CA+LUT) → SMAA
+ *
+ * with AgX tone mapping applied inside the grade pass so bloom is added in
+ * linear space *before* the curve, which is what stops highlights turning
+ * chalky.  Quality tiers scale the expensive passes down for phones.
+ * ========================================================================== */
+
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
+import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
+import {
+  MOBILE_PIXEL_BUDGET,
+  canvasCssSize,
+  detectTouchEnvironment,
+  fitPixelRatioToBudget,
+  pixelRatioCap,
+  selectRenderTier,
+  setRendererDrawingSize
+} from './mobile-policy.js';
+import { resizeSceneDepthTargets, syncSceneDepth } from './scene-depth.js';
+import { QUALITY } from './performance.js';
+
+/* --------------------------------------------------------------- tiers --- */
+
+export const TIER = { LOW: 0, MED: 1, HIGH: 2 };
+
+/**
+ * Pick a quality tier. Deliberately conservative: a stuttering 30fps nursery
+ * reads as *worse* than a slightly softer 60fps one on a child's tablet.
+ */
+export function detectTier() {
+  const forced = new URLSearchParams(location.search).get('tier');
+  return selectRenderTier({
+    forced,
+    deviceMemory: navigator.deviceMemory,
+    hardwareConcurrency: navigator.hardwareConcurrency,
+    width: window.innerWidth,
+    height: window.innerHeight,
+    devicePixelRatio: window.devicePixelRatio,
+    touch: detectTouchEnvironment()
+  });
+}
+
+/* --------------------------------------------------------- grade shader --- */
+
+/**
+ * Single combined "finishing" pass. Doing DOF, vignette, grain, chromatic
+ * aberration, tone mapping and the film-look grade in one shader saves three
+ * full-screen round trips versus stacking stock passes.
+ */
+const GradeShader = {
+  name: 'GradeShader',
+  uniforms: {
+    tDiffuse:     { value: null },
+    tDepth:       { value: null },
+    uResolution:  { value: new THREE.Vector2(1, 1) },
+    uExposure:    { value: 1.0 },
+    uVignette:    { value: 0.30 },
+    uGrain:       { value: 0.014 },
+    // 0.0016 put a 3 px rainbow fringe on every high-contrast vertical edge at
+    // 1280 wide — the curtain leading edge looked like a compression artefact.
+    // Real lens CA on a good wide is well under a pixel in the centre.
+    // …and it has to *stop* being a constant term. `0.25 + r2 * 2.4` never
+    // reaches zero, so every edge in the frame carried a fringe, just a smaller
+    // one — which is what made the drum rim and the rug/floor boundary fringe
+    // at frame *centre*. A real lens' lateral CA is a field aberration: it is
+    // identically zero on the optical axis and rises steeply in the last
+    // fifth of the image circle. `pow(r², n)` is that curve.
+    uAberration:  { value: 0.0022 },
+    uDofStrength: { value: 0.85 },
+    uFocus:       { value: 0.14 },   // view-space depth of the subject
+    uFocusRange:  { value: 0.30 },
+    uNear:        { value: 0.1 },
+    uFar:         { value: 100 },
+    uLift:        { value: new THREE.Vector3(0.004, 0.002, 0.007) },
+    uGain:        { value: new THREE.Vector3(1.03, 1.005, 0.985) },
+    uSaturation:  { value: 1.11 },
+    uContrast:    { value: 1.045 },
+    uWarmth:      { value: 0.03 },
+    /* Black point. Measured (tools/histo.mjs) the whole 28-frame set lived
+     * between display 0.27 and 0.67 with *zero* pixels under 0.15 in six
+     * frames — rubric §4 #101. AgX's toe is deliberately long: display 0.15
+     * needs linear 0.018, and a room with a 0.33 env probe, a 0.23 hemisphere
+     * and a 0.5 fill never gets a surface that dark. The grade therefore has
+     * to author the black point rather than hoping the render produces one.
+     *
+     * The curve is `c²(1+k)/(c+k)`: exactly 0 at 0, unity gain well above k,
+     * and smooth everywhere in between, so it darkens the bottom two stops
+     * without the posterised step a subtract-and-clamp produces on a smooth
+     * wall gradient. Per mood in lighting.js `MOODS[*].grade.black`. */
+    uBlack:       { value: 0.0 },
+    /* Per-channel highlight shoulder.
+     *
+     * The luminance histogram cannot see the defect this fixes. Measured on
+     * `51-sleep-asleep`, **23.8% of the frame had the red channel pinned at
+     * 255** while green and blue sat around 0.9 and 0.7 — so the baby's face
+     * was a flat vermilion plateau with every trace of form gone, and yet the
+     * frame reported 0.00% of pixels above luminance 0.95. Warm light on warm
+     * skin flat-tops one channel long before the pixel is anywhere near white,
+     * and a hard clamp at 1.0 is what turns a lit cheek into a paper cut-out.
+     *
+     * The fix is a shoulder that maps [uShoulder, uWhite] onto [uShoulder, 1.0]
+     * with `s(2-s)` — monotonic, zero slope at the white point so there is no
+     * hard corner, and near-unity slope at the knee so midtones are untouched.
+     * A channel therefore desaturates smoothly toward white as it brightens
+     * (which is what a film highlight actually does) instead of flat-topping,
+     * and the luminance gradient across a highlight survives.
+     *
+     * `uWhite` is the *display* value that maps to 1.0. It has to be tuned
+     * against what the render actually produces, not chosen for tidiness. AgX
+     * is extremely compressive at the top — measured, the sky through the
+     * window lands at linear 4.3 even at a sky gain of 7.0, which AgX puts at
+     * display 0.936, and a naive asymptotic shoulder then pulled that *down* to
+     * 0.879. At a white point of 1.22 the same pixel lands at 0.964, i.e. the
+     * frame finally carries a genuine near-white — while the 0.09% of frame 51
+     * that exceeds 1.22 is the only region that clips at all (§4 #46).
+     */
+    uShoulder:    { value: 0.84 },
+    uWhite:       { value: 1.22 },
+    // Split toning — the single most useful lever for D38. A warm key against
+    // a neutral shadow gives an image luminance range but no *chromatic* range,
+    // and that is what makes a render read as "correctly exposed" rather than
+    // "lit". Real shadow is not the key minus intensity, it is a different
+    // light source: the sky. So shadows get pushed toward that sky, highlights
+    // stay with the key. Per-mood values live in lighting.js `MOODS[*].grade`.
+    uShadowTint:  { value: new THREE.Vector3(0.88, 0.955, 1.16) },
+    uHighTint:    { value: new THREE.Vector3(1.04, 1.0, 0.945) },
+    uSplit:       { value: 1.0 }
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */`
+    #include <common>
+    #include <packing>
+
+    varying vec2 vUv;
+    uniform sampler2D tDiffuse;
+    uniform sampler2D tDepth;
+    uniform float uExposure, uVignette, uGrain, uAberration;
+    uniform float uDofStrength, uFocus, uFocusRange, uNear, uFar;
+    uniform float uSaturation, uContrast, uWarmth, uSplit, uBlack, uShoulder, uWhite;
+    uniform vec2  uResolution;
+    uniform vec3  uLift, uGain, uShadowTint, uHighTint;
+
+    #ifndef MOBILE_FAST_GRADE
+    float linearDepth(vec2 uv) {
+      float d = texture2D(tDepth, uv).x;
+      #if defined( DEPTH_IS_LINEAR )
+        return d;
+      #elif PERSPECTIVE_CAMERA == 1
+        float vz = perspectiveDepthToViewZ(d, uNear, uFar);
+        return viewZToOrthographicDepth(vz, uNear, uFar);
+      #else
+        return d;
+      #endif
+    }
+    #endif
+
+    // AgX — gentler highlight rolloff than ACES, keeps pastels from going grey.
+    vec3 agxDefaultContrastApprox(vec3 x) {
+      vec3 x2 = x * x;
+      vec3 x4 = x2 * x2;
+      return  15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x
+            + 0.4298 * x2 + 0.1191 * x - 0.00232;
+    }
+    vec3 agx(vec3 col) {
+      const mat3 agxIn = mat3(
+        0.8425640, 0.0784336, 0.0792237,
+        0.0423241, 0.8784686, 0.0791661,
+        0.0424069, 0.0784336, 0.8791429);
+      const mat3 agxOut = mat3(
+         1.1968790, -0.0980210, -0.0990297,
+        -0.0528968,  1.1519110, -0.0989646,
+        -0.0529716, -0.0980190,  1.1510335);
+      const float minEv = -12.47393, maxEv = 4.026069;
+      col = agxIn * col;
+      col = clamp(log2(col), minEv, maxEv);
+      col = (col - minEv) / (maxEv - minEv);
+      col = agxDefaultContrastApprox(col);
+      col = agxOut * col;
+      /* Saturation restore after the neutral AgX base.
+       *
+       * AgX earns its highlight rolloff by walking colours toward white as they
+       * brighten, and at 1.06 almost none of that was being given back. The
+       * consequence was visible in every frame: a 4.75-intensity amber key
+       * landing on a cream wall came out *pale pink*, the rug came out dusty,
+       * and the whole nursery sat in one washed pastel family with no colour
+       * anywhere strong enough to be called a hue. The frame read "correctly
+       * exposed" and not "lit" — which is the thing that separates a hobby
+       * render from a shipped one.
+       *
+       * 1.18 is applied here rather than in the grade's uSaturation on
+       * purpose: at this point we are still working per-channel on the tone
+       * curve's own output, so it undoes AgX's desaturation where AgX did it
+       * (the highlights) instead of pushing the shadows around too.
+       */
+      float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
+      col = mix(vec3(l), col, 1.18);
+      return max(col, 0.0);
+    }
+
+    #ifndef MOBILE_FAST_GRADE
+    // 13-tap hex bokeh — cheap, and the hex shape is far more filmic than a box.
+    vec3 bokeh(vec2 uv, float radius) {
+      vec3 sum = texture2D(tDiffuse, uv).rgb;
+      if (radius < 0.0008) return sum;
+      float total = 1.0;
+      const int RINGS = 2;
+      for (int r = 1; r <= RINGS; r++) {
+        float rr = radius * float(r) / float(RINGS);
+        for (int i = 0; i < 6; i++) {
+          float a = (float(i) / 6.0 + float(r) * 0.08) * PI2;
+          vec2 off = vec2(cos(a), sin(a)) * rr;
+          off.x *= uResolution.y / uResolution.x;
+          sum += texture2D(tDiffuse, uv + off).rgb;
+          total += 1.0;
+        }
+      }
+      return sum / total;
+    }
+    #endif
+
+    void main() {
+      vec2 uv = vUv;
+      vec2 fromCenter = uv - 0.5;
+      float r2 = dot(fromCenter, fromCenter);
+
+      #ifdef MOBILE_FAST_GRADE
+      // iPad path: keep the authored grade, tone curve, vignette and dither,
+      // but compile out depth/DOF and chromatic multi-sampling entirely.
+      vec3 col = texture2D(tDiffuse, uv).rgb;
+      #else
+      // depth of field ------------------------------------------------------
+      float depth = linearDepth(uv);
+      float dz = depth - uFocus;
+      // A dead zone around the focal plane keeps the subject perfectly crisp;
+      // without it, tiny depth jitter makes the whole frame feel soft.
+      // The dead zone has to be wide enough to hold the *whole subject*, not
+      // just the plane the focus point sits on: focusOn() aims at the chest
+      // socket, and in a portrait the eyes are 4–5 cm nearer than that. At
+      // 0.5 × the face preset's 5 cm range the eyes sat on the ramp and the
+      // sharpest thing in frame was the floor. A full range either side means
+      // the head is inside the dead zone end to end.
+      float dead = uFocusRange;
+      // …and then a long ramp, so focus falls off over metres rather than
+      // snapping from sharp to fully blurred at the edge of the dead zone.
+      float ramp = uFocusRange * 6.0;
+      float defocus = max(0.0, abs(dz) - dead);
+      float coc = clamp(defocus / max(1e-6, ramp), 0.0, 1.0);
+      coc = pow(coc, 1.35) * uDofStrength;
+      // never blur the very front of frame as hard as the background
+      coc *= dz < 0.0 ? 0.45 : 1.0;
+      float radius = coc * 0.0042;
+
+      // lateral chromatic aberration — a *field* aberration, so it is exactly
+      // zero on axis and only appears in the last fifth of the image circle.
+      // r2 runs 0 at centre → 0.5 at the corner, so (r2 * 2) normalises the
+      // corner to 1 and the cube keeps the middle 60% of the frame clean:
+      // halfway to the corner this is 1.6% of the corner value.
+      float caField = clamp(r2 * 2.0, 0.0, 1.0);
+      float ca = uAberration * caField * caField * caField;
+      vec3 col;
+      col.r = bokeh(uv + fromCenter * ca, radius).r;
+      col.g = bokeh(uv, radius).g;
+      col.b = bokeh(uv - fromCenter * ca, radius).b;
+      #endif
+
+      col *= uExposure;
+      col = agx(col);
+
+      // black point ---------------------------------------------------------
+      // See uBlack above. Applied *before* the split tone on purpose: it is
+      // what puts enough of the frame under the shadow weight's crossover for
+      // the cool tint to have anything to land on.
+      {
+        float k = max(1e-4, uBlack);
+        col = col * col * (1.0 + k) / (col + k);
+      }
+
+      // split tone — cool shadow against warm key -----------------------------
+      // Weighted on display luminance *after* the curve, so the split follows
+      // what the eye reads as shadow rather than what the renderer called dark.
+      // The two ranges deliberately overlap around mid grey: a hard crossover
+      // produces a visible band on any smooth gradient (a wall, a cheek).
+      float sl = dot(col, vec3(0.2126, 0.7152, 0.0722));
+      // The shadow band used to reach up to display luminance 0.52 — which on
+      // this palette is *most of the room*. A warm cream wall lit by a 3.85
+      // golden key sits around 0.45–0.60, so the blue shadow tint was landing
+      // on it at half strength and the entire nursery came out lilac: the
+      // golden mood was chromatically indistinguishable from day, and both
+      // read cool. A split tone has to touch the shadows only; above ~0.30 the
+      // eye is reading local colour, not shadow colour.
+      //
+      // …and then the band was too *narrow*. With the black point above pulling
+      // the bottom of the range down, a crossover at 0.30 left the split tone
+      // touching under 5% of the frame — measured R:B ran 1.6–1.9 across every
+      // room shot, i.e. one hue, no chromatic range at all (§4 #137). 0.38 is
+      // still below the local-colour threshold on a lit cream wall (which now
+      // sits 0.45–0.62) but reaches the whole shadow side of the room.
+      float shadowW = 1.0 - smoothstep(0.006, 0.44, sl);
+      // The warm highlight tint has to *release* at the very top. A real
+      // specular is the colour of the source and a genuinely blown highlight is
+      // neutral; carrying a 0.955 blue multiplier all the way to the ceiling
+      // meant the brightest pixel the pipeline could produce was an amber one,
+      // whose display luminance is capped around 0.93 however hard it is
+      // driven. That is most of why the measured set had zero pixels over 0.95
+      // even after the sky was three stops up.
+      float highW = smoothstep(0.45, 0.95, sl) * (1.0 - 0.85 * smoothstep(0.86, 1.02, sl));
+      col *= mix(vec3(1.0), uShadowTint, shadowW * uSplit);
+      col *= mix(vec3(1.0), uHighTint, highW * uSplit);
+
+      // lift / gain / saturation / contrast ---------------------------------
+      col = col * uGain + uLift;
+      col.r += uWarmth * 0.5 * col.r;
+      col.b -= uWarmth * 0.35 * col.b;
+      float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
+      col = mix(vec3(luma), col, uSaturation);
+      col = (col - 0.5) * uContrast + 0.5;
+
+      // highlight shoulder --------------------------------------------------
+      // Last shaping step before the frame is written, so nothing downstream
+      // (contrast, the split tone's high band, the warmth tilt) can push a
+      // channel back onto the ceiling. See uShoulder above.
+      {
+        float kk = uShoulder;
+        float span = max(1e-3, uWhite - kk);
+        vec3 sh = clamp((col - vec3(kk)) / span, 0.0, 1.0);
+        col = min(col, vec3(kk)) + (1.0 - kk) * (sh * (2.0 - sh));
+      }
+
+      // vignette ------------------------------------------------------------
+      // Gentle cos^4-style falloff. The old smoothstep crushed the corners so
+      // hard that the room's edges disappeared entirely.
+      float vig = 1.0 - uVignette * pow(clamp(r2 * 2.0, 0.0, 1.0), 1.5);
+      col *= clamp(vig, 0.0, 1.0);
+
+      // Screen-stable film grain. Animated noise changed half the frame on
+      // every tick and read as flicker; camera motion already supplies the
+      // subtle photographic movement this grade needs.
+      float n = fract(sin(dot(uv * uResolution, vec2(12.9898, 78.233))) * 43758.5453);
+      col += (n - 0.5) * uGrain * (0.35 + luma * 0.9);
+
+      /* Ordered dither before the 8-bit write (rubric §4.7 #100).
+       *
+       * Everything above runs in half float and then lands in an 8-bit sRGB
+       * canvas. A gradient that crosses one code value per 30-odd pixels — the
+       * sky through the window, the falloff of the vignette, the shaded half of
+       * a wall, the soft edge of a shadow — quantises into visible Mach bands,
+       * and the eye is far better at spotting a straight contour than it is at
+       * spotting a 1/255 error. The film grain above does not fix this: it is
+       * luminance-weighted, so it thins out to nothing exactly in the dark
+       * smooth areas that band the worst.
+       *
+       * A 4×4 Bayer matrix at ±0.5 LSB decorrelates the rounding for the cost
+       * of five ALU ops, and being *ordered* rather than random it does not add
+       * temporal noise on top of the grain that is there on purpose.
+       */
+      vec2 bp = floor(mod(vUv * uResolution, 4.0));
+      float bayer = mod(bp.x * 5.0 + bp.y * 3.0 + floor(bp.x * 0.5) * 6.0
+                      + floor(bp.y * 0.5) * 9.0, 16.0);
+      col += ((bayer + 0.5) / 16.0 - 0.5) / 255.0;
+
+      gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+    }
+  `
+};
+
+/* -------------------------------------------------------- depth resolve --- */
+
+/**
+ * Resolves the scene depth attachment into a standalone colour target.
+ *
+ * `EffectComposer` ping-pongs between two render targets, each with its own
+ * DepthTexture. RenderPass writes into the current read buffer, so the source
+ * depth is rebound from that buffer at the start of every frame. Keeping the
+ * constructor's original texture here would make an odd-swap pipeline alternate
+ * between current and stale depth, which appears as full-frame flicker.
+ *
+ * Writing linear depth once into a target of our own costs one full-screen
+ * blit and lets the grade pass — and the particle system's soft-fade — sample
+ * a stable, standalone texture. `needsSwap = false` leaves the colour chain
+ * untouched.
+ */
+class DepthResolvePass extends Pass {
+  constructor(depthTexture, camera, width, height) {
+    super();
+    this.needsSwap = false;
+    this.camera = camera;
+
+    this.renderTarget = new THREE.WebGLRenderTarget(width, height, {
+      type: THREE.HalfFloatType,
+      format: THREE.RedFormat,
+      depthBuffer: false,
+      stencilBuffer: false,
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter
+    });
+
+    this.material = new THREE.ShaderMaterial({
+      defines: { PERSPECTIVE_CAMERA: camera.isPerspectiveCamera ? 1 : 0 },
+      uniforms: {
+        tDepth: { value: depthTexture },
+        uNear: { value: camera.near },
+        uFar: { value: camera.far }
+      },
+      vertexShader: /* glsl */`
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }`,
+      fragmentShader: /* glsl */`
+        #include <common>
+        #include <packing>
+        varying vec2 vUv;
+        uniform sampler2D tDepth;
+        uniform float uNear, uFar;
+        void main() {
+          float d = texture2D(tDepth, vUv).x;
+          #if PERSPECTIVE_CAMERA == 1
+            float vz = perspectiveDepthToViewZ(d, uNear, uFar);
+            gl_FragColor = vec4(viewZToOrthographicDepth(vz, uNear, uFar), 0.0, 0.0, 1.0);
+          #else
+            gl_FragColor = vec4(d, 0.0, 0.0, 1.0);
+          #endif
+        }`
+    });
+
+    this._quad = new FullScreenQuad(this.material);
+  }
+
+  get texture() { return this.renderTarget.texture; }
+
+  setDepthTexture(depthTexture) {
+    this.material.uniforms.tDepth.value = depthTexture;
+  }
+
+  setSize(width, height) { this.renderTarget.setSize(width, height); }
+
+  render(renderer) {
+    this.material.uniforms.uNear.value = this.camera.near;
+    this.material.uniforms.uFar.value = this.camera.far;
+    const prev = renderer.getRenderTarget();
+    renderer.setRenderTarget(this.renderTarget);
+    this._quad.render(renderer);
+    renderer.setRenderTarget(prev);
+  }
+
+  dispose() {
+    this.renderTarget.dispose();
+    this.material.dispose();
+    this._quad.dispose();
+  }
+}
+
+/* ------------------------------------------------------------ pipeline --- */
+
+export class RenderPipeline {
+  constructor(canvas, scene, camera, tier = detectTier(), {
+    touchEnvironment = detectTouchEnvironment()
+  } = {}) {
+    this.canvas = canvas;
+    this.scene = scene;
+    this.camera = camera;
+    this.tier = tier;
+    this.touchEnvironment = touchEnvironment;
+    this.mode = 'title';
+    this.quality = tier === TIER.HIGH ? QUALITY.HIGH
+      : tier === TIER.MED ? QUALITY.BALANCED : QUALITY.LOW;
+    this._resolutionScale = 1;
+    this._effectScale = 1;
+    this._mobilePixelBudget = MOBILE_PIXEL_BUDGET.title;
+
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: false,          // SMAA handles this; MSAA + composer is wasteful
+      alpha: false,
+      powerPreference: this.touchEnvironment ? 'default' : 'high-performance',
+      stencil: false
+    });
+    const initialSize = canvasCssSize(canvas, window);
+    renderer.setPixelRatio(this._pixelRatio());
+    setRendererDrawingSize(renderer, initialSize.width, initialSize.height);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    // Tone mapping happens in the grade pass, so the composer stays linear.
+    renderer.toneMapping = THREE.NoToneMapping;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.autoUpdate = false;
+    renderer.shadowMap.needsUpdate = true;
+    // PCF-soft rather than VSM: VSM's blur radius produced visible light-bleed
+    // notches where the baby's limbs meet the body. PCF keeps contact tight and
+    // the soft look is restored by the contactShadow blobs in lighting.js.
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // MeshPhysicalMaterial transmission otherwise re-renders the full scene
+    // into a full-resolution 4×MSAA target. Mobile corneas do not use
+    // transmission, and this also bounds any incidental transmitted material.
+    renderer.transmissionResolutionScale = this.touchEnvironment ? 0.25 : 1;
+    renderer.info.autoReset = false;
+    this.renderer = renderer;
+
+    this.clock = new THREE.Clock();
+    this._buildComposer();
+    this._onResize = () => this.resize();
+    window.addEventListener('resize', this._onResize);
+    window.addEventListener('orientationchange', this._onResize);
+    window.visualViewport?.addEventListener('resize', this._onResize);
+    this.resize();
+  }
+
+  _pixelRatio() {
+    const dpr = window.devicePixelRatio || 1;
+    const cap = pixelRatioCap(this.tier, this.touchEnvironment);
+    const ratio = Math.min(dpr, cap) * this._resolutionScale;
+    if (this.touchEnvironment) {
+      const { width, height } = canvasCssSize(this.canvas, window);
+      return fitPixelRatioToBudget({
+        width,
+        height,
+        requestedRatio: ratio,
+        maxPixels: this._mobilePixelBudget
+      });
+    }
+    return this.mode === 'title' ? Math.min(1, ratio) : Math.max(0.75, ratio);
+  }
+
+  _buildComposer() {
+    const { renderer, scene, camera, tier } = this;
+    const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+
+    const target = new THREE.WebGLRenderTarget(size.x, size.y, {
+      type: THREE.HalfFloatType,
+      colorSpace: THREE.NoColorSpace,
+      samples: 0,
+      depthTexture: new THREE.DepthTexture(size.x, size.y)
+    });
+    this.target = target;
+
+    const composer = new EffectComposer(renderer, target);
+    composer.setPixelRatio(this._pixelRatio());
+    this.composer = composer;
+    const initialDepthTexture = composer.readBuffer.depthTexture;
+
+    this.renderPass = new RenderPass(scene, camera);
+    composer.addPass(this.renderPass);
+
+    // --- ambient occlusion ------------------------------------------------
+    if (!this.touchEnvironment && tier >= TIER.MED) {
+      const gtao = new GTAOPass(scene, camera, size.x, size.y);
+      gtao.output = GTAOPass.OUTPUT.Default;
+      gtao.updateGtaoMaterial({
+        // A nursery is a room of small objects sitting on big flat surfaces.
+        // The old 0.42 m radius only ever caught the last centimetre of a
+        // contact, which is why the AO buffer came back almost pure white and
+        // every prop still read as pasted on. 0.8 m is roughly "the width of
+        // the crib", so legs, plinths and the rug edge all darken properly.
+        radius: 0.62,
+        distanceExponent: 1.0,
+        thickness: 1.0,
+        // 2.0 put visible AO blotching on the baby's torso: on a smooth,
+        // strongly curved surface the sample noise survives the denoise and
+        // reads as marbling on the skin. 1.5 keeps the grounding and loses it.
+        scale: 1.5,
+        samples: tier === TIER.HIGH ? 16 : 8,
+        distanceFallOff: 1.0,
+        screenSpaceRadius: false
+      });
+      // Wider denoise: with the G-buffer coming from the scene depth (below)
+      // the raw AO is noisier, and 8 px of Poisson left a visible crawl.
+      gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 16, rings: 2, samples: 16 });
+      gtao.blendIntensity = 1.0;
+      this._wireGtaoToSceneDepth(gtao, initialDepthTexture);
+      composer.addPass(gtao);
+      this.gtao = gtao;
+    }
+
+    // --- bloom ------------------------------------------------------------
+    // Threshold sits high: only genuine highlights (window, lamp, sparkles)
+    // should bloom, otherwise pastel walls smear.
+    //
+    // The threshold is on *luminance*, which is why 0.86 was not holding the
+    // skin: the SSS term in makeSkin() was pushing the red channel past 2.0 on
+    // every backlit silhouette while green and blue stayed low, and a colour
+    // that saturated still clears a luminance gate at a fraction of its peak.
+    // The real fix is in the shader (the halo is now a rim), but the gate is
+    // raised too so that only things which are bright in *all three* channels —
+    // the window, the lamp shade, a specular hit — can ever fire it.
+    //
+    // …and the gate was still an order of magnitude too low, which is rubric
+    // §4 #102 ("bloom applied to the whole frame rather than threshold-limited
+    // to true highlights") and was reported against `40-play-blocks` as "a
+    // broad haze over roughly 15% of the frame". The arithmetic: this pass
+    // reads the *linear* HDR buffer, and with `useLegacyLights` off a wall of
+    // albedo 0.75 under a key of 3.35 lx leaves the surface at 3.35 × 0.75 / π
+    // ≈ 0.80, plus fill, rim and env — call it 1.2. A threshold of 1.02 was
+    // therefore catching every lit wall in the room, which is precisely how a
+    // threshold-limited effect becomes a full-frame veil.
+    //
+    // 2.35 sits above any lit diffuse surface in the set and below the two
+    // things that are genuinely emissive: the sky (linear 8–11 through
+    // `SKY.gain`) and the lamp shade. Strength comes up to compensate, so the
+    // window keeps a real halo while the walls stop glowing — and it matters
+    // more now than it did, because `day` and `rain` are deliberately driving
+    // the sky harder than any previous pass did.
+    const bloom = new UnrealBloomPass(
+      new THREE.Vector2(size.x, size.y),
+      tier === TIER.LOW ? 0.38 : 0.52,   // strength
+      0.66,                              // radius
+      2.35                               // threshold
+    );
+    composer.addPass(bloom);
+    this.bloom = bloom;
+
+    // --- depth resolve (stable standalone depth for later passes) ---------
+    const depthResolve = new DepthResolvePass(
+      initialDepthTexture, camera, size.x, size.y);
+    composer.addPass(depthResolve);
+    this.depthResolve = depthResolve;
+
+    // --- grade ------------------------------------------------------------
+    const grade = new ShaderPass(GradeShader);
+    grade.material.defines.PERSPECTIVE_CAMERA = camera.isPerspectiveCamera ? 1 : 0;
+    // Already linearised by the resolve pass, so the grade must not linearise
+    // a second time.
+    grade.material.defines.DEPTH_IS_LINEAR = 1;
+    if (this.touchEnvironment) {
+      grade.material.defines.MOBILE_FAST_GRADE = 1;
+      grade.uniforms.uDofStrength.value = 0;
+      grade.uniforms.uAberration.value = 0;
+      grade.material.needsUpdate = true;
+    }
+    grade.uniforms.tDepth.value = depthResolve.texture;
+    grade.uniforms.uNear.value = camera.near;
+    grade.uniforms.uFar.value = camera.far;
+    grade.uniforms.uResolution.value.set(size.x, size.y);
+    if (tier === TIER.LOW) {
+      grade.uniforms.uDofStrength.value = 0.0;
+      grade.uniforms.uAberration.value = 0.0;
+    }
+    composer.addPass(grade);
+    this.grade = grade;
+    this._baseDofStrength = grade.uniforms.uDofStrength.value;
+
+    // --- AA ---------------------------------------------------------------
+    if (!this.touchEnvironment && tier >= TIER.MED) {
+      const smaa = new SMAAPass();
+      composer.addPass(smaa);
+      this.smaa = smaa;
+    }
+    composer.passes[composer.passes.length - 1].renderToScreen = true;
+  }
+
+  /**
+   * Make GTAO read the *scene* depth buffer instead of rendering its own
+   * depth+normal G-buffer.
+   *
+   * Two separate problems, one fix.
+   *
+   * 1. CORRECTNESS. `GTAOPass._overrideVisibility()` only hides Points and
+   *    Lines before it re-renders the scene with `MeshNormalMaterial`. Every
+   *    *transparent* mesh therefore lands in the AO G-buffer as if it were
+   *    solid: the window's volumetric light shaft, its floor pool, the contact
+   *    shadow blobs, the glazing, the sky and cloud planes. The light shaft is
+   *    a three-metre prism seen nearly edge-on, so GTAO measured near-total
+   *    self-occlusion across its whole silhouette and the Default output
+   *    (`colour × AO`) multiplied that region of the frame to pure black — the
+   *    giant black polygon in the upper left of the wide shot. Reading the real
+   *    scene depth instead means only depth-*writing* geometry occludes, which
+   *    is exactly the set of surfaces that should.
+   *
+   * 2. COST. The G-buffer render was a second full traversal of the scene
+   *    (plus its own transmission resolve): ~190 of the frame's 524 draw calls.
+   *    Skipping it is free — with no normal texture the GTAO shader falls back
+   *    to reconstructing view normals from depth derivatives, which for a room
+   *    of large smooth surfaces is visually equivalent.
+   *
+   * There is no feedback loop here: GTAO samples the depth attachment while
+   * rendering into its own `gtaoRenderTarget` / `pdRenderTarget`, and its final
+   * blend into the composer buffer does not bind a depth sampler.
+   *
+   * `setGBuffer()` is not used because in r180 it dereferences
+   * `this.normalRenderTarget.depthTexture` on a branch that never creates one.
+   */
+  _wireGtaoToSceneDepth(gtao, depthTexture) {
+    gtao._renderGBuffer = false;              // skip the scene re-render
+    gtao.depthTexture = depthTexture;
+    gtao.normalTexture = null;
+    for (const m of [gtao.gtaoMaterial, gtao.pdMaterial]) {
+      m.defines.NORMAL_VECTOR_TYPE = 0;       // 0 = reconstruct from depth
+      m.defines.DEPTH_SWIZZLING = 'x';
+      m.uniforms.tDepth.value = depthTexture;
+      m.uniforms.tNormal.value = null;
+      m.needsUpdate = true;
+    }
+  }
+
+  /**
+   * Pull focus onto a world-space point (the baby, usually).
+   *
+   * `range` is in **metres** — that is what every `CameraRig` preset authors
+   * (0.05 for the face macro, 0.50 for the establishing wide) and it is the
+   * only reading that makes physical sense. It used to be handed to the shader
+   * as if it were already normalised device depth, so 0.50 meant 30 m on a
+   * 60 m far plane: larger than the room, which is why nothing in the wide shot
+   * was ever out of focus and the frame had no depth separation at all.
+   */
+  focusOn(worldPos, range = 0.30) {
+    if (this.touchEnvironment) return;
+    const v = worldPos.clone().applyMatrix4(this.camera.matrixWorldInverse);
+    const span = Math.max(1e-4, this.camera.far - this.camera.near);
+    const depth = (-v.z - this.camera.near) / span;
+    this.grade.uniforms.uFocus.value = THREE.MathUtils.clamp(depth, 0, 1);
+    this.grade.uniforms.uFocusRange.value = Math.max(1e-5, range / span);
+  }
+
+  setExposure(v) { this.grade.uniforms.uExposure.value = v; }
+
+  /**
+   * Apply one coherent rendering budget. Changing DPR and effect resolution
+   * together avoids spending saved geometry work on full-resolution post FX.
+   */
+  setPerformanceBudget({ mode = 'play', quality = this.quality } = {}) {
+    const previousRatio = this._pixelRatio();
+    const previousEffectScale = this._effectScale;
+    this.mode = mode;
+    this.quality = quality;
+
+    if (this.touchEnvironment) {
+      this._resolutionScale = 1;
+      this._mobilePixelBudget = mode === 'title'
+        ? MOBILE_PIXEL_BUDGET.title
+        : quality === QUALITY.LOW
+          ? MOBILE_PIXEL_BUDGET.low
+          : MOBILE_PIXEL_BUDGET.balanced;
+      this._effectScale = quality === QUALITY.LOW ? 0.35 : 0.42;
+    } else if (mode === 'title') {
+      this._resolutionScale = 0.72;
+      this._effectScale = 0.5;
+    } else if (quality === QUALITY.LOW) {
+      this._resolutionScale = 0.68;
+      this._effectScale = 0.55;
+    } else if (quality === QUALITY.BALANCED) {
+      this._resolutionScale = 0.84;
+      this._effectScale = 0.75;
+    } else {
+      this._resolutionScale = 1;
+      this._effectScale = 1;
+    }
+
+    const heavy = mode !== 'title' && quality > QUALITY.LOW;
+    // GTAO is the first full-screen effect to yield on touch hardware. Bloom
+    // and SMAA preserve the authored look while the frame governor measures.
+    const ambientOcclusion = heavy;
+    if (this.gtao) this.gtao.enabled = ambientOcclusion;
+    this.bloom.enabled = mode !== 'title'
+      && (this.touchEnvironment || quality > QUALITY.LOW);
+    if (this.smaa) this.smaa.enabled = heavy;
+    if (!this.touchEnvironment) {
+      this.grade.uniforms.uDofStrength.value = mode === 'title' || quality === QUALITY.LOW
+        ? 0
+        : quality === QUALITY.BALANCED ? this._baseDofStrength * 0.45 : this._baseDofStrength;
+    }
+
+    if (Math.abs(previousRatio - this._pixelRatio()) > 0.01
+      || previousEffectScale !== this._effectScale) {
+      this.resize();
+    }
+  }
+
+  /** Nudge the grade toward a mood (day / evening / night / bath). */
+  setGrade({
+    lift, gain, saturation, contrast, warmth, vignette, exposure,
+    shadowTint, highTint, split, black, shoulder, white
+  }) {
+    const u = this.grade.uniforms;
+    if (lift) u.uLift.value.fromArray(lift);
+    if (gain) u.uGain.value.fromArray(gain);
+    if (saturation !== undefined) u.uSaturation.value = saturation;
+    if (contrast !== undefined) u.uContrast.value = contrast;
+    if (warmth !== undefined) u.uWarmth.value = warmth;
+    if (vignette !== undefined) u.uVignette.value = vignette;
+    if (exposure !== undefined) u.uExposure.value = exposure;
+    if (shadowTint) u.uShadowTint.value.fromArray(shadowTint);
+    if (highTint) u.uHighTint.value.fromArray(highTint);
+    if (split !== undefined) u.uSplit.value = split;
+    if (black !== undefined) u.uBlack.value = black;
+    if (shoulder !== undefined) u.uShoulder.value = shoulder;
+    if (white !== undefined) u.uWhite.value = white;
+  }
+
+  resize() {
+    const { width: w, height: h } = canvasCssSize(this.canvas, window);
+    if (this.camera.isPerspectiveCamera) {
+      this.camera.aspect = w / h;
+      this.camera.updateProjectionMatrix();
+    }
+    this.renderer.setPixelRatio(this._pixelRatio());
+    setRendererDrawingSize(this.renderer, w, h);
+    this.composer.setPixelRatio(this._pixelRatio());
+    this.composer.setSize(w, h);
+    const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+    resizeSceneDepthTargets(this.composer, size.x, size.y);
+    this.grade.uniforms.uResolution.value.set(size.x, size.y);
+    // GTAO samples the scene depth attachment, so it has to be sized in
+    // drawing-buffer pixels, not CSS pixels, or the AO lands at the wrong scale
+    // on any display with devicePixelRatio > 1.
+    const effectWidth = Math.max(1, Math.round(size.x * this._effectScale));
+    const effectHeight = Math.max(1, Math.round(size.y * this._effectScale));
+    this.gtao?.setSize(effectWidth, effectHeight);
+    this.bloom?.setSize(effectWidth, effectHeight);
+    this.depthResolve?.setSize(size.x, size.y);
+  }
+
+  /** Reconnect app-owned render targets after the browser restores WebGL. */
+  recover() {
+    this.renderer.resetState();
+    this.resize();
+    syncSceneDepth(this.composer, this.gtao, this.depthResolve);
+  }
+
+  render(dt) {
+    // RenderPass writes the scene into the composer's current read buffer.
+    // SMAA makes that buffer alternate each frame, so all depth consumers must
+    // follow it before the pass chain starts.
+    syncSceneDepth(this.composer, this.gtao, this.depthResolve);
+    this.renderer.info.reset();
+    this.composer.render(dt);
+  }
+
+  performanceSnapshot() {
+    const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+    const pixels = size.x * size.y;
+    const effectPixels = Math.round(size.x * this._effectScale)
+      * Math.round(size.y * this._effectScale);
+    // Composer: 2×RGBA16F + 2×depth; depth resolve: R16F. Bloom owns
+    // one bright target and five horizontal/vertical RGBA16F pairs.
+    const composerBytes = pixels * (2 * 8 + 2 * 4 + 2);
+    const bloomBytes = this.bloom.enabled ? effectPixels * 11 * 8 : 0;
+    return {
+      width: size.x,
+      height: size.y,
+      pixels,
+      pixelRatio: this.renderer.getPixelRatio(),
+      passes: this.composer.passes
+        .filter(pass => pass.enabled)
+        .map(pass => pass.constructor.name),
+      mobileFastGrade: Boolean(this.grade.material.defines.MOBILE_FAST_GRADE),
+      transmissionScale: this.renderer.transmissionResolutionScale,
+      estimatedTargetMiB: (composerBytes + bloomBytes) / 1024 / 1024
+    };
+  }
+
+  dispose() {
+    window.removeEventListener('resize', this._onResize);
+    window.removeEventListener('orientationchange', this._onResize);
+    window.visualViewport?.removeEventListener('resize', this._onResize);
+    // EffectComposer owns only its ping-pong targets and copy pass. Individual
+    // passes own additional targets/materials and must be released explicitly.
+    for (const pass of new Set(this.composer.passes)) pass.dispose?.();
+    this.composer.dispose();
+    this.renderer.dispose();
+  }
+}

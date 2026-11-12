@@ -1,0 +1,2780 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta name="robots" content="noindex,nofollow">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,minimum-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="format-detection" content="telephone=no">
+<meta name="theme-color" content="#1c2b57">
+<title>もぐらとほたるの、あえた！すごろく</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#1c2b57;
+  overscroll-behavior:none;touch-action:none;-webkit-user-select:none;user-select:none;
+  -webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;-webkit-text-size-adjust:none;}
+body{position:fixed;left:0;top:0;right:0;bottom:0;}
+canvas{position:fixed;left:0;top:0;display:block;touch-action:none;outline:none;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}
+#sa{position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;
+  padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);
+  padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left);}
+</style>
+
+<script src="/gf-nav.js" defer></script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+/*
+ もぐらとほたるの、あえた！すごろく  (games/261028-14)
+ ----------------------------------------------------------------
+ 盤面: 12マスの馬蹄形の道 (0=もぐらの家/昼の端, 11=ほたるの家/夜の端)。
+   夕焼けマス s (1..10)。 i<s 昼 / i==s 夕焼け / i>s 夜。
+ 操作: 太陽 → s+1 (昼が伸びる) → もぐらが s の方向へ1〜3マス跳ぶ。
+       月   → s-1 (夜が伸びる) → ほたるが s の方向へ1〜3マス跳ぶ。
+   途中のマスも判定。端は折り返し。音楽会の後は鳥の枝道で 11→枝道→0 が輪になる。
+ 発見:
+   1 大根   : 太陽の手番でもぐらが「昼の畑」を通過 → 大根が飛び出し、夕焼けマスへ運ばれる
+   2 ランタン: 大根のマスが夜になる → ほたるが潜って光る → タップ/ドラッグでコマに渡す
+   3 飛び石 : 月の手番でほたるが「夜の池」を通過 → 波紋。 夕焼けが池に来る → 飛び石 → アヒルが渡る
+   4 橋     : もぐら(昼側)とほたる(夜側)が夕焼けを挟んで隣り合う → 橋。 新しい場所で再会 → 延長
+   5 合唱   : 直前と違うさいころで鐘のマスを夕焼けにする → 鐘+歌。住人が楽器を持って集まる
+   6 宝箱   : ランタンが井戸から1マス以内にある時、井戸が夕焼け → もぐらが掘る → 宝石 → 舞台へ
+   7 音楽会 : 橋 + 合唱 (前回の音楽会以降に再会と合唱) → 島が開いて音楽会 → 鳥が枝道へ引っ越す
+ 状態は純粋関数 step(state, die, roll) で更新し、演出はイベント列を再生する。
+*/
+'use strict';
+(() => {
+// ================================================================ utils
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+const E = {
+  lin: t => t,
+  outQ: t => 1 - (1 - t) * (1 - t),
+  outC: t => 1 - Math.pow(1 - t, 3),
+  inQ: t => t * t,
+  ioS: t => -(Math.cos(Math.PI * t) - 1) / 2,
+  ioC: t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2),
+  outB: t => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); },
+  outEl: t => (t <= 0 ? 0 : t >= 1 ? 1 : Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * (TAU / 3)) + 1),
+};
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const QS = location.search || '';
+const TEST = /[?&]test\b/.test(QS);
+const qsNum = (k) => { const m = QS.match(new RegExp('[?&]' + k + '=(\\d+)')); return m ? +m[1] : null; };
+
+// ================================================================ save
+const DISC_KEYS = ['radish', 'lantern', 'stones', 'bridge', 'chorus', 'treasure', 'concert'];
+const SAVE_KEY = 'mogura-hotaru-sugoroku-261028-14';
+const Store = {
+  ok: true, mem: null,
+  load() {
+    let raw = null;
+    try { raw = window.localStorage.getItem(SAVE_KEY); } catch (e) { this.ok = false; return this.mem; }
+    if (!raw) return null;
+    try {
+      const d = sanitize(JSON.parse(raw));
+      if (!d) this.clear();
+      return d;
+    } catch (e) { this.clear(); return null; }
+  },
+  save(d) {
+    this.mem = d;
+    if (!this.ok) return;
+    try { window.localStorage.setItem(SAVE_KEY, JSON.stringify(d)); } catch (e) { this.ok = false; }
+  },
+  clear() { try { window.localStorage.removeItem(SAVE_KEY); } catch (e) { /* storage refused */ } },
+};
+function sanitize(d) {
+  if (!d || typeof d !== 'object' || d.v !== 1) return null;
+  const int = (x, a, b) => (Number.isFinite(x) ? clamp(Math.round(x), a, b) : a);
+  const num = (x, a, b) => (Number.isFinite(x) ? clamp(x, a, b) : 0);
+  const out = { v: 1 };
+  out.bridge = int(d.bridge, 0, 3);
+  let dirs = Array.isArray(d.bridgeDirs) ? d.bridgeDirs.filter(x => x === 'N' || x === 'W' || x === 'E') : [];
+  if (dirs.length !== out.bridge || dirs[0] !== 'N' || new Set(dirs).size !== dirs.length) dirs = ['N', 'W', 'E'].slice(0, out.bridge);
+  out.bridgeDirs = dirs;
+  out.stones = Array.isArray(d.stones)
+    ? d.stones.filter(s => s && Number.isFinite(s.u) && Number.isFinite(s.v)).slice(0, 5).map(s => ({ u: num(s.u, -0.75, 0.75), v: num(s.v, -0.75, 0.75) }))
+    : [];
+  const lan = Array.isArray(d.lanterns) ? d.lanterns.filter(h => h === 'mole' || h === 'fly' || h === 'stage').slice(0, 3) : [];
+  const seen = {};
+  out.lanterns = lan.map(h => { if (h !== 'stage' && seen[h]) return 'stage'; seen[h] = 1; return h; });
+  out.gems = int(d.gems, 0, 15);
+  out.bellAwake = !!d.bellAwake;
+  out.birdsMoved = !!d.birdsMoved;
+  out.birdPair = !!d.birdPair;
+  out.shortcut = !!d.shortcut;
+  out.concerts = int(d.concerts, 0, 9999);
+  out.duckTrips = int(d.duckTrips, 0, 99999);
+  out.visits = int(d.visits, 0, 99999);
+  out.disc = {};
+  for (const k of DISC_KEYS) out.disc[k] = !!(d.disc && d.disc[k]);
+  return out;
+}
+
+// ================================================================ world geometry (world units)
+const CONTENT = { x: 104, y: 22, w: 792, h: 892 };
+const PATH = { cx: 500, cy: 588, rx: 318, ry: 256, a0: 215, span: 250 };
+const WOB = [0, 10, -8, 9, -6, 3, -3, 6, -9, 8, -10, 0];
+const TS = 98;           // tile size
+const BTS = 80;          // bird-road tile size
+const RING = 16;         // 12 path tiles + 4 bird-road tiles (when the loop is open)
+const GEO = {
+  tiles: [], center: { x: 500, y: 588 },
+  stage: { x: 500, y: 600, r: 58 },
+  tree: { x: 500, y: 462 },
+  islets: { N: { x: 500, y: 96, r: 66 }, W: { x: 212, y: 160, r: 60 }, E: { x: 788, y: 160, r: 60 } },
+  bridgeRoot: { x: 500, y: 268 },
+  houses: [{ x: 372, y: 706, k: 'rabbit' }, { x: 628, y: 706, k: 'frog' }, { x: 500, y: 742, k: 'hedgehog' }],
+};
+(function buildGeo() {
+  for (let i = 0; i < 12; i++) {
+    const a = ((PATH.a0 - (i * PATH.span) / 11) * Math.PI) / 180;
+    const w = WOB[i];
+    const x = PATH.cx + (PATH.rx + w) * Math.cos(a);
+    const y = PATH.cy - (PATH.ry + w * 0.8) * Math.sin(a);
+    let tx = PATH.rx * Math.sin(a), ty = PATH.ry * Math.cos(a);
+    const tl = Math.hypot(tx, ty); tx /= tl; ty /= tl;
+    let nx = GEO.center.x - x, ny = GEO.center.y - 10 - y;
+    const nl = Math.hypot(nx, ny); nx /= nl; ny /= nl;
+    GEO.tiles.push({ i, x, y, ang: Math.atan2(ty, tx), tx, ty, nx, ny, size: TS, bird: false });
+  }
+  // the bird road: 11 -> 12 -> 13 -> 14 -> 15 -> 0
+  const bp = [[676, 806], [560, 838], [440, 838], [324, 806]];
+  for (let k = 0; k < 4; k++) {
+    const [x, y] = bp[k];
+    const prev = k === 0 ? GEO.tiles[11] : { x: bp[k - 1][0], y: bp[k - 1][1] };
+    const next = k === 3 ? GEO.tiles[0] : { x: bp[k + 1][0], y: bp[k + 1][1] };
+    let tx = next.x - prev.x, ty = next.y - prev.y; const tl = Math.hypot(tx, ty); tx /= tl; ty /= tl;
+    GEO.tiles.push({ i: 12 + k, x, y, ang: Math.atan2(ty, tx), tx, ty, nx: -ty, ny: tx, size: BTS, bird: true });
+  }
+})();
+const tileXY = (p) => GEO.tiles[p];
+const annex = (i, d) => { const t = GEO.tiles[i]; return { x: t.x + t.nx * d, y: t.y + t.ny * d }; };
+// pond frame: origin = pond centre, u = inward (toward plaza), v = along the path
+function pondFrame(i) {
+  const t = GEO.tiles[i];
+  const c = annex(i, 118);
+  return { x: c.x, y: c.y, ux: t.nx, uy: t.ny, vx: t.tx, vy: t.ty, ru: 46, rv: 74 };
+}
+const pondPt = (pf, u, v) => ({ x: pf.x + pf.ux * u * pf.ru + pf.vx * v * pf.rv, y: pf.y + pf.uy * u * pf.ru + pf.vy * v * pf.rv });
+
+// ================================================================ audio (all synthesized with Web Audio)
+const Snd = (() => {
+  let ctx = null, master = null, dry = null, wet = null, noiseBuf = null, unlocked = false;
+  const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+  function impulse(sec, decay) {
+    const len = Math.floor(ctx.sampleRate * sec), b = ctx.createBuffer(2, len, ctx.sampleRate);
+    for (let c = 0; c < 2; c++) { const d = b.getChannelData(c); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay); }
+    return b;
+  }
+  function init() {
+    if (ctx) return true;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    try { ctx = new AC(); } catch (e) { ctx = null; return false; }
+    try {
+      const comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -20; comp.knee.value = 14; comp.ratio.value = 4; comp.attack.value = 0.005; comp.release.value = 0.25;
+      master = ctx.createGain(); master.gain.value = 0.0001;
+      master.connect(comp); comp.connect(ctx.destination);
+      dry = ctx.createGain(); dry.connect(master);
+      const conv = ctx.createConvolver(); conv.buffer = impulse(1.5, 2.8);
+      wet = ctx.createGain(); wet.gain.value = 0.25; wet.connect(conv); conv.connect(master);
+      noiseBuf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+      const nd = noiseBuf.getChannelData(0); for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    } catch (e) { ctx = null; return false; }
+    return true;
+  }
+  function unlock() {
+    if (!init()) return;
+    try {
+      if (ctx.state !== 'running') { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); }
+      if (!unlocked) {
+        const b = ctx.createBuffer(1, 1, 22050), s = ctx.createBufferSource();
+        s.buffer = b; s.connect(ctx.destination); s.start(0);
+        unlocked = true;
+        master.gain.setValueAtTime(0.0001, ctx.currentTime);
+        master.gain.exponentialRampToValueAtTime(0.62, ctx.currentTime + 0.35);
+      }
+    } catch (e) { /* audio is optional */ }
+  }
+  function suspend() { try { if (ctx && ctx.state === 'running') ctx.suspend().catch(() => {}); } catch (e) {} }
+  function resume() { try { if (ctx && unlocked && ctx.state !== 'running') ctx.resume().catch(() => {}); } catch (e) {} }
+  const ok = () => !!(ctx && unlocked && ctx.state === 'running');
+  const T = () => ctx.currentTime;
+
+  // ---- primitives
+  function voice(o) {
+    const t0 = T() + (o.t || 0), a = o.a || 0.004, h = o.h || 0, d = o.d || 0.3, vol = o.vol == null ? 0.15 : o.vol;
+    const osc = ctx.createOscillator();
+    osc.type = o.type || 'sine';
+    osc.frequency.setValueAtTime(o.f, t0);
+    if (o.f2) osc.frequency.exponentialRampToValueAtTime(Math.max(30, o.f2), t0 + (o.glide || a + d * 0.6));
+    if (o.det) osc.detune.setValueAtTime(o.det, t0);
+    if (o.vib) {
+      const l = ctx.createOscillator(), lg = ctx.createGain();
+      l.frequency.value = o.vibF || 5.5; lg.gain.value = o.vib;
+      l.connect(lg); lg.connect(osc.frequency); l.start(t0); l.stop(t0 + a + h + d + 0.1);
+    }
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + a);
+    if (h) g.gain.setValueAtTime(vol, t0 + a + h);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + a + h + d);
+    let node = osc;
+    if (o.filt) {
+      const f = ctx.createBiquadFilter(); f.type = o.ft || 'lowpass'; f.frequency.value = o.filt; f.Q.value = o.q || 0.7;
+      osc.connect(f); node = f;
+    }
+    node.connect(g);
+    let out = g;
+    if (o.pan && ctx.createStereoPanner) { const p = ctx.createStereoPanner(); p.pan.value = clamp(o.pan, -1, 1); g.connect(p); out = p; }
+    out.connect(dry);
+    if (o.rev) { const s = ctx.createGain(); s.gain.value = o.rev; out.connect(s); s.connect(wet); }
+    osc.start(t0); osc.stop(t0 + a + h + d + 0.08);
+  }
+  function noise(o) {
+    const t0 = T() + (o.t || 0), a = o.a || 0.003, d = o.d || 0.2;
+    const src = ctx.createBufferSource(); src.buffer = noiseBuf;
+    const f = ctx.createBiquadFilter(); f.type = o.type || 'bandpass'; f.Q.value = o.q || 1;
+    f.frequency.setValueAtTime(o.f || 1200, t0);
+    if (o.f2) f.frequency.exponentialRampToValueAtTime(o.f2, t0 + a + d);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(o.vol || 0.08, t0 + a); g.gain.exponentialRampToValueAtTime(0.0001, t0 + a + d);
+    src.connect(f); f.connect(g); g.connect(dry);
+    if (o.rev) { const s = ctx.createGain(); s.gain.value = o.rev; g.connect(s); s.connect(wet); }
+    src.start(t0, Math.random() * 0.4); src.stop(t0 + a + d + 0.05);
+  }
+  const safe = fn => (...args) => { if (!ok()) return; try { fn(...args); } catch (e) { /* never break the game for sound */ } };
+
+  // ---- instruments
+  function ceramicRaw(f, t, vol, pan) {
+    voice({ f, t, d: 0.22, vol, pan, rev: 0.25 });
+    voice({ f: f * 2.76, t, d: 0.1, vol: vol * 0.45, pan });
+    voice({ f: f * 5.4, t, d: 0.05, vol: vol * 0.22, pan });
+    noise({ t, d: 0.025, vol: vol * 0.35, f: 3200, q: 1.5 });
+  }
+  function bellRaw(f, t, vol, d) {
+    const t0 = T() + t, car = ctx.createOscillator(), mod = ctx.createOscillator(), mg = ctx.createGain(), g = ctx.createGain();
+    car.frequency.value = f; mod.frequency.value = f * 3.5;
+    mg.gain.setValueAtTime(f * 2.2, t0); mg.gain.exponentialRampToValueAtTime(f * 0.05, t0 + d);
+    mod.connect(mg); mg.connect(car.frequency);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vol, t0 + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d);
+    car.connect(g); g.connect(dry);
+    const s = ctx.createGain(); s.gain.value = 0.5; g.connect(s); s.connect(wet);
+    car.start(t0); mod.start(t0); car.stop(t0 + d + 0.05); mod.stop(t0 + d + 0.05);
+  }
+  const SCALES = { day: [0, 2, 4, 7, 9], dusk: [0, 4, 6, 7, 11], night: [0, 3, 5, 7, 10], dawn: [0, 2, 5, 7, 9] };
+  const BASE = { day: 72, dusk: 69, night: 64, dawn: 74 };
+  function degree(time, step) {
+    const sc = SCALES[time] || SCALES.day, n = sc.length;
+    const oct = Math.floor(step / n), deg = ((step % n) + n) % n;
+    return mtof(BASE[time] + sc[deg] + 12 * clamp(oct, -1, 2));
+  }
+  const api = {
+    unlock, suspend, resume, ok, mtof, degree,
+    diePress: safe((die) => {
+      if (die === 'sun') { ceramicRaw(784, 0, 0.16, -0.3); voice({ f: 1175, t: 0.03, d: 0.12, vol: 0.05, pan: -0.3 }); }
+      else { ceramicRaw(587, 0, 0.15, 0.3); voice({ f: 880, t: 0.04, d: 0.18, vol: 0.05, pan: 0.3, rev: 0.4 }); }
+    }),
+    hop: safe((f, terrain, pan) => {
+      voice({ f: f * 0.75, f2: f, glide: 0.05, d: 0.16, vol: 0.12, pan, rev: 0.2 });
+      voice({ f: f * 2, d: 0.08, vol: 0.03, pan });
+      if (terrain === 'water') voice({ f: f * 1.5, f2: f * 0.6, t: 0.03, d: 0.14, vol: 0.06, pan });
+      else if (terrain === 'field') voice({ f: f * 0.5, type: 'triangle', filt: 900, d: 0.1, vol: 0.06, pan });
+      else if (terrain === 'bell') bellRaw(f * 2, 0.02, 0.03, 0.5);
+      else if (terrain === 'well') voice({ f, t: 0.16, d: 0.2, vol: 0.03, pan, rev: 0.8 });
+    }),
+    land: safe((pan) => { for (let k = 0; k < 3; k++) voice({ f: rand(2100, 3300), t: 0.02 + k * 0.035, d: 0.08, vol: 0.022, pan, rev: 0.3 }); }),
+    flip: safe(() => { noise({ d: 0.05, vol: 0.06, f: 1800, q: 2 }); voice({ f: 330, f2: 250, d: 0.07, vol: 0.06 }); }),
+    thud: safe(() => { voice({ f: 140, f2: 90, d: 0.12, vol: 0.12 }); noise({ d: 0.08, vol: 0.04, f: 500 }); }),
+    tick: safe((f, pan) => { ceramicRaw(f || 1200, 0, 0.05, pan); }),
+    pop: safe(() => {
+      voice({ f: 170, f2: 560, glide: 0.07, d: 0.1, vol: 0.2 });
+      voice({ f: 560, f2: 280, t: 0.08, d: 0.16, vol: 0.12 });
+      noise({ d: 0.09, vol: 0.08, f: 700, f2: 300 });
+      for (let k = 0; k < 4; k++) voice({ f: 1300 + k * 260, t: 0.12 + k * 0.04, d: 0.1, vol: 0.03, rev: 0.4 });
+    }),
+    boing: safe(() => { voice({ f: 220, f2: 330, glide: 0.12, d: 0.3, vol: 0.08, type: 'triangle', vib: 30, vibF: 12 }); }),
+    chime: safe((f, t, vol) => { const v = vol || 0.06; voice({ f, t: t || 0, d: 1.2, vol: v, rev: 0.7 }); voice({ f: f * 2.01, t: t || 0, d: 0.6, vol: v * 0.4, rev: 0.7 }); voice({ f: f * 3.02, t: t || 0, d: 0.3, vol: v * 0.2 }); }),
+    glow: safe(() => { [0, 4, 7, 12, 16].forEach((s, k) => voice({ f: mtof(76 + s), t: k * 0.07, d: 0.9, vol: 0.045, rev: 0.8 })); }),
+    ripple: safe(() => { voice({ f: 760, f2: 300, d: 0.18, vol: 0.09, rev: 0.5 }); voice({ f: 980, f2: 520, t: 0.09, d: 0.14, vol: 0.05, rev: 0.5 }); }),
+    stone: safe((k) => { ceramicRaw(392 + (k || 0) * 60, 0, 0.1, 0); voice({ f: 120, f2: 80, d: 0.1, vol: 0.08 }); }),
+    bridge: safe((k) => { const f = degree('day', k); voice({ f, d: 0.5, vol: 0.06, rev: 0.6, type: 'triangle', filt: 2600 }); voice({ f: f * 2, d: 0.25, vol: 0.025, rev: 0.6 }); }),
+    bell: safe((f, vol, d) => bellRaw(f, 0, vol || 0.08, d || 2.2)),
+    sing: safe((f, d, t) => {
+      voice({ f, t: t || 0, a: 0.12, h: d * 0.6, d: d * 0.5, vol: 0.05, vib: 5, vibF: 5.5, rev: 0.7 });
+      voice({ f: f * 2, t: t || 0, a: 0.15, h: d * 0.5, d: d * 0.4, vol: 0.012, type: 'triangle', filt: 1800, rev: 0.6 });
+    }),
+    creak: safe(() => { noise({ d: 0.9, vol: 0.05, f: 380, f2: 950, q: 6 }); voice({ f: 70, f2: 110, d: 0.9, vol: 0.06, type: 'triangle' }); }),
+    sparkle: safe(() => { for (let k = 0; k < 6; k++) voice({ f: degree('day', 8 + k), t: k * 0.05, d: 0.25, vol: 0.035, rev: 0.6 }); }),
+    chirp: safe((pan) => { const f = rand(2300, 2900); voice({ f, f2: f * 1.35, glide: 0.05, d: 0.07, vol: 0.025, pan }); voice({ f: f * 1.1, f2: f * 1.45, glide: 0.05, t: 0.1, d: 0.07, vol: 0.02, pan }); }),
+    quack: safe(() => { voice({ f: 420, f2: 300, glide: 0.1, d: 0.12, vol: 0.05, type: 'sawtooth', filt: 1100, q: 4 }); }),
+    squeak: safe((f) => { voice({ f: f || 900, f2: (f || 900) * 1.3, glide: 0.06, d: 0.1, vol: 0.05, type: 'triangle' }); }),
+    whoosh: safe((d) => { noise({ d: d || 0.6, vol: 0.04, f: 400, f2: 2400, q: 0.8, rev: 0.4 }); }),
+    rumble: safe(() => { voice({ f: 62, f2: 55, a: 0.2, h: 0.6, d: 0.6, vol: 0.06, vib: 3, vibF: 7 }); }),
+    dig: safe(() => { for (let k = 0; k < 4; k++) noise({ t: k * 0.12, d: 0.07, vol: 0.06, f: 600 + k * 80, q: 1.2 }); }),
+    melodyNote: safe((f, type, vol, d, pan) => voice({ f, type: type || 'sine', d: d || 0.5, vol: vol || 0.05, pan, rev: 0.5, filt: type === 'sine' ? 0 : 2400 })),
+    drum: safe((low) => { voice({ f: low ? 110 : 190, f2: low ? 55 : 120, d: 0.16, vol: 0.09 }); }),
+    shaker: safe((vol) => noise({ d: 0.05, vol: vol || 0.02, f: 6000, q: 0.8, type: 'highpass' })),
+  };
+
+  // ---- gentle generative music (scheduled ahead on the audio clock)
+  const PROG = [[60, 64, 67], [57, 60, 64], [53, 57, 60], [55, 59, 62]];
+  const CONCERT_MEL = [4, 7, 9, 7, 4, 2, 0, 2, 4, 7, 9, 12, 9, 7, 4, -1];
+  const PENT = [0, 2, 4, 7, 9];
+  const melF = (deg, oct) => { const n = PENT.length, o = Math.floor(deg / n), d = ((deg % n) + n) % n; return mtof(72 + 12 * (o + (oct || 0)) + PENT[d]); };
+  const M = { next: 0, beat: 0, params: { bell: null, concert: false, dayRatio: 0.5, layers: {} } };
+  function schedBeat(b, tAt) {
+    const p = M.params, bar = Math.floor(b / 4) % 4, inBar = b % 4, ch = PROG[bar];
+    const dt = Math.max(0, tAt - T());
+    if (p.concert) {
+      const L = p.layers || {};
+      voice({ f: mtof(ch[0] - 12), t: dt, type: 'triangle', d: 0.4, vol: 0.06, filt: 700 });
+      if (inBar === 0 || inBar === 2) api.drumAt(dt, true);
+      noise({ t: dt + 0.27, d: 0.04, vol: 0.012, f: 7000, type: 'highpass' });
+      const deg = CONCERT_MEL[(b % 16)];
+      if (deg >= 0) voice({ f: melF(deg, 0), t: dt, d: 0.45, vol: 0.045, rev: 0.4, type: 'triangle', filt: 2600 });
+      if (inBar === 0) ch.forEach(m => voice({ f: mtof(m), t: dt, a: 0.08, h: 0.9, d: 0.8, vol: 0.022, rev: 0.5 }));
+      if (L.bell && inBar === 0) bellRaw(mtof(ch[0] + 12), dt, 0.04, 1.6);
+      if (L.firefly && inBar === 2) api.singAt(dt, mtof(ch[2] + 12), 0.9);
+      if (L.duck && inBar === 3 && bar === 3) api.quackAt(dt);
+      if (L.gems && inBar === 3) for (let k = 0; k < Math.min(4, L.gems); k++) voice({ f: melF(10 + k, 0), t: dt + k * 0.06, d: 0.2, vol: 0.02, rev: 0.6 });
+      if (L.rabbit && b % 2 === 1) voice({ f: melF(deg >= 0 ? deg + 5 : 7, 0), t: dt, a: 0.03, d: 0.25, vol: 0.018, vib: 5 });
+      if (L.frog && inBar === 1) api.drumAt(dt, false);
+      return;
+    }
+    // calm music box (soft and sparse)
+    if (b % 2 === 0 && Math.random() < 0.75) {
+      const m = pick(ch) + (p.dayRatio > 0.5 ? 12 : 0) + (Math.random() < 0.3 ? 12 : 0);
+      voice({ f: mtof(m), t: dt, d: 1.4, vol: 0.016, rev: 0.6 });
+    }
+    if (p.bell === 'day' || p.bell === 'dusk') {
+      if (inBar === 0 || (p.bell === 'day' && inBar === 2)) bellRaw(mtof(ch[inBar === 0 ? 0 : 2] + 12), dt, 0.03, 1.4);
+      if (p.bell === 'day') voice({ f: mtof(pick(ch) + 24), t: dt + 0.31, d: 0.12, vol: 0.012 });
+    }
+    if ((p.bell === 'night' || p.bell === 'dusk') && inBar === 0) {
+      ch.slice(0, 2).forEach((m, k) => voice({ f: mtof(m + (k ? 0 : -12) + 12), t: dt, a: 0.5, h: 1.2, d: 0.9, vol: 0.02, vib: 3, rev: 0.7 }));
+      if (p.bell === 'night' || bar % 2 === 1) api.singAt(dt + 0.6, mtof(ch[2] + 12), 1.2);
+    }
+  }
+  api.drumAt = (t, low) => voice({ f: low ? 105 : 180, f2: low ? 52 : 110, t, d: 0.16, vol: 0.07 });
+  api.singAt = (t, f, d) => api.sing(f, d, t);
+  api.quackAt = (t) => voice({ f: 420, f2: 300, glide: 0.1, t, d: 0.12, vol: 0.035, type: 'sawtooth', filt: 1100, q: 4 });
+  api.setMusic = (p) => { Object.assign(M.params, p); };
+  api.tickMusic = () => {
+    if (!ok()) return;
+    try {
+      const spb = 60 / (M.params.concert ? 112 : 92);
+      if (M.next < T() - 0.5) M.next = T() + 0.1;
+      while (M.next < T() + 0.25) { schedBeat(M.beat, M.next); M.beat++; M.next += spb; }
+    } catch (e) { /* ignore */ }
+  };
+  return api;
+})();
+
+// ================================================================ rules (pure state transitions)
+const Rules = (() => {
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  const timeAt = (st, p) => (p >= 12 ? 'dawn' : p < st.s ? 'day' : p === st.s ? 'dusk' : 'night');
+  function nextPos(st, p, dir) {
+    if (st.loop) return (p + dir + RING) % RING;
+    const np = p + dir;
+    return np < 0 || np > 11 ? null : np;
+  }
+  // before the bird road: toward the sunset.  after it opens the ring has two seams,
+  // the sunset (s) and the dawn (middle of the bird road, 13.5): head for the nearer one.
+  function dirToward(st, p, cur) {
+    if (!st.loop) return p < st.s ? 1 : p > st.s ? -1 : cur || 1;
+    if (p === st.s) return cur || 1;
+    const f = (st.s - p + RING) % RING, b = (p - st.s + RING) % RING;
+    const df = (13.5 - p + RING) % RING, db = (p - 13.5 + RING) % RING;
+    if (!st.dawnMet && Math.min(df, db) < Math.min(f, b) - 1.5) return df < db ? 1 : -1;
+    return f < b ? 1 : b < f ? -1 : cur || 1;
+  }
+  const ringDist = (st, a, b) => { if (!st.loop) return Math.abs(a - b); const d = Math.abs(a - b) % RING; return Math.min(d, RING - d); };
+  const lanPos = (st, l) => (l.h === 'mole' ? st.mole.i : l.h === 'fly' ? st.fly.i : l.h === 'tile' ? l.t : -99);
+  function hash01(a, b) { const r = mulberry32(((a | 0) * 2654435761) ^ ((b | 0) * 40503) ^ 0x5bd1e995); r(); return r(); }
+  function meetKey(st) {
+    const m = st.mole.i, f = st.fly.i;
+    // mole on the day side, firefly on the night side, the sunset tile right between them
+    if (m < 12 && f < 12 && m === st.s - 1 && f === st.s + 1) return 's' + st.s;
+    // after the bird road opens: they can also meet across the middle of the road (dawn)
+    if (st.loop && (f === 12 || f === 13) && (m === 14 || m === 15) && m - f <= 2) return 'dawn';
+    return null;
+  }
+  // field near the mole's start, pond on the firefly's side, bell and well far from the first sunset
+  function makeLayout(seed) {
+    const r = mulberry32(seed >>> 0);
+    const ri = (a, b) => a + Math.floor(r() * (b - a + 1));
+    const field = ri(2, 4), pond = ri(7, 9);
+    const s0 = r() < 0.5 ? 5 : 6;
+    const left = [1, 2, 3, 4].filter(t => t !== field), right = [7, 8, 9, 10].filter(t => t !== pond);
+    const far = (arr) => { const f = arr.filter(t => Math.abs(t - s0) >= 3), src = f.length ? f : arr; return src[Math.floor(r() * src.length)]; };
+    let bell, well;
+    if (r() < 0.5) { bell = far(left); well = far(right); } else { bell = far(right); well = far(left); }
+    return { lay: { field, pond, bell, well }, s0 };
+  }
+  function newState(save, seed) {
+    const { lay, s0 } = makeLayout(seed);
+    const sv = save || {};
+    return {
+      seed: seed >>> 0, s: s0, loop: !!sv.shortcut,
+      mole: { i: 0, dir: 1 }, fly: { i: 11, dir: -1 },
+      lay,
+      field: { ready: true, regrow: 0 }, radish: null,
+      lanterns: (sv.lanterns || []).map(h => ({ h, t: 0, idle: 0 })),
+      ripples: [], stones: (sv.stones || []).map(o => ({ u: o.u, v: o.v })),
+      bridge: sv.bridge || 0, bridgeDirs: (sv.bridgeDirs || []).slice(),
+      meetKeys: [], together: false, meets: 0,
+      bellAwake: !!sv.bellAwake, wellCool: 0, gems: sv.gems || 0,
+      concerts: sv.concerts || 0, chorusSince: false, meetSince: false,
+      birdsMoved: !!sv.birdsMoved, birdPair: !!sv.birdPair,
+      dawnMet: false, lastDie: null, prevDie: null, turn: 0, sinceDisc: 0, rippleSeq: 0, lastConcert: null,
+      disc: Object.assign({}, sv.disc || {}), duckTrips: sv.duckTrips || 0,
+    };
+  }
+  function markDisc(st, k, ev) { if (!st.disc[k]) { st.disc[k] = true; ev.push({ k: 'disc', d: k }); } st.sinceDisc = 0; }
+  function newRipple(st) {
+    const all = st.ripples.concat(st.stones);
+    let best = null, bestD = -1;
+    for (let tries = 0; tries < 6; tries++) {
+      st.rippleSeq++;
+      const u = -0.62 + 1.24 * hash01(st.seed, st.rippleSeq * 2), v = -0.62 + 1.24 * hash01(st.seed, st.rippleSeq * 2 + 1);
+      let dmin = 9;
+      for (const o of all) dmin = Math.min(dmin, Math.hypot(o.u - u, (o.v - v) * 1.4));
+      if (dmin > 0.42) return { u, v };
+      if (dmin > bestD) { bestD = dmin; best = { u, v }; }
+    }
+    return best;
+  }
+  function treasureCheck(st, ev) {
+    if (st.s !== st.lay.well || st.wellCool > 0 || st.gems >= 15) return false;
+    if (!st.lanterns.some(l => l.h !== 'stage' && ringDist(st, lanPos(st, l), st.lay.well) <= 1)) return false;
+    st.wellCool = 7;
+    const from = st.mole.i, add = Math.min(5, 15 - st.gems);
+    st.mole.i = st.lay.well;
+    st.gems += add;
+    ev.push({ k: 'treasure', well: st.lay.well, from, gems: add });
+    markDisc(st, 'treasure', ev);
+    return true;
+  }
+  function meetCheck(st, ev) {
+    const key = meetKey(st);
+    if (!key) { st.together = false; return; }
+    if (st.together) return;
+    st.together = true; st.meets++;
+    if (key === 'dawn') st.dawnMet = true;
+    const fresh = !st.meetKeys.includes(key);
+    if (fresh || !st.concerts) st.meetSince = true;
+    if (fresh) st.meetKeys.push(key);
+    let ext = null;
+    if (fresh && st.bridge < 3) {
+      const side = key === 'dawn' ? null : +key.slice(1) <= 5 ? 'W' : 'E';
+      ext = st.bridge === 0 ? 'N' : side && !st.bridgeDirs.includes(side) ? side : ['W', 'E'].find(x => !st.bridgeDirs.includes(x));
+      st.bridgeDirs.push(ext); st.bridge++;
+    }
+    ev.push({ k: 'meet', key, fresh, ext, at: key === 'dawn' ? -1 : st.s });
+    markDisc(st, 'bridge', ev);
+  }
+  function concertCheck(st, ev) {
+    if (!(st.bridge >= 1 && st.bellAwake && st.chorusSince && st.meetSince)) return;
+    if (st.lastConcert != null && st.turn - st.lastConcert < 30) return;
+    st.chorusSince = false; st.meetSince = false; st.concerts++; st.lastConcert = st.turn;
+    const first = !st.birdsMoved;
+    st.birdsMoved = true; st.loop = true;
+    // the next round: the path re-forms with a new arrangement and both go home
+    const nl = makeLayout(st.seed + st.concerts * 7919);
+    const oldLay = st.lay;
+    st.lay = nl.lay; st.s = nl.s0;
+    st.mole.i = 0; st.mole.dir = 1; st.fly.i = 11; st.fly.dir = -1;
+    st.together = false; st.wellCool = 0; st.dawnMet = false;
+    ev.push({ k: 'concert', n: st.concerts, first, oldLay, s: st.s });
+    markDisc(st, 'concert', ev);
+  }
+  function step(st0, die, roll) {
+    const st = clone(st0), ev = [];
+    st.turn++; st.sinceDisc++;
+    if (st.wellCool > 0) st.wellCool--;
+    const sun = die === 'sun';
+    const ns = clamp(st.s + (sun ? 1 : -1), 1, 10);
+    if (ns !== st.s) { ev.push({ k: 'shift', from: st.s, to: ns, die }); st.s = ns; }
+    else ev.push({ k: 'shiftBlock', die, at: st.s });
+    const who = sun ? 'mole' : 'fly', pc = st[who], oth = st[sun ? 'fly' : 'mole'];
+    let dir = dirToward(st, pc.i, pc.dir), p = pc.i, radishAt = -1, passed = false;
+    const hops = [];
+    for (let k = 0; k < roll; k++) {
+      let np = nextPos(st, p, dir), bounce = false;
+      if (np === null) { dir = -dir; np = nextPos(st, p, dir); bounce = true; }
+      const h = { from: p, to: np, bounce, ev: [] };
+      hops.push(h);
+      p = np;
+      if (k < roll - 1 && p === oth.i) passed = true;
+      if (sun && p === st.lay.field && st.field.ready && !st.radish && timeAt(st, p) === 'day') { radishAt = p; h.ev.push({ k: 'radish' }); break; }
+      if (!sun && p === st.lay.pond && timeAt(st, p) === 'night' && st.ripples.length < 3) {
+        const rp = newRipple(st); st.ripples.push(rp); h.ev.push({ k: 'ripple', u: rp.u, v: rp.v });
+      }
+      if (!st.lanterns.some(l => l.h === who)) {
+        const li = st.lanterns.findIndex(l => l.h === 'tile' && l.t === p && l.idle >= 4);
+        if (li >= 0) { st.lanterns[li].h = who; h.ev.push({ k: 'pickup', idx: li, who }); }
+      }
+    }
+    if (radishAt >= 0) passed = false;
+    pc.i = p; pc.dir = dir;
+    ev.push({ k: 'move', who, hops, roll, from: hops.length ? hops[0].from : p });
+    if (passed) ev.push({ k: 'pass', who });
+    if (radishAt >= 0) {
+      st.field.ready = false; st.field.regrow = 6;
+      const place = st.s, stand = Math.max(radishAt, place - 1);
+      st.radish = { t: place };
+      pc.i = stand; pc.dir = 1;
+      ev.push({ k: 'radish', at: radishAt, place, stand });
+      markDisc(st, 'radish', ev);
+    }
+    if (st.radish && timeAt(st, st.radish.t) === 'night') {
+      st.lanterns.push({ h: 'tile', t: st.radish.t, idle: 0 });
+      ev.push({ k: 'lantern', t: st.radish.t, idx: st.lanterns.length - 1 });
+      st.radish = null;
+      markDisc(st, 'lantern', ev);
+    }
+    if (!st.field.ready && !st.radish) {
+      if (st.field.regrow > 0) st.field.regrow--;
+      else if (st.lanterns.length < 3) { st.field.ready = true; ev.push({ k: 'sprout' }); }
+    }
+    if (st.s === st.lay.pond && st.ripples.length) {
+      const added = st.ripples.splice(0);
+      st.stones.push(...added);
+      const sunk = [];
+      while (st.stones.length > 5) sunk.push(st.stones.shift());
+      ev.push({ k: 'stones', added, sunk });
+      markDisc(st, 'stones', ev);
+    }
+    if (st.s === st.lay.bell && ns !== st0.s) {
+      if ((st.lastDie && st.lastDie !== die) || (st.prevDie && st.prevDie !== die)) {
+        const again = st.bellAwake;
+        st.bellAwake = true; st.chorusSince = true;
+        ev.push({ k: 'chorus', again });
+        markDisc(st, 'chorus', ev);
+      } else ev.push({ k: 'bellDing' });
+    }
+    treasureCheck(st, ev);
+    st.lanterns.forEach(l => { if (l.h === 'tile') l.idle++; });
+    meetCheck(st, ev);
+    concertCheck(st, ev);
+    st.prevDie = st.lastDie; st.lastDie = die;
+    return { st, ev };
+  }
+  // the child hands a lantern to a piece (tap or drag)
+  function giveLantern(st0, idx, who) {
+    const st = clone(st0), ev = [], l = st.lanterns[idx];
+    if (!l) return { st, ev };
+    const holds = w => st.lanterns.some(o => o !== l && o.h === w);
+    let target = who;
+    if (target !== 'stage' && holds(target)) { const o = target === 'mole' ? 'fly' : 'mole'; target = holds(o) ? 'stage' : o; }
+    l.h = target; l.idle = 0;
+    ev.push({ k: 'give', idx, who: target });
+    treasureCheck(st, ev);
+    return { st, ev };
+  }
+  function dropLantern(st0, idx, tile) {
+    const st = clone(st0), ev = [], l = st.lanterns[idx];
+    if (!l) return { st, ev };
+    l.h = 'tile'; l.t = tile; l.idle = 0;
+    ev.push({ k: 'drop', idx, t: tile });
+    treasureCheck(st, ev);
+    return { st, ev };
+  }
+
+  // ---- director: gently bias the roll when the child has gone a while without a new discovery
+  function rollScore(st, ev) {
+    let sc = 0;
+    const nw = (k) => (st.disc[k] ? 1 : 2.5);
+    for (const e of ev) {
+      if (e.k === 'meet') sc += (e.ext ? 6 : e.fresh ? 3 : 0.4) * nw('bridge');
+      else if (e.k === 'radish') sc += 5 * nw('radish');
+      else if (e.k === 'treasure') sc += 6 * nw('treasure');
+      else if (e.k === 'concert') sc += 6;
+      else if (e.k === 'move') for (const h of e.hops) for (const x of h.ev) if (x.k === 'ripple') sc += st.stones.length ? 0.6 : 2;
+    }
+    return sc;
+  }
+  function chooseRoll(st, die, rnd) {
+    const pity = 0.4 + Math.min(5, st.sinceDisc / 4), w = [1, 1, 1];
+    for (let r = 1; r <= 3; r++) w[r - 1] = 1 + pity * rollScore(st, step(st, die, r).ev);
+    let x = rnd() * (w[0] + w[1] + w[2]);
+    for (let r = 1; r <= 3; r++) { x -= w[r - 1]; if (x <= 0) return r; }
+    return 3;
+  }
+
+  // ---- planner: which die should glow next (expectimax over a few turns)
+  function goalOf(st) {
+    const heldLantern = st.lanterns.some(l => l.h !== 'stage');
+    if (st.field.ready && !st.radish && !st.disc.radish) return 'radish';
+    if (st.radish) return 'lantern';
+    if (!st.disc.stones && !st.ripples.length) return 'ripple';
+    if (st.ripples.length && !st.disc.stones) return 'stones';
+    if (st.bridge === 0) return 'meet';
+    if (heldLantern && !st.disc.treasure) return 'treasure';
+    if (!st.bellAwake) return 'chorus';
+    if (!st.chorusSince && !st.meetSince) return 'meet';
+    if (!st.meetSince) return 'meet';
+    if (!st.chorusSince) return 'chorus';
+    if (st.loop && !st.meetKeys.includes('dawn')) return 'dawn';
+    if (st.ripples.length) return 'stones';
+    if (heldLantern && st.gems < 15 && st.wellCool === 0) return 'treasure';
+    if (st.field.ready && !st.radish && st.lanterns.length < 3) return 'radish';
+    return 'meetNew';
+  }
+  function achieved(g, ev) {
+    for (const e of ev) {
+      if (g === 'radish' && e.k === 'radish') return true;
+      if (g === 'lantern' && e.k === 'lantern') return true;
+      if (g === 'stones' && e.k === 'stones') return true;
+      if (g === 'chorus' && e.k === 'chorus') return true;
+      if (g === 'treasure' && e.k === 'treasure') return true;
+      if (g === 'meet' && e.k === 'meet') return true;
+      if (g === 'meetNew' && e.k === 'meet' && e.fresh) return true;
+      if (g === 'dawn' && e.k === 'meet' && e.key === 'dawn') return true;
+      if (g === 'ripple' && e.k === 'move') for (const h of e.hops) for (const x of h.ev) if (x.k === 'ripple') return true;
+    }
+    return false;
+  }
+  function heur(g, st) {
+    const m = st.mole.i, f = st.fly.i, s = st.s, L = st.lay;
+    switch (g) {
+      case 'radish': return (s <= L.field ? (L.field - s + 1) * 1.5 : 0) + (m <= L.field ? (L.field - m) * 0.3 : (m - L.field) * 0.6 + 1);
+      case 'lantern': return st.radish ? Math.max(0, s - st.radish.t + 1) : 0;
+      case 'ripple': return (L.pond <= s ? (s - L.pond + 1) * 1.2 : 0) + (f > L.pond ? 0 : 1.5);
+      case 'stones': return Math.abs(s - L.pond);
+      case 'chorus': return Math.abs(s - L.bell) + (s === L.bell ? 1 : 0);
+      case 'treasure': {
+        let d = 9;
+        for (const l of st.lanterns) if (l.h !== 'stage') d = Math.min(d, ringDist(st, lanPos(st, l), L.well));
+        return Math.abs(s - L.well) + Math.max(0, d - 1) * 0.8;
+      }
+      case 'dawn': return ringDist(st, f, 13) * 0.6 + ringDist(st, m, 14) * 0.6;
+      default: {
+        let h = m <= s && s <= f && m < 12 && f < 12 ? Math.max(0, f - m - 2) * 0.7 : 2 + ringDist(st, m, s) * 0.5 + ringDist(st, f, s) * 0.5;
+        if (g === 'meetNew' && st.meetKeys.includes('s' + s)) h += 1;
+        return h;
+      }
+    }
+  }
+  // the chorus only depends on the sunset position and the last dice: exact breadth-first search
+  function bellPlan(st) {
+    const bell = st.lay.bell, start = { s: st.s, a: st.lastDie || '', b: st.prevDie || '', first: null };
+    const q = [start], seen = new Set([start.s + start.a + start.b]);
+    while (q.length) {
+      const n = q.shift();
+      for (const die of ['sun', 'moon']) {
+        const ns = clamp(n.s + (die === 'sun' ? 1 : -1), 1, 10);
+        if (ns === n.s) continue;
+        const first = n.first || die;
+        if (ns === bell && ((n.a && n.a !== die) || (n.b && n.b !== die))) return first;
+        const k = ns + die + n.a;
+        if (!seen.has(k)) { seen.add(k); q.push({ s: ns, a: die, b: n.a, first }); }
+      }
+    }
+    return null;
+  }
+  function plan(st, depth, rnd) {
+    const g = goalOf(st), D = depth || 3;
+    if (g === 'chorus') { const d = bellPlan(st); if (d) return { die: d, goal: g, sc: null }; }
+    const val = (s, d) => {
+      if (d === 0) return heur(g, s);
+      let best = Infinity;
+      for (const die of ['sun', 'moon']) {
+        let acc = 0;
+        for (let r = 1; r <= 3; r++) { const res = step(s, die, r); acc += achieved(g, res.ev) ? -10 - d : val(res.st, d - 1); }
+        best = Math.min(best, acc / 3);
+      }
+      return best;
+    };
+    const sc = {};
+    for (const die of ['sun', 'moon']) {
+      let acc = 0;
+      for (let r = 1; r <= 3; r++) { const res = step(st, die, r); acc += achieved(g, res.ev) ? -10 - D : val(res.st, D - 1); }
+      sc[die] = acc / 3;
+    }
+    let die;
+    if (Math.abs(sc.sun - sc.moon) < 0.05) die = st.lastDie === 'sun' ? 'moon' : 'sun';
+    else die = sc.sun < sc.moon ? 'sun' : 'moon';
+    // a long dry spell: sometimes suggest the other die so the guidance can never loop forever
+    if (rnd && st.sinceDisc > 14 && rnd() < 0.35) die = die === 'sun' ? 'moon' : 'sun';
+    return { die, goal: g, sc };
+  }
+  return { clone, timeAt, step, newState, giveLantern, dropLantern, chooseRoll, plan, goalOf, meetKey, lanPos, ringDist, dirToward };
+})();
+
+// ================================================================ runtime: canvas, layout, camera, clock
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const VIEW = { W: 1, H: 1, dpr: 1, k: 1, bx: 0, by: 0, portrait: true, ins: { t: 0, r: 0, b: 0, l: 0 }, dieSize: 120, dice: { sun: { x: 0, y: 0 }, moon: { x: 0, y: 0 } }, board: { x: 0, y: 0, w: 1, h: 1 } };
+const CAM = { zoom: 1, fx: CONTENT.x + CONTENT.w / 2, fy: CONTENT.y + CONTENT.h / 2, shake: 0, sx: 0, sy: 0 };
+const DBG = { errors: [], timeScale: 1, forceRoll: 0 };
+function readInsets() {
+  try {
+    const cs = getComputedStyle(document.getElementById('sa'));
+    return { t: parseFloat(cs.paddingTop) || 0, r: parseFloat(cs.paddingRight) || 0, b: parseFloat(cs.paddingBottom) || 0, l: parseFloat(cs.paddingLeft) || 0 };
+  } catch (e) { return { t: 0, r: 0, b: 0, l: 0 }; }
+}
+function layout() {
+  const W = Math.max(1, window.innerWidth | 0), H = Math.max(1, window.innerHeight | 0);
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  Object.assign(VIEW, { W, H, dpr });
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  cv.style.width = W + 'px'; cv.style.height = H + 'px';
+  const ins = (VIEW.ins = readInsets());
+  VIEW.portrait = H >= W;
+  if (VIEW.portrait) {
+    const ds = clamp(Math.min(W * 0.31, H * 0.16), 92, 210);
+    const areaH = ds * 1.34 + ins.b + 8;
+    VIEW.board = { x: ins.l, y: ins.t, w: W - ins.l - ins.r, h: H - ins.t - areaH };
+    const dy = H - ins.b - ds * 0.68 - 8;
+    VIEW.dice.sun = { x: ins.l + (W - ins.l - ins.r) * 0.27, y: dy };
+    VIEW.dice.moon = { x: ins.l + (W - ins.l - ins.r) * 0.73, y: dy };
+    VIEW.dieSize = ds;
+  } else {
+    const ds = clamp(Math.min(H * 0.24, W * 0.15), 92, 210);
+    const sideW = ds * 1.36;
+    VIEW.board = { x: ins.l + sideW, y: ins.t, w: W - ins.l - ins.r - sideW * 2, h: H - ins.t - ins.b };
+    const dy = ins.t + (H - ins.t - ins.b) * 0.62;
+    VIEW.dice.sun = { x: ins.l + sideW * 0.5 + 4, y: dy };
+    VIEW.dice.moon = { x: W - ins.r - sideW * 0.5 - 4, y: dy };
+    VIEW.dieSize = ds;
+  }
+  const b = VIEW.board;
+  VIEW.k = Math.max(0.05, Math.min(b.w / CONTENT.w, b.h / CONTENT.h) * 0.98);
+  VIEW.bx = b.x + b.w / 2; VIEW.by = b.y + b.h / 2;
+  Cache.dirty = true;
+}
+function camScale() { return VIEW.k * CAM.zoom; }
+function worldToScreen(x, y) { const s = camScale(); return { x: VIEW.bx + (x - CAM.fx) * s + CAM.sx, y: VIEW.by + (y - CAM.fy) * s + CAM.sy }; }
+function screenToWorld(x, y) { const s = camScale(); return { x: (x - VIEW.bx - CAM.sx) / s + CAM.fx, y: (y - VIEW.by - CAM.sy) / s + CAM.fy }; }
+function setWorldTransform() {
+  const s = camScale(), d = VIEW.dpr;
+  ctx.setTransform(d * s, 0, 0, d * s, d * (VIEW.bx + CAM.sx - CAM.fx * s), d * (VIEW.by + CAM.sy - CAM.fy * s));
+}
+function setScreenTransform() { const d = VIEW.dpr; ctx.setTransform(d, 0, 0, d, 0, 0); }
+
+// ---- game clock (stops while hidden), awaitable waits and tweens
+const Clock = { t: 0, waits: [], tweens: [] };
+const wait = (ms) => new Promise(res => Clock.waits.push({ at: Clock.t + Math.max(0, ms), res }));
+const tween = (ms, fn, ez) => new Promise(res => Clock.tweens.push({ t0: Clock.t, ms: Math.max(1, ms), fn, ez: ez || E.lin, res }));
+function tickClock(dt) {
+  Clock.t += dt;
+  const tw = Clock.tweens;
+  for (let i = 0; i < tw.length; i++) {
+    const o = tw[i], k = clamp((Clock.t - o.t0) / o.ms, 0, 1);
+    try { o.fn(o.ez(k), k); } catch (e) { DBG.errors.push(String(e && e.stack || e)); }
+    if (k >= 1) o.done = true;
+  }
+  for (let i = tw.length - 1; i >= 0; i--) if (tw[i].done) { const o = tw[i]; tw.splice(i, 1); o.res(); }
+  const ws = Clock.waits;
+  for (let i = ws.length - 1; i >= 0; i--) if (ws[i].at <= Clock.t) { const o = ws[i]; ws.splice(i, 1); o.res(); }
+}
+// run an async scene; never let an error escape to the console
+function run(fn) { try { const p = fn(); if (p && p.catch) p.catch(e => DBG.errors.push(String(e && e.stack || e))); } catch (e) { DBG.errors.push(String(e && e.stack || e)); } }
+
+// ---- particles & footprints (hard caps keep old iPads smooth)
+const PART = [], PMAX = 140, FOOT = [], FMAX = 36;
+function spawn(p) { if (PART.length >= PMAX) PART.shift(); p.t = 0; PART.push(p); }
+function sparkle(x, y, n, o) {
+  o = o || {};
+  for (let k = 0; k < n; k++) {
+    const a = rand(0, TAU), sp = rand(o.min || 40, o.max || 160);
+    spawn({ kind: o.kind || 'star', x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - (o.up || 40), g: o.g == null ? 160 : o.g,
+      life: rand(0.5, 0.9) * (o.life || 1), size: rand(5, 10) * (o.size || 1), color: o.color || pick(['#fff3c4', '#ffd76a', '#ffffff', '#ffb35c']),
+      rot: rand(0, TAU), vr: rand(-6, 6), drag: o.drag || 1.6 });
+  }
+}
+function shards(x, y, n, colors) {
+  for (let k = 0; k < n; k++) {
+    const a = rand(-Math.PI, 0), sp = rand(60, 170);
+    spawn({ kind: 'shard', x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, g: 520, life: rand(0.45, 0.8), size: rand(5, 9), color: pick(colors), rot: rand(0, TAU), vr: rand(-10, 10), drag: 0.6 });
+  }
+}
+function footprint(x, y, ang, who) {
+  if (FOOT.length >= FMAX) FOOT.shift();
+  FOOT.push({ x, y, ang, who, t0: Clock.t });
+}
+function updateParticles(dt) {
+  const s = dt / 1000;
+  for (let i = PART.length - 1; i >= 0; i--) {
+    const p = PART[i];
+    p.t += s;
+    if (p.t >= p.life) { PART.splice(i, 1); continue; }
+    const dr = Math.max(0, 1 - p.drag * s);
+    p.vx *= dr; p.vy = p.vy * dr + p.g * s;
+    p.x += p.vx * s; p.y += p.vy * s; p.rot += p.vr * s;
+  }
+  while (FOOT.length && Clock.t - FOOT[0].t0 > 5200) FOOT.shift();
+}
+
+// ================================================================ ceramic painting helpers + cached layers
+function rr(c, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  c.beginPath();
+  c.moveTo(x + r, y); c.lineTo(x + w - r, y); c.quadraticCurveTo(x + w, y, x + w, y + r);
+  c.lineTo(x + w, y + h - r); c.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  c.lineTo(x + r, y + h); c.quadraticCurveTo(x, y + h, x, y + h - r);
+  c.lineTo(x, y + r); c.quadraticCurveTo(x, y, x + r, y); c.closePath();
+}
+// slightly irregular hand-made outline through points (closed, smoothed)
+function blobPath(c, pts) {
+  const n = pts.length;
+  c.beginPath();
+  const m0x = (pts[n - 1][0] + pts[0][0]) / 2, m0y = (pts[n - 1][1] + pts[0][1]) / 2;
+  c.moveTo(m0x, m0y);
+  for (let i = 0; i < n; i++) {
+    const p = pts[i], q = pts[(i + 1) % n];
+    c.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2);
+  }
+  c.closePath();
+}
+function ringPts(x, y, rx, ry, n, wob, seed) {
+  const r = mulberry32(seed), pts = [];
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * TAU, k = 1 + (r() - 0.5) * wob;
+    pts.push([x + Math.cos(a) * rx * k, y + Math.sin(a) * ry * k]);
+  }
+  return pts;
+}
+function glazeSpot(c, x, y, rx, ry, a) {
+  const g = c.createRadialGradient(x, y, 0, x, y, Math.max(rx, ry));
+  g.addColorStop(0, `rgba(255,255,255,${a})`); g.addColorStop(1, 'rgba(255,255,255,0)');
+  c.save(); c.translate(x, y); c.scale(1, ry / rx); c.translate(-x, -y);
+  c.fillStyle = g; c.beginPath(); c.arc(x, y, rx, 0, TAU); c.fill(); c.restore();
+}
+// mosaic tesserae inside the current clip
+function tesserae(c, x0, y0, x1, y1, cell, cols, seed, grout) {
+  const r = mulberry32(seed);
+  c.fillStyle = grout; c.fillRect(x0, y0, x1 - x0, y1 - y0);
+  for (let y = y0; y < y1; y += cell) {
+    const off = ((y / cell) | 0) % 2 ? cell * 0.5 : 0;
+    for (let x = x0 - off; x < x1; x += cell) {
+      const j = () => (r() - 0.5) * cell * 0.22;
+      const g = cell * 0.09;
+      c.fillStyle = cols[(r() * cols.length) | 0];
+      c.beginPath();
+      c.moveTo(x + g + j(), y + g + j()); c.lineTo(x + cell - g + j(), y + g + j());
+      c.lineTo(x + cell - g + j(), y + cell - g + j()); c.lineTo(x + g + j(), y + cell - g + j());
+      c.closePath(); c.fill();
+    }
+  }
+}
+const ISLAND = {
+  main: ringPts(500, 592, 398, 314, 26, 0.07, 11),
+  N: ringPts(GEO.islets.N.x, GEO.islets.N.y, GEO.islets.N.r, GEO.islets.N.r * 0.86, 12, 0.12, 21),
+  W: ringPts(GEO.islets.W.x, GEO.islets.W.y, GEO.islets.W.r, GEO.islets.W.r * 0.86, 12, 0.12, 22),
+  E: ringPts(GEO.islets.E.x, GEO.islets.E.y, GEO.islets.E.r, GEO.islets.E.r * 0.86, 12, 0.12, 23),
+};
+const Cache = { dirty: true, sea: null, island: null, faces: {}, halo: {}, dice: {}, scale: 1 };
+function mkCanvas(w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h)); return c; }
+function buildSea() {
+  const W = VIEW.W * VIEW.dpr, H = VIEW.H * VIEW.dpr, cnv = mkCanvas(W, H), c = cnv.getContext('2d');
+  const g = c.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#24467f'); g.addColorStop(1, '#1a3462');
+  c.fillStyle = g; c.fillRect(0, 0, W, H);
+  const cell = Math.max(14, 26 * VIEW.k * VIEW.dpr);
+  c.globalAlpha = 0.9;
+  tesserae(c, 0, 0, W, H, cell, ['#2d5a9e', '#2a5291', '#3467aa', '#26508a', '#3a74b3', '#2f61a2', '#4280bd'], 5, 'rgba(18,36,74,0.9)');
+  c.globalAlpha = 1;
+  // soft vignette toward the dice tray
+  const v = c.createRadialGradient(W / 2, H * 0.42, Math.min(W, H) * 0.2, W / 2, H * 0.5, Math.max(W, H) * 0.75);
+  v.addColorStop(0, 'rgba(255,255,255,0.06)'); v.addColorStop(1, 'rgba(10,20,50,0.35)');
+  c.fillStyle = v; c.fillRect(0, 0, W, H);
+  return cnv;
+}
+function buildIsland() {
+  const s = VIEW.k * VIEW.dpr;
+  const cnv = mkCanvas(CONTENT.w * s, CONTENT.h * s), c = cnv.getContext('2d');
+  c.setTransform(s, 0, 0, s, -CONTENT.x * s, -CONTENT.y * s);
+  const shapes = [ISLAND.main, ISLAND.N, ISLAND.W, ISLAND.E];
+  // foam + sand rim
+  for (const pts of shapes) {
+    c.save(); blobPath(c, pts); c.lineWidth = 34; c.strokeStyle = 'rgba(210,235,255,0.35)'; c.stroke();
+    c.lineWidth = 22; c.strokeStyle = '#e9d3a2'; c.stroke(); c.restore();
+  }
+  for (const pts of shapes) {
+    c.save(); blobPath(c, pts); c.clip();
+    tesserae(c, CONTENT.x - 20, CONTENT.y - 20, CONTENT.x + CONTENT.w + 20, CONTENT.y + CONTENT.h + 20, 24,
+      ['#86b86c', '#9cc77c', '#7aad62', '#a9cf88', '#8fbf72', '#b4d690', '#7fb36a'], 31, '#5d8a4c');
+    // gentle light from top-left and shade toward the rim
+    const lg = c.createRadialGradient(420, 470, 60, 500, 600, 470);
+    lg.addColorStop(0, 'rgba(255,250,215,0.25)'); lg.addColorStop(1, 'rgba(30,60,40,0.25)');
+    c.fillStyle = lg; c.fillRect(CONTENT.x, CONTENT.y, CONTENT.w, CONTENT.h);
+    c.restore();
+    c.save(); blobPath(c, pts); c.lineWidth = 3; c.strokeStyle = 'rgba(90,70,40,0.5)'; c.stroke(); c.restore();
+  }
+  // plaza: a creamy mosaic circle where the stage stands
+  c.save(); c.beginPath(); c.ellipse(GEO.stage.x, GEO.stage.y + 6, 132, 96, 0, 0, TAU); c.clip();
+  tesserae(c, GEO.stage.x - 140, GEO.stage.y - 100, GEO.stage.x + 140, GEO.stage.y + 110, 20, ['#f1e3c2', '#e9d6ae', '#f6ead0', '#e2cc9e'], 41, '#b99c6c');
+  c.restore();
+  // islet decorations
+  drawFlowers(c, GEO.islets.W.x, GEO.islets.W.y, 7, 51);
+  drawMushroomHouse(c, GEO.islets.N.x + 10, GEO.islets.N.y - 6);
+  drawLighthouse(c, GEO.islets.E.x + 8, GEO.islets.E.y - 4);
+  // little houses of the residents
+  for (const h of GEO.houses) drawHouse(c, h.x, h.y, h.k);
+  return cnv;
+}
+function drawFlowers(c, x, y, n, seed) {
+  const r = mulberry32(seed);
+  for (let k = 0; k < n; k++) {
+    const a = r() * TAU, d = r() * 36, fx = x + Math.cos(a) * d, fy = y + Math.sin(a) * d * 0.7;
+    c.fillStyle = ['#ff8fb1', '#ffd45e', '#ffffff', '#c59cff'][k % 4];
+    for (let p = 0; p < 5; p++) { const pa = (p / 5) * TAU; c.beginPath(); c.arc(fx + Math.cos(pa) * 4.5, fy + Math.sin(pa) * 4.5, 3.6, 0, TAU); c.fill(); }
+    c.fillStyle = '#f39a2b'; c.beginPath(); c.arc(fx, fy, 2.6, 0, TAU); c.fill();
+  }
+}
+function drawMushroomHouse(c, x, y) {
+  c.fillStyle = '#f4ead6'; rr(c, x - 14, y - 4, 28, 26, 6); c.fill();
+  c.fillStyle = '#7a4d2e'; rr(c, x - 5, y + 6, 10, 16, 5); c.fill();
+  c.fillStyle = '#e2533f'; c.beginPath(); c.ellipse(x, y - 4, 26, 18, 0, Math.PI, TAU); c.fill();
+  c.fillStyle = '#fff'; [[-12, -10, 4], [3, -15, 5], [14, -8, 3.5]].forEach(([a, b, rad]) => { c.beginPath(); c.arc(x + a, y + b, rad, 0, TAU); c.fill(); });
+  glazeSpot(c, x - 10, y - 14, 10, 6, 0.5);
+}
+function drawLighthouse(c, x, y) {
+  c.fillStyle = '#ffffff'; c.beginPath(); c.moveTo(x - 12, y + 22); c.lineTo(x - 7, y - 26); c.lineTo(x + 7, y - 26); c.lineTo(x + 12, y + 22); c.closePath(); c.fill();
+  c.fillStyle = '#e45a4a'; c.fillRect(x - 10, y - 4, 20, 8); c.fillRect(x - 8, y - 20, 16, 6);
+  c.fillStyle = '#ffe48a'; rr(c, x - 7, y - 36, 14, 10, 3); c.fill();
+  c.fillStyle = '#4a5a8a'; c.beginPath(); c.moveTo(x - 9, y - 36); c.lineTo(x, y - 44); c.lineTo(x + 9, y - 36); c.closePath(); c.fill();
+  glazeSpot(c, x - 3, y - 10, 4, 14, 0.5);
+}
+function drawHouse(c, x, y, k) {
+  c.save(); c.translate(x, y);
+  c.fillStyle = 'rgba(40,60,30,0.25)'; c.beginPath(); c.ellipse(2, 20, 34, 10, 0, 0, TAU); c.fill();
+  if (k === 'hedgehog') {
+    c.fillStyle = '#b98a5a'; c.beginPath(); c.ellipse(0, 6, 34, 24, 0, Math.PI, TAU); c.lineTo(34, 18); c.lineTo(-34, 18); c.closePath(); c.fill();
+    c.fillStyle = '#5b3b22'; c.beginPath(); c.ellipse(0, 12, 11, 12, 0, Math.PI, TAU); c.lineTo(11, 18); c.lineTo(-11, 18); c.fill();
+    c.fillStyle = '#7fb36a'; for (let i = -2; i <= 2; i++) { c.beginPath(); c.arc(i * 11, -14 + Math.abs(i) * 4, 5, 0, TAU); c.fill(); }
+    glazeSpot(c, -14, -6, 12, 6, 0.45);
+  } else {
+    const wall = k === 'rabbit' ? '#fbe7e1' : '#dff3e4', roof = k === 'rabbit' ? '#d9714f' : '#4f86c6';
+    c.fillStyle = wall; rr(c, -24, -10, 48, 30, 5); c.fill();
+    c.strokeStyle = 'rgba(80,60,40,0.35)'; c.lineWidth = 2; c.stroke();
+    c.fillStyle = roof; c.beginPath(); c.moveTo(-31, -8); c.quadraticCurveTo(0, -42, 31, -8); c.closePath(); c.fill();
+    c.fillStyle = '#8a5a3a'; rr(c, -6, 2, 12, 18, 5); c.fill();
+    c.fillStyle = '#ffe8a0'; c.beginPath(); c.arc(14, 0, 5, 0, TAU); c.fill();
+    glazeSpot(c, -12, -22, 12, 6, 0.5);
+  }
+  c.restore();
+}
+function drawTree(c, x, y) {
+  c.fillStyle = 'rgba(40,60,30,0.3)'; c.beginPath(); c.ellipse(x + 4, y + 30, 40, 11, 0, 0, TAU); c.fill();
+  c.fillStyle = '#8b5e3c'; rr(c, x - 7, y - 6, 14, 38, 5); c.fill();
+  const leaves = [[0, -34, 34], [-26, -18, 24], [26, -18, 24], [-12, -52, 22], [14, -54, 22]];
+  for (const [a, b, rad] of leaves) { c.fillStyle = '#4f9a58'; c.beginPath(); c.arc(x + a, y + b, rad, 0, TAU); c.fill(); }
+  for (const [a, b, rad] of leaves) { c.fillStyle = '#69b26a'; c.beginPath(); c.arc(x + a - 3, y + b - 4, rad * 0.72, 0, TAU); c.fill(); }
+  glazeSpot(c, x - 14, y - 52, 16, 9, 0.35);
+}
+const FACE = {
+  day: { hi: '#ffeeb0', mid: '#f4be4f', lo: '#cf8f2a', side: '#a86c1e' },
+  night: { hi: '#7084d6', mid: '#34428f', lo: '#1f2a66', side: '#141c47' },
+  dusk: { hi: '#ffd9a0', mid: '#f59048', lo: '#d9602e', side: '#9c4320' },
+  dawn: { hi: '#fff0f6', mid: '#f7b7d2', lo: '#d98ab0', side: '#a7607f' },
+  back: { hi: '#fff3c8', mid: '#f9c75e', lo: '#e0952f', side: '#a8661c' },
+};
+const TILE_SHAPE = (() => { const r = mulberry32(77), o = []; for (let i = 0; i < 8; i++) o.push((r() - 0.5) * 5); return o; })();
+function tileOutline(c, h) {
+  const w = TILE_SHAPE;
+  c.beginPath();
+  c.moveTo(-h + 10 + w[0], -h + w[1]);
+  c.quadraticCurveTo(0, -h - 2 + w[2], h - 10 + w[3], -h + w[1] * 0.5);
+  c.quadraticCurveTo(h + 1, -h + 1, h + w[4] * 0.4, -h + 10);
+  c.quadraticCurveTo(h + 2 + w[5] * 0.3, 0, h, h - 10);
+  c.quadraticCurveTo(h, h, h - 10, h + w[6] * 0.3);
+  c.quadraticCurveTo(0, h + 2 + w[7] * 0.4, -h + 10, h);
+  c.quadraticCurveTo(-h, h, -h, h - 10);
+  c.quadraticCurveTo(-h - 2 + w[0] * 0.3, 0, -h + w[2] * 0.3, -h + 10);
+  c.quadraticCurveTo(-h, -h, -h + 10 + w[0], -h + w[1]);
+  c.closePath();
+}
+function star4(c, x, y, r) { c.beginPath(); c.moveTo(x, y - r); c.quadraticCurveTo(x, y, x + r, y); c.quadraticCurveTo(x, y, x, y + r); c.quadraticCurveTo(x, y, x - r, y); c.quadraticCurveTo(x, y, x, y - r); c.fill(); }
+function paintFace(c, size, kind) {
+  const h = size / 2, F = FACE[kind];
+  c.save(); c.translate(0, 7); tileOutline(c, h); c.fillStyle = F.side; c.fill(); c.restore();
+  tileOutline(c, h);
+  const g = c.createRadialGradient(-h * 0.35, -h * 0.4, h * 0.1, 0, 0, h * 1.35);
+  g.addColorStop(0, F.hi); g.addColorStop(0.55, F.mid); g.addColorStop(1, F.lo);
+  c.fillStyle = g; c.fill();
+  c.save(); tileOutline(c, h); c.clip();
+  if (kind === 'day') {
+    c.fillStyle = 'rgba(255,214,110,0.95)';
+    for (let p = 0; p < 8; p++) { const a = (p / 8) * TAU; c.beginPath(); c.ellipse(Math.cos(a) * 17, Math.sin(a) * 17, 8, 4.5, a, 0, TAU); c.fill(); }
+    c.fillStyle = '#fff3cc'; c.beginPath(); c.arc(0, 0, 10, 0, TAU); c.fill();
+    c.fillStyle = 'rgba(205,130,40,0.55)'; [[-1, -1], [1, -1], [1, 1], [-1, 1]].forEach(([a, b]) => { c.beginPath(); c.arc(a * (h - 13), b * (h - 13), 3.2, 0, TAU); c.fill(); });
+  } else if (kind === 'night') {
+    c.fillStyle = 'rgba(255,236,170,0.92)'; c.beginPath(); c.arc(-4, 0, 15, 0, TAU); c.fill();
+    c.fillStyle = F.mid; c.beginPath(); c.arc(3, -4, 13, 0, TAU); c.fill();
+    c.fillStyle = 'rgba(210,225,255,0.9)'; star4(c, 18, -16, 6); star4(c, -20, 20, 4.5); star4(c, 22, 18, 3.5);
+    c.fillStyle = 'rgba(255,255,255,0.35)'; [[-24, -22], [8, 26], [-28, 6], [26, -2]].forEach(([a, b]) => { c.beginPath(); c.arc(a, b, 1.6, 0, TAU); c.fill(); });
+  } else if (kind === 'dusk') {
+    const ig = c.createRadialGradient(0, 8, 2, 0, 8, h); ig.addColorStop(0, 'rgba(255,240,190,0.85)'); ig.addColorStop(1, 'rgba(255,240,190,0)');
+    c.fillStyle = ig; c.fillRect(-h, -h, size, size);
+    c.fillStyle = 'rgba(255,230,150,0.95)'; c.beginPath(); c.arc(0, 12, 15, Math.PI, TAU); c.fill();
+    c.strokeStyle = 'rgba(255,245,220,0.7)'; c.lineWidth = 3;
+    [16, 24, 32].forEach((yy, k) => { c.beginPath(); c.moveTo(-h + 10 + k * 5, yy); c.lineTo(h - 10 - k * 5, yy); c.stroke(); });
+  } else if (kind === 'dawn') {
+    c.fillStyle = 'rgba(255,255,255,0.75)';
+    c.beginPath(); c.ellipse(0, 0, 18, 7, -0.5, 0, TAU); c.fill();
+    c.strokeStyle = 'rgba(200,120,160,0.6)'; c.lineWidth = 2; c.beginPath(); c.moveTo(-16, 9); c.lineTo(15, -9); c.stroke();
+  } else if (kind === 'back') {
+    c.fillStyle = 'rgba(255,248,210,0.6)';
+    for (let p = 0; p < 12; p++) { const a = (p / 12) * TAU; c.beginPath(); c.moveTo(0, 0); c.arc(0, 0, h * 1.2, a, a + 0.18); c.closePath(); c.fill(); }
+  }
+  c.restore();
+  glazeSpot(c, -h * 0.38, -h * 0.45, h * 0.55, h * 0.26, 0.55);
+  tileOutline(c, h); c.lineWidth = 2.5; c.strokeStyle = 'rgba(60,35,15,0.38)'; c.stroke();
+}
+function buildFace(kind, size) {
+  const s = VIEW.k * VIEW.dpr, S = (size + 26) * s, cnv = mkCanvas(S, S), c = cnv.getContext('2d');
+  c.setTransform(s, 0, 0, s, S / 2, S / 2 - 3 * s);
+  paintFace(c, size, kind);
+  return { cnv, S: S / s };
+}
+function buildHalo(kind) {
+  const s = VIEW.k * VIEW.dpr, R = 150, S = R * 2 * s, cnv = mkCanvas(S, S), c = cnv.getContext('2d');
+  c.setTransform(s, 0, 0, s, S / 2, S / 2);
+  const col = kind === 'day' ? '255,214,120' : kind === 'night' ? '34,46,120' : kind === 'dusk' ? '255,138,60' : '255,170,210';
+  const g = c.createRadialGradient(0, 0, 10, 0, 0, R);
+  g.addColorStop(0, `rgba(${col},0.62)`); g.addColorStop(0.55, `rgba(${col},0.32)`); g.addColorStop(1, `rgba(${col},0)`);
+  c.fillStyle = g; c.beginPath(); c.arc(0, 0, R, 0, TAU); c.fill();
+  if (kind === 'night') {
+    const r = mulberry32(9);
+    for (let i = 0; i < 9; i++) { const a = r() * TAU, d = 30 + r() * 90; c.fillStyle = `rgba(230,236,255,${0.35 + r() * 0.4})`; star4(c, Math.cos(a) * d, Math.sin(a) * d, 2 + r() * 2.5); }
+  }
+  return { cnv, R };
+}
+const DIE_COL = {
+  sun: { hi: '#fff0b8', mid: '#ffc94e', lo: '#ef8f2c', side: '#c46a1f', carve: '#e0882a', rad: 0.3 },
+  moon: { hi: '#dbe6ff', mid: '#8fa9ee', lo: '#4f68c0', side: '#33479a', carve: '#5d78cf', rad: 0.17 },
+};
+function buildDie(kind) {
+  const ds = VIEW.dieSize, d = VIEW.dpr, S = ds * 1.5 * d, cnv = mkCanvas(S, S), c = cnv.getContext('2d'), C = DIE_COL[kind];
+  c.setTransform(d, 0, 0, d, S / 2, S / 2);
+  const f = ds * 0.74, fx = -f / 2 - ds * 0.05, fy = -f / 2 + ds * 0.07, ox = ds * 0.13, oy = -ds * 0.14, rad = f * C.rad;
+  c.fillStyle = 'rgba(10,20,40,0.28)'; c.beginPath(); c.ellipse(ds * 0.04, fy + f + ds * 0.04, f * 0.62, ds * 0.08, 0, 0, TAU); c.fill();
+  for (let i = 8; i >= 1; i--) {
+    const t = i / 8;
+    c.fillStyle = i > 6 ? C.side : C.lo;
+    rr(c, fx + ox * t, fy + oy * t, f, f, rad); c.fill();
+  }
+  // top and side faces get a soft light
+  c.save(); rr(c, fx + ox, fy + oy, f, f, rad); c.clip();
+  const tg = c.createLinearGradient(fx, fy + oy, fx + f, fy + oy + f * 0.3); tg.addColorStop(0, C.hi); tg.addColorStop(1, C.mid);
+  c.globalAlpha = 0.85; c.fillStyle = tg; c.fillRect(fx + ox - 4, fy + oy - 4, f + 8, f * 0.45); c.globalAlpha = 1;
+  c.restore();
+  rr(c, fx, fy, f, f, rad);
+  const g = c.createRadialGradient(fx + f * 0.3, fy + f * 0.28, f * 0.05, fx + f * 0.5, fy + f * 0.55, f * 0.85);
+  g.addColorStop(0, C.hi); g.addColorStop(0.5, C.mid); g.addColorStop(1, C.lo);
+  c.fillStyle = g; c.fill();
+  c.lineWidth = Math.max(1.5, ds * 0.018); c.strokeStyle = 'rgba(70,40,20,0.35)'; c.stroke();
+  // carved emblem
+  const ex = fx + f / 2, ey = fy + f / 2, er = f * 0.24;
+  const carve = (dx, dy, col) => {
+    c.save(); c.translate(dx, dy); c.fillStyle = col;
+    if (kind === 'sun') {
+      c.beginPath(); c.arc(ex, ey, er * 0.62, 0, TAU); c.fill();
+      for (let k = 0; k < 8; k++) { const a = (k / 8) * TAU; c.beginPath(); c.ellipse(ex + Math.cos(a) * er * 1.08, ey + Math.sin(a) * er * 1.08, er * 0.24, er * 0.13, a, 0, TAU); c.fill(); }
+    } else {
+      c.beginPath(); c.arc(ex, ey, er, 0, TAU); c.arc(ex + er * 0.48, ey - er * 0.3, er * 0.86, 0, TAU, true); c.fill('evenodd');
+      star4(c, ex + er * 0.95, ey + er * 0.75, er * 0.22);
+    }
+    c.restore();
+  };
+  const o = Math.max(1, ds * 0.012);
+  carve(o, o, 'rgba(255,255,255,0.55)');
+  carve(-o, -o, 'rgba(60,30,10,0.35)');
+  carve(0, 0, C.carve);
+  glazeSpot(c, fx + f * 0.3, fy + f * 0.2, f * 0.32, f * 0.13, 0.65);
+  return { cnv, S: S / d, face: { x: fx, y: fy, f } };
+}
+function buildCaches() {
+  Cache.sea = buildSea();
+  Cache.island = buildIsland();
+  for (const k of Object.keys(FACE)) Cache.faces[k] = buildFace(k, TS);
+  Cache.faces.dawnSmall = buildFace('dawn', BTS);
+  for (const k of ['day', 'night', 'dusk', 'dawn']) Cache.halo[k] = buildHalo(k);
+  Cache.dice.sun = buildDie('sun'); Cache.dice.moon = buildDie('moon');
+  Cache.dirty = false;
+}
+
+// ================================================================ characters (drawn as glazed ceramic figures)
+function shadow(c, x, y, rx, a) { c.fillStyle = `rgba(30,25,20,${a == null ? 0.28 : a})`; c.beginPath(); c.ellipse(x, y, rx, rx * 0.32, 0, 0, TAU); c.fill(); }
+function eyes(c, x, y, gap, r, lookX, lookY, blink, wide) {
+  for (const s of [-1, 1]) {
+    const ex = x + s * gap;
+    if (blink > 0.5) { c.strokeStyle = '#2a1a10'; c.lineWidth = 2; c.beginPath(); c.moveTo(ex - r, y); c.quadraticCurveTo(ex, y + r * 0.7, ex + r, y); c.stroke(); continue; }
+    const rr2 = r * (wide ? 1.35 : 1);
+    c.fillStyle = '#ffffff'; c.beginPath(); c.arc(ex, y, rr2 * 1.25, 0, TAU); c.fill();
+    c.fillStyle = '#24160e'; c.beginPath(); c.arc(ex + lookX * r * 0.45, y + lookY * r * 0.45, rr2 * 0.8, 0, TAU); c.fill();
+    c.fillStyle = '#ffffff'; c.beginPath(); c.arc(ex + lookX * r * 0.45 - r * 0.25, y + lookY * r * 0.45 - r * 0.3, r * 0.3, 0, TAU); c.fill();
+  }
+}
+// the mole: round brown pottery, twitching pink nose, puffs its chest when proud
+function drawMole(c, m) {
+  const x = m.x, y = m.y;
+  shadow(c, x, y + 2, 26 * (1 - m.hy / 160), 0.3 * (1 - m.under));
+  if (m.under > 0.98) { drawMound(c, x, y, 1); return; }
+  c.save();
+  c.translate(x, y - m.hy);
+  if (m.under > 0) { c.beginPath(); c.rect(-60, -120, 120, 120 + 2); c.clip(); c.translate(0, m.under * 56); }
+  c.rotate(m.tilt + Math.sin(m.spin * TAU) * 0.15);
+  const F = m.face, sit = m.sit, proud = m.proud;
+  c.scale((1 / m.sq) * (1 + sit * 0.12), m.sq * (1 - sit * 0.16));
+  // feet
+  c.fillStyle = '#f2a3a0';
+  c.beginPath(); c.ellipse(-11 + sit * 6 * F, -3 + sit * -4, 8, 4.5, 0, 0, TAU); c.fill();
+  c.beginPath(); c.ellipse(11 + sit * 6 * F, -3 + sit * -4, 8, 4.5, 0, 0, TAU); c.fill();
+  // body
+  const g = c.createRadialGradient(-9, -40, 4, 0, -26, 34);
+  g.addColorStop(0, '#b98455'); g.addColorStop(0.6, '#8a5a35'); g.addColorStop(1, '#5e3a20');
+  c.fillStyle = g; c.beginPath(); c.ellipse(0, -27, 27, 26 + proud * 2, 0, 0, TAU); c.fill();
+  c.strokeStyle = 'rgba(50,25,10,0.35)'; c.lineWidth = 1.6; c.stroke();
+  // belly
+  c.fillStyle = '#efcfa8'; c.beginPath(); c.ellipse(F * 3, -20 - proud * 3, 15 + proud * 4, 13 + proud * 3, 0, 0, TAU); c.fill();
+  // nose
+  const sn = Math.sin(m.sniff * TAU * 2) * 1.6;
+  c.fillStyle = '#ff9aa8'; c.beginPath(); c.ellipse(F * 22, -33 + sn * 0.4 - proud * 2, 7 + Math.abs(sn) * 0.4, 5.5, 0, 0, TAU); c.fill();
+  c.fillStyle = 'rgba(255,255,255,0.7)'; c.beginPath(); c.arc(F * 20, -35 - proud * 2, 1.8, 0, TAU); c.fill();
+  // whiskers
+  c.strokeStyle = 'rgba(60,30,15,0.5)'; c.lineWidth = 1.1;
+  for (const s of [-1, 1]) { c.beginPath(); c.moveTo(F * 18, -31 + s * 2); c.lineTo(F * 30, -31 + s * 5 + sn * 0.5); c.stroke(); }
+  // eyes + cheeks
+  eyes(c, F * 7, -40 - proud * 3, 7, 2.6, m.lx, m.ly, m.blink, m.wide > 0);
+  c.fillStyle = 'rgba(255,140,140,0.45)'; c.beginPath(); c.arc(F * 14 - 1, -29, 4, 0, TAU); c.fill();
+  c.beginPath(); c.arc(-F * 8, -30, 3.4, 0, TAU); c.fill();
+  // paws (waving / holding)
+  c.fillStyle = '#f7a8a2';
+  if (m.carry) { c.beginPath(); c.ellipse(F * 15, -22, 6, 5, 0, 0, TAU); c.fill(); c.beginPath(); c.ellipse(F * 2, -20, 6, 5, 0, 0, TAU); c.fill(); }
+  else {
+    const wv = m.wave > 0 ? Math.sin(Clock.t / 90) * 0.6 : 0;
+    c.save(); c.translate(F * 22, -24); c.rotate(m.wave > 0 ? -F * (1.6 + wv) : 0); c.beginPath(); c.ellipse(m.wave > 0 ? 0 : 0, m.wave > 0 ? -9 : 0, 6, 5.2, 0, 0, TAU); c.fill(); c.restore();
+    c.beginPath(); c.ellipse(-F * 22, -22, 6, 5.2, 0, 0, TAU); c.fill();
+  }
+  glazeSpot(c, -11, -42, 11, 6, 0.55);
+  c.restore();
+  if (m.under > 0) drawMound(c, x, y, m.under);
+}
+function drawMound(c, x, y, k) {
+  c.fillStyle = '#8c6239'; c.beginPath(); c.ellipse(x, y, 24 * k, 12 * k, 0, Math.PI, TAU); c.fill();
+  c.fillStyle = '#a97b4c'; c.beginPath(); c.ellipse(x - 4, y - 3 * k, 13 * k, 5 * k, 0, Math.PI, TAU); c.fill();
+}
+// the firefly: translucent yellow belly that glows and pulses before it sings
+function drawFirefly(c, f) {
+  if (f.dive >= 0.99) return;
+  const fl = 18 + Math.sin(Clock.t / 380 + f.seed) * 4 + f.hy;
+  c.save(); c.globalAlpha = 1 - (f.dive || 0);
+  shadow(c, f.x, f.y + 2, 16 * (1 - Math.min(0.6, f.hy / 120)), 0.22);
+  c.save();
+  c.translate(f.x, f.y - fl);
+  c.rotate(f.tilt + Math.sin(f.spin * TAU) * 0.2);
+  c.scale((1 / f.sq) * (1 - (f.dive || 0) * 0.6), f.sq * (1 - (f.dive || 0) * 0.6));
+  const F = f.face, glow = 0.55 + f.glow * 0.45 + Math.sin(Clock.t / 260) * 0.08 + f.pulse * 0.5;
+  // glow halo
+  const hg = c.createRadialGradient(-F * 9, -20, 2, -F * 9, -20, 46 + f.pulse * 18);
+  hg.addColorStop(0, `rgba(255,245,150,${0.55 * glow})`); hg.addColorStop(1, 'rgba(255,240,120,0)');
+  c.fillStyle = hg; c.beginPath(); c.arc(-F * 9, -20, 46 + f.pulse * 18, 0, TAU); c.fill();
+  // wings
+  const fw = 0.65 + Math.abs(Math.sin(Clock.t / 55)) * 0.35;
+  c.fillStyle = 'rgba(220,240,255,0.55)'; c.strokeStyle = 'rgba(120,150,190,0.5)'; c.lineWidth = 1;
+  for (const s of [-1, 1]) { c.save(); c.translate(-F * 2, -38); c.rotate(-0.5 * s - F * 0.2); c.scale(1, fw); c.beginPath(); c.ellipse(0, -13, 8, 15, 0, 0, TAU); c.fill(); c.stroke(); c.restore(); }
+  // belly (translucent, glowing)
+  const bg = c.createRadialGradient(-F * 11, -22, 2, -F * 9, -20, 18);
+  bg.addColorStop(0, `rgba(255,255,220,${0.95})`); bg.addColorStop(0.6, `rgba(255,232,90,${0.85})`); bg.addColorStop(1, 'rgba(240,190,40,0.75)');
+  c.fillStyle = bg; c.beginPath(); c.ellipse(-F * 9, -20, 14, 17, F * 0.5, 0, TAU); c.fill();
+  c.strokeStyle = 'rgba(200,150,40,0.45)'; c.lineWidth = 1.2; c.stroke();
+  c.strokeStyle = 'rgba(210,160,50,0.4)'; for (let k = 0; k < 3; k++) { c.beginPath(); c.ellipse(-F * 9, -14 + k * -6, 12 - k, 3, F * 0.5, 0, Math.PI); c.stroke(); }
+  // body + head
+  c.fillStyle = '#3a2c2a'; c.beginPath(); c.ellipse(F * 3, -36, 11, 12, 0, 0, TAU); c.fill();
+  c.fillStyle = '#ef7a52'; c.beginPath(); c.ellipse(F * 9, -46, 11, 8, 0, Math.PI, TAU); c.fill();
+  c.fillStyle = '#2e2322'; c.beginPath(); c.arc(F * 11, -50, 11, 0, TAU); c.fill();
+  // antennae
+  c.strokeStyle = '#2e2322'; c.lineWidth = 2;
+  for (const s of [-1, 1]) { c.beginPath(); c.moveTo(F * 11 + s * 4, -59); c.quadraticCurveTo(F * 14 + s * 10, -72, F * 18 + s * 8, -74); c.stroke(); c.fillStyle = '#ffe680'; c.beginPath(); c.arc(F * 18 + s * 8, -74, 3, 0, TAU); c.fill(); }
+  eyes(c, F * 13, -51, 5, 2.3, f.lx, f.ly, f.blink, f.wide > 0);
+  c.fillStyle = 'rgba(255,150,150,0.55)'; c.beginPath(); c.arc(F * 19, -45, 2.6, 0, TAU); c.fill();
+  // arms
+  c.strokeStyle = '#2e2322'; c.lineWidth = 3; c.lineCap = 'round';
+  if (f.carry) { c.beginPath(); c.moveTo(F * 6, -34); c.lineTo(F * 16, -28); c.stroke(); }
+  else {
+    const wv = f.wave > 0 ? Math.sin(Clock.t / 90) * 0.5 : 0;
+    c.beginPath(); c.moveTo(F * 8, -35); c.lineTo(F * 8 + Math.cos(-1.2 - wv) * 12 * (f.wave > 0 ? 1 : 0.6) * F, -35 + Math.sin(-1.2 - wv) * (f.wave > 0 ? 12 : 4) + (f.wave > 0 ? 0 : 8)); c.stroke();
+  }
+  c.lineCap = 'butt';
+  glazeSpot(c, F * 7, -56, 5, 3, 0.6);
+  c.restore();
+  c.restore();
+}
+const RES_LOOK = {
+  rabbit: { body: '#fbf6f0', shade: '#d9cbbd', acc: '#ffb3c1', inst: 'horn', note: 1046 },
+  frog: { body: '#8fd06c', shade: '#5c9e45', acc: '#e9f6c8', inst: 'drum', note: 523 },
+  hedgehog: { body: '#c99a6b', shade: '#7a5536', acc: '#f3dcc0', inst: 'shaker', note: 784 },
+};
+function drawInstrument(c, kind, F, t) {
+  if (kind === 'horn') {
+    c.fillStyle = '#f2c14e'; c.beginPath(); c.moveTo(F * 8, -24); c.lineTo(F * 24, -30); c.lineTo(F * 26, -20); c.closePath(); c.fill();
+    c.beginPath(); c.ellipse(F * 26, -25, 3, 6, 0, 0, TAU); c.fill();
+  } else if (kind === 'drum') {
+    c.fillStyle = '#e0534a'; rr(c, -10, -22, 20, 13, 3); c.fill();
+    c.fillStyle = '#fff3d6'; c.beginPath(); c.ellipse(0, -22, 10, 3.4, 0, 0, TAU); c.fill();
+    c.strokeStyle = '#7a4a2a'; c.lineWidth = 2; c.beginPath(); c.moveTo(F * 9, -34 + Math.sin(t / 120) * 4); c.lineTo(F * 2, -24); c.stroke();
+  } else {
+    c.fillStyle = '#ffd45e'; c.beginPath(); c.arc(F * 16, -30 + Math.sin(t / 90) * 3, 5, 0, TAU); c.fill();
+    c.strokeStyle = '#a06a2a'; c.lineWidth = 2; c.beginPath(); c.moveTo(F * 13, -26); c.lineTo(F * 8, -20); c.stroke();
+  }
+}
+function drawResident(c, r) {
+  const L = RES_LOOK[r.kind], F = r.face, t = Clock.t;
+  shadow(c, r.x, r.y + 1, 15, 0.26);
+  c.save();
+  c.translate(r.x, r.y - r.hy);
+  c.rotate(r.tilt);
+  c.scale(1 / r.sq, r.sq);
+  if (r.kind === 'rabbit') {
+    c.fillStyle = L.body;
+    for (const s of [-1, 1]) { c.save(); c.translate(F * 4 + s * 6, -40); c.rotate(s * 0.18 + Math.sin(t / 400 + s) * 0.06); c.beginPath(); c.ellipse(0, -14, 5.5, 15, 0, 0, TAU); c.fill(); c.fillStyle = L.acc; c.beginPath(); c.ellipse(0, -13, 2.6, 10, 0, 0, TAU); c.fill(); c.fillStyle = L.body; c.restore(); }
+  }
+  if (r.kind === 'hedgehog') {
+    c.fillStyle = L.shade;
+    for (let k = 0; k < 7; k++) { const a = Math.PI + 0.2 + k * 0.42; c.beginPath(); c.moveTo(-F * 4 + Math.cos(a) * 12, -18 + Math.sin(a) * 12); c.lineTo(-F * 4 + Math.cos(a) * 25, -18 + Math.sin(a) * 25); c.lineTo(-F * 4 + Math.cos(a + 0.3) * 12, -18 + Math.sin(a + 0.3) * 12); c.fill(); }
+  }
+  const g = c.createRadialGradient(-5, -28, 3, 0, -18, 22);
+  g.addColorStop(0, '#ffffff'); g.addColorStop(0.25, L.body); g.addColorStop(1, L.shade);
+  c.fillStyle = g; c.beginPath(); c.ellipse(0, -18, 16, 17, 0, 0, TAU); c.fill();
+  c.strokeStyle = 'rgba(60,40,20,0.3)'; c.lineWidth = 1.3; c.stroke();
+  c.fillStyle = L.acc; c.beginPath(); c.ellipse(F * 3, -13, 9, 8, 0, 0, TAU); c.fill();
+  if (r.kind === 'frog') {
+    for (const s of [-1, 1]) { c.fillStyle = L.body; c.beginPath(); c.arc(F * 3 + s * 7, -33, 6.5, 0, TAU); c.fill(); }
+    eyes(c, F * 3, -33, 7, 2.4, r.lx, r.ly, r.blink, false);
+    c.strokeStyle = '#2f5a24'; c.lineWidth = 1.6; c.beginPath(); c.arc(F * 4, -22, 6, 0.2, Math.PI - 0.2); c.stroke();
+  } else {
+    eyes(c, F * 6, -24, 5, 2.1, r.lx, r.ly, r.blink, false);
+    c.fillStyle = r.kind === 'rabbit' ? '#ff8fa3' : '#3a2a1e'; c.beginPath(); c.arc(F * 12, -19, 2.4, 0, TAU); c.fill();
+  }
+  c.fillStyle = 'rgba(255,140,150,0.4)'; c.beginPath(); c.arc(F * 12, -15, 3, 0, TAU); c.fill();
+  if (r.gemHat) { c.fillStyle = r.gemHat; c.beginPath(); c.moveTo(-6, -36); c.lineTo(0, -46); c.lineTo(6, -36); c.closePath(); c.fill(); glazeSpot(c, -1, -41, 2.5, 2, 0.8); }
+  if (r.inst) drawInstrument(c, L.inst, F, t + r.seed * 100);
+  if (r.carry) drawGem(c, F * 10, -10, r.carry, 0.8);
+  glazeSpot(c, -6, -28, 6, 4, 0.55);
+  c.restore();
+}
+function drawDuck(c, d) {
+  shadow(c, d.x, d.y + 1, 15, 0.25);
+  c.save();
+  c.translate(d.x, d.y - d.hy);
+  c.rotate(Math.sin(d.waddle) * 0.12);
+  const F = d.face;
+  const g = c.createRadialGradient(-4, -22, 2, 0, -14, 22);
+  g.addColorStop(0, '#ffffff'); g.addColorStop(0.4, '#fff6dc'); g.addColorStop(1, '#e4d3a8');
+  c.fillStyle = g; c.beginPath(); c.ellipse(-F * 3, -13, 17, 12, 0, 0, TAU); c.fill();
+  c.beginPath(); c.moveTo(-F * 18, -16); c.lineTo(-F * 26, -24); c.lineTo(-F * 17, -10); c.fill();
+  c.beginPath(); c.arc(F * 9, -29, 9.5, 0, TAU); c.fill();
+  c.strokeStyle = 'rgba(120,90,40,0.35)'; c.lineWidth = 1.2; c.stroke();
+  c.fillStyle = '#ff9a3c'; c.beginPath(); c.ellipse(F * 19, -27, 6.5, 3.4, 0, 0, TAU); c.fill();
+  c.fillStyle = '#ff9a3c'; c.fillRect(-6, -3, 3, 4); c.fillRect(2, -3, 3, 4);
+  eyes(c, F * 12, -31, 0.01, 1.8, F * 0.5, 0, d.blink, false);
+  c.fillStyle = 'rgba(230,210,160,0.9)'; c.beginPath(); c.ellipse(-F * 4, -13, 8, 5, -F * 0.3, 0, TAU); c.fill();
+  if (d.flower) { c.fillStyle = '#ff8fb1'; for (let p = 0; p < 5; p++) { const a = (p / 5) * TAU; c.beginPath(); c.arc(F * 24 + Math.cos(a) * 3, -27 + Math.sin(a) * 3, 2.4, 0, TAU); c.fill(); } c.fillStyle = '#ffd45e'; c.beginPath(); c.arc(F * 24, -27, 1.8, 0, TAU); c.fill(); }
+  glazeSpot(c, F * 5, -34, 4, 3, 0.7);
+  c.restore();
+}
+function drawBird(c, b) {
+  if (!b.fly) shadow(c, b.x, b.y + 1, 8, 0.2);
+  c.save(); c.translate(b.x, b.y - b.hy);
+  const F = b.face;
+  c.fillStyle = b.col; c.beginPath(); c.ellipse(0, -9, 9, 8, 0, 0, TAU); c.fill();
+  c.beginPath(); c.moveTo(-F * 7, -10); c.lineTo(-F * 15, -14); c.lineTo(-F * 13, -7); c.closePath(); c.fill();
+  const flap = b.fly ? Math.sin(Clock.t / 45 + b.seed) * 0.9 : 0.15;
+  c.fillStyle = b.wing; c.save(); c.translate(-F * 1, -10); c.rotate(-F * flap); c.beginPath(); c.ellipse(-F * 3, -2, 7, 4, 0, 0, TAU); c.fill(); c.restore();
+  c.fillStyle = '#ffb347'; c.beginPath(); c.moveTo(F * 8, -11); c.lineTo(F * 13, -9.5); c.lineTo(F * 8, -8); c.closePath(); c.fill();
+  c.fillStyle = '#2a1a10'; c.beginPath(); c.arc(F * 4, -12, 1.5, 0, TAU); c.fill();
+  glazeSpot(c, -2, -13, 3.5, 2.2, 0.7);
+  c.restore();
+}
+const GEM_COLS = ['#ff5f7e', '#4fb3ff', '#5fdc8a', '#b97cff', '#ffd23f'];
+function drawGem(c, x, y, col, s) {
+  s = s || 1;
+  c.save(); c.translate(x, y); c.scale(s, s);
+  c.fillStyle = col; c.beginPath(); c.moveTo(0, -8); c.lineTo(7, -3); c.lineTo(4, 7); c.lineTo(-4, 7); c.lineTo(-7, -3); c.closePath(); c.fill();
+  c.fillStyle = 'rgba(255,255,255,0.55)'; c.beginPath(); c.moveTo(0, -8); c.lineTo(3, -3); c.lineTo(-3, -3); c.closePath(); c.fill();
+  c.strokeStyle = 'rgba(40,20,40,0.35)'; c.lineWidth = 1; c.stroke();
+  c.restore();
+}
+// giant radish; k = growth (0..1), lantern = 0..1 morph into a glowing vegetable lantern
+function drawRadish(c, x, y, k, lantern, sway) {
+  c.save(); c.translate(x, y); c.scale(k, k);
+  const sw = Math.sin(Clock.t / 300) * 0.08 + (sway || 0);
+  // leaves (become the handle when it is a lantern)
+  if (lantern < 0.6) {
+    c.fillStyle = '#4fa34a';
+    for (const a of [-0.5, 0, 0.5]) { c.save(); c.translate(0, -50); c.rotate(a + sw); c.beginPath(); c.ellipse(0, -18, 7, 20, 0, 0, TAU); c.fill(); c.fillStyle = '#6cc163'; c.beginPath(); c.ellipse(-1, -18, 3, 15, 0, 0, TAU); c.fill(); c.fillStyle = '#4fa34a'; c.restore(); }
+  }
+  if (lantern > 0.3) {
+    c.strokeStyle = '#4fa34a'; c.lineWidth = 4; c.globalAlpha = clamp((lantern - 0.3) / 0.4, 0, 1);
+    c.beginPath(); c.moveTo(-9, -48); c.quadraticCurveTo(0, -78, 9, -48); c.stroke(); c.globalAlpha = 1;
+  }
+  if (lantern > 0) {
+    const hg = c.createRadialGradient(0, -26, 4, 0, -26, 70);
+    hg.addColorStop(0, `rgba(255,236,140,${0.6 * lantern})`); hg.addColorStop(1, 'rgba(255,220,100,0)');
+    c.fillStyle = hg; c.beginPath(); c.arc(0, -26, 70, 0, TAU); c.fill();
+  }
+  // body
+  const g = c.createRadialGradient(-6, -34, 3, 0, -24, 32);
+  g.addColorStop(0, '#ffffff'); g.addColorStop(0.5, lantern > 0 ? `rgb(255,${248 - lantern * 20},${235 - lantern * 120})` : '#f8f4ea'); g.addColorStop(1, lantern > 0 ? '#f0c060' : '#ddd3c0');
+  c.fillStyle = g;
+  c.beginPath(); c.moveTo(-18, -46); c.quadraticCurveTo(-24, -20, -6, 4); c.quadraticCurveTo(0, 12, 6, 4); c.quadraticCurveTo(24, -20, 18, -46); c.quadraticCurveTo(0, -56, -18, -46); c.fill();
+  c.fillStyle = '#9ccf6a'; c.beginPath(); c.ellipse(0, -47, 16, 6, 0, 0, TAU); c.fill();
+  if (lantern > 0) { // patterns shining through the skin
+    c.fillStyle = `rgba(255,170,40,${0.75 * lantern})`;
+    for (const [a, b, r] of [[-8, -30, 3.5], [7, -26, 3], [-2, -14, 3.6], [9, -38, 2.4], [-11, -18, 2.2]]) star4(c, a, b, r * 1.5);
+  } else {
+    c.strokeStyle = 'rgba(160,140,110,0.5)'; c.lineWidth = 1.2;
+    for (const yy of [-30, -18, -8]) { c.beginPath(); c.moveTo(-9, yy); c.lineTo(-3, yy + 1); c.stroke(); }
+  }
+  glazeSpot(c, -7, -36, 5, 9, 0.65);
+  c.restore();
+}
+function drawChest(c, x, y, lid, k) {
+  c.save(); c.translate(x, y); c.scale(k, k);
+  c.fillStyle = '#8b5a2b'; rr(c, -20, -24, 40, 24, 4); c.fill();
+  c.fillStyle = '#e9b949'; c.fillRect(-20, -15, 40, 4); c.fillRect(-3, -22, 6, 10);
+  c.save(); c.translate(-20, -24); c.rotate(-lid * 1.9);
+  c.fillStyle = '#a06a35'; c.beginPath(); c.moveTo(0, 0); c.lineTo(40, 0); c.quadraticCurveTo(40, -14, 20, -14); c.quadraticCurveTo(0, -14, 0, 0); c.fill();
+  c.fillStyle = '#e9b949'; c.fillRect(17, -14, 6, 14);
+  c.restore();
+  if (lid > 0.3) { const hg = c.createRadialGradient(0, -26, 2, 0, -26, 40); hg.addColorStop(0, 'rgba(255,240,170,0.8)'); hg.addColorStop(1, 'rgba(255,240,170,0)'); c.fillStyle = hg; c.beginPath(); c.arc(0, -26, 40, 0, TAU); c.fill(); }
+  glazeSpot(c, -10, -18, 7, 3, 0.5);
+  c.restore();
+}
+
+// ================================================================ game + visual state
+const G = {
+  st: null, queue: [], busy: false, target: 'sun', goal: null, concert: false, idle: 0, demoDone: false, gazeDone: false,
+  hand: null, touch: null, mel: { step: 0, t: -1e9, die: null }, drag: null, saveDue: false, started: false, firstTap: false, turnSerial: 0,
+  concertT: 0, concertScene: null,
+};
+const V = {
+  tiles: [], mole: null, fly: null, radish: null, lanterns: [], ripples: [], stones: [],
+  bridge: { N: 0, W: 0, E: 0 }, bridgeGlow: 0, bell: { swing: 0, ring: 0 }, well: { glow: 0 }, chests: [],
+  gems: [], stageGems: 0, residents: [], duck: null, birds: [], birdRoad: 0, plaza: 0, stageK: 0, annexA: 1,
+  dice: { sun: null, moon: null }, layShown: null, link: null, orbs: [],
+};
+const mkDieV = () => ({ sq: 1, v: 0, pips: 0, pipsLeft: 0, glow: 0, hop: 0, press: 0 });
+function mkPiece(kind, tile) {
+  const t = tileXY(tile);
+  return { kind, tile, x: t.x, y: t.y, hy: 0, sq: 1, face: kind === 'mole' ? 1 : -1, lx: 0, ly: 0, blink: 0, nextBlink: rand(800, 3000),
+    wave: 0, spin: 0, sit: 0, proud: 0, sniff: 0, glow: 0, pulse: 0, tilt: 0, wide: 0, carry: null, under: 0, seed: rand(0, 99),
+    anim: false, turnBack: 0, lookT: 0, look: null, idleAct: 0 };
+}
+function faceOf(st, i) { return i >= 12 ? 'dawn' : Rules.timeAt(st, i); }
+function syncVisualFromState(st) {
+  V.tiles = GEO.tiles.map((t, i) => ({ face: faceOf(st, i), flip: null, dx: 0, dy: 0, dang: 0, lift: 0, sc: 1, wob: 0 }));
+  V.mole = mkPiece('mole', st.mole.i); V.fly = mkPiece('fly', st.fly.i);
+  V.lanterns = st.lanterns.map((l, i) => mkLanternV(i));
+  V.stones = st.stones.map(o => ({ u: o.u, v: o.v, form: 1, sink: 0 }));
+  V.ripples = st.ripples.map(o => ({ u: o.u, v: o.v, t0: Clock.t }));
+  V.bridge = { N: 0, W: 0, E: 0 };
+  st.bridgeDirs.forEach(d => (V.bridge[d] = 1));
+  V.stageGems = st.gems;
+  V.birdRoad = st.loop ? 1 : 0;
+  V.layShown = Object.assign({}, st.lay);
+  V.radish = st.field.ready ? { st: 'ready', k: 1 } : null;
+  V.dice.sun = mkDieV(); V.dice.moon = mkDieV();
+}
+const mkLanternV = (i) => ({ i, x: 0, y: 0, ready: true, glow: 1, k: 1, fly: null });
+// where a piece stands on its tile (side by side when sharing)
+function restPos(kind) {
+  const st = G.st, me = kind === 'mole' ? V.mole : V.fly, other = kind === 'mole' ? V.fly : V.mole;
+  const t = tileXY(me.tile);
+  let x = t.x, y = t.y + 6;
+  if (other && other.tile === me.tile) { const s = kind === 'mole' ? -1 : 1; x += t.tx * 22 * s; y += t.ty * 22 * s; }
+  if (st && st.radish && st.radish.t === me.tile) { x -= t.nx * 14; y -= t.ny * 14; }
+  return { x, y };
+}
+function lanternPos(i) {
+  const l = G.st.lanterns[i], lv = V.lanterns[i];
+  if (!l) return { x: 0, y: 0 };
+  if (lv && lv.fly) return { x: lv.x, y: lv.y };
+  if (l.h === 'mole') { const m = V.mole; return { x: m.x + m.face * 17, y: m.y - m.hy - 14 + m.under * 50 }; }
+  if (l.h === 'fly') { const f = V.fly, fl = 18 + Math.sin(Clock.t / 380 + f.seed) * 4 + f.hy; return { x: f.x + f.face * 18, y: f.y - fl - 14 }; }
+  if (l.h === 'tile') { const t = tileXY(l.t); return { x: t.x + t.nx * 16, y: t.y + t.ny * 16 + 8 }; }
+  const k = G.st.lanterns.slice(0, i + 1).filter(o => o.h === 'stage').length - 1;
+  const a = Math.PI + 0.5 + k * 0.9;
+  return { x: GEO.stage.x + Math.cos(a) * 66, y: GEO.stage.y - 30 + Math.sin(a) * 18 };
+}
+
+// ================================================================ board drawing
+function drawHalos(c) {
+  const n = 12 + (V.birdRoad > 0 ? 4 : 0);
+  for (let i = 0; i < n; i++) {
+    const tv = V.tiles[i], t = GEO.tiles[i], h = Cache.halo[tv.face];
+    if (!h) continue;
+    const a = (i >= 12 ? V.birdRoad * 0.6 : 0.75) * (1 - G.concertT * 0.8);
+    if (a <= 0.01) continue;
+    c.globalAlpha = a;
+    const R = h.R * (tv.face === 'dusk' ? 1.05 : 1);
+    c.drawImage(h.cnv, t.x + tv.dx - R, t.y + tv.dy - R, R * 2, R * 2);
+  }
+  c.globalAlpha = 1;
+}
+function drawTile(c, i) {
+  const tv = V.tiles[i], t = GEO.tiles[i], bird = i >= 12;
+  if (bird && V.birdRoad <= 0) return;
+  const x = t.x + tv.dx, y = t.y + tv.dy - tv.lift;
+  let face = tv.face, sx = 1, skew = 0, lift = 0, edge = 0;
+  if (tv.flip) {
+    const k = clamp((Clock.t - tv.flip.t0) / tv.flip.dur, 0, 1), ph = k * Math.PI;
+    sx = Math.cos(ph); face = sx >= 0 ? tv.flip.from : tv.flip.to;
+    lift = Math.sin(ph) * 16; skew = Math.sin(ph) * 0.22 * tv.flip.side; edge = Math.sin(ph);
+    if (k >= 1) { tv.face = tv.flip.to; tv.flip = null; face = tv.face; sx = 1; lift = 0; skew = 0; edge = 0; }
+  }
+  const spr = bird ? Cache.faces.dawnSmall : Cache.faces[face];
+  if (!spr) return;
+  const S = spr.S * (bird ? V.birdRoad : 1) * tv.sc;
+  c.save();
+  c.translate(x, y + 4);
+  c.rotate(t.ang + tv.dang);
+  c.fillStyle = 'rgba(40,30,20,0.25)'; c.beginPath(); c.ellipse(0, 6, S * 0.4, S * 0.36, 0, 0, TAU); c.fill();
+  c.translate(0, -4 - lift);
+  c.transform(1, skew, 0, 1, 0, 0);
+  if (edge > 0.05) { c.fillStyle = FACE[tv.flip ? tv.flip.to : face].side; c.fillRect(-4 * edge, -S * 0.36, 8 * edge, S * 0.72); }
+  c.scale(Math.max(0.02, Math.abs(sx)), 1);
+  c.drawImage(spr.cnv, -S / 2, -S / 2, S, S);
+  c.restore();
+}
+function startFlip(i, to, side, delay) {
+  const tv = V.tiles[i];
+  if (!tv) return;
+  const from = tv.flip ? tv.flip.to : tv.face;
+  if (from === to) return;
+  tv.flip = { from, to, t0: Clock.t + (delay || 0), dur: 340, side: side || 1 };
+  if (tv.flip.t0 > Clock.t) { tv.face = from; }
+}
+function syncFaces(side) {
+  for (let i = 0; i < 12; i++) { const want = faceOf(G.st, i); const tv = V.tiles[i]; const cur = tv.flip ? tv.flip.to : tv.face; if (cur !== want) startFlip(i, want, side, 0); }
+}
+function tileTime(i) { return V.tiles[i] ? (V.tiles[i].flip ? V.tiles[i].flip.to : V.tiles[i].face) : 'day'; }
+function annexNight(c, x, y, rx, ry, time) {
+  if (time === 'day') return;
+  c.fillStyle = time === 'night' ? 'rgba(25,32,95,0.42)' : 'rgba(255,120,60,0.16)';
+  c.beginPath(); c.ellipse(x, y, rx, ry, 0, 0, TAU); c.fill();
+}
+function drawFieldTile(c, i) {
+  const t = GEO.tiles[i];
+  c.save(); c.translate(t.x, t.y); c.rotate(t.ang);
+  c.fillStyle = '#8a5a32'; rr(c, -30, -22, 60, 44, 12); c.fill();
+  c.strokeStyle = '#6b4325'; c.lineWidth = 3;
+  for (const yy of [-10, 2, 14]) { c.beginPath(); c.moveTo(-24, yy); c.quadraticCurveTo(0, yy - 4, 24, yy); c.stroke(); }
+  c.restore();
+  const ready = G.st.field.ready && !(V.radish && V.radish.st !== 'ready');
+  // sprouts: big leaves peek out when a radish is ready
+  const k = ready ? 1 : 0.45;
+  c.fillStyle = '#4fa34a';
+  const sw = Math.sin(Clock.t / 420) * 0.15 + (V.radish && V.radish.shake ? Math.sin(Clock.t / 30) * 0.3 * V.radish.shake : 0);
+  for (const [a, dx] of [[-0.5, -8], [0, 0], [0.5, 8]]) {
+    c.save(); c.translate(t.x + dx * 0.4, t.y - 2); c.rotate(a + sw); c.beginPath(); c.ellipse(0, -10 * k, 4.5 * k, 12 * k, 0, 0, TAU); c.fill(); c.restore();
+  }
+  // a small garden on the plaza side
+  const g = annex(i, 82);
+  c.fillStyle = '#7d5532'; c.beginPath(); c.ellipse(g.x, g.y, 30, 18, t.ang, 0, TAU); c.fill();
+  for (const [a, b] of [[-14, -3], [0, 4], [14, -2]]) { c.fillStyle = '#7cc463'; c.beginPath(); c.arc(g.x + a, g.y + b - 4, 7, 0, TAU); c.fill(); c.fillStyle = '#a5dd88'; c.beginPath(); c.arc(g.x + a - 1, g.y + b - 6, 3.5, 0, TAU); c.fill(); }
+  annexNight(c, g.x, g.y, 34, 22, tileTime(i));
+}
+function drawPond(c, i) {
+  const pf = pondFrame(i), time = tileTime(i), night = time === 'night';
+  c.save();
+  c.transform(pf.ux * pf.ru, pf.uy * pf.ru, pf.vx * pf.rv, pf.vy * pf.rv, pf.x, pf.y);
+  c.fillStyle = '#e9d3a2'; c.beginPath(); c.arc(0, 0, 1.2, 0, TAU); c.fill();
+  const wg = c.createRadialGradient(-0.3, -0.3, 0.1, 0, 0, 1.05);
+  wg.addColorStop(0, night ? '#3a4f9a' : '#8fd3f0'); wg.addColorStop(1, night ? '#1d2a66' : '#3d8fc6');
+  c.fillStyle = wg; c.beginPath(); c.arc(0, 0, 1, 0, TAU); c.fill();
+  c.restore();
+  // reeds and far-shore flowers
+  const f1 = pondPt(pf, 1.32, -0.5), f2 = pondPt(pf, 1.3, 0.5);
+  drawFlowers(c, f1.x, f1.y, 3, 61);
+  c.strokeStyle = '#4f8f45'; c.lineWidth = 3;
+  for (let k = -1; k <= 1; k++) { c.beginPath(); c.moveTo(f2.x + k * 5, f2.y + 6); c.quadraticCurveTo(f2.x + k * 7, f2.y - 8, f2.x + k * 4 + 2, f2.y - 18); c.stroke(); }
+  // glints / stars on the water
+  c.fillStyle = night ? 'rgba(230,236,255,0.7)' : 'rgba(255,255,255,0.65)';
+  for (let k = 0; k < 3; k++) { const p = pondPt(pf, -0.4 + k * 0.35, Math.sin(Clock.t / 900 + k) * 0.5); star4(c, p.x, p.y, 2.5 + Math.sin(Clock.t / 300 + k) * 1); }
+  // glowing ripples left by the firefly
+  for (const r of V.ripples) {
+    const p = pondPt(pf, r.u, r.v), ph = ((Clock.t - r.t0) / 1400) % 1;
+    for (let k = 0; k < 2; k++) {
+      const q = (ph + k * 0.5) % 1;
+      c.strokeStyle = `rgba(255,245,150,${0.75 * (1 - q)})`; c.lineWidth = 2.2;
+      c.beginPath(); c.ellipse(p.x, p.y, 6 + q * 18, (6 + q * 18) * 0.55, 0, 0, TAU); c.stroke();
+    }
+    c.fillStyle = 'rgba(255,250,190,0.9)'; c.beginPath(); c.ellipse(p.x, p.y, 4, 2.4, 0, 0, TAU); c.fill();
+  }
+  // stepping stones
+  for (const s of V.stones) {
+    if (s.form <= 0) continue;
+    const p = pondPt(pf, s.u, s.v), k = s.form, sk = s.sink;
+    c.globalAlpha = 1 - sk;
+    c.fillStyle = 'rgba(20,40,70,0.35)'; c.beginPath(); c.ellipse(p.x, p.y + 3, 15 * k, 9 * k, 0, 0, TAU); c.fill();
+    const g = c.createRadialGradient(p.x - 4, p.y - 4 - (1 - k) * 6, 1, p.x, p.y, 15);
+    g.addColorStop(0, '#ffffff'); g.addColorStop(0.35, '#d6dde8'); g.addColorStop(1, '#8e9bb3');
+    c.fillStyle = g; c.beginPath(); c.ellipse(p.x, p.y - (1 - k) * 4 + sk * 6, 13 * k, 8.5 * k, 0, 0, TAU); c.fill();
+    c.strokeStyle = 'rgba(60,70,100,0.4)'; c.lineWidth = 1.2; c.stroke();
+    c.globalAlpha = 1;
+  }
+  // the duck's nest
+  const n = pondPt(pf, NEST.u, NEST.v);
+  c.fillStyle = '#d9b46a'; c.beginPath(); c.ellipse(n.x, n.y, 17, 8, 0, 0, TAU); c.fill();
+  c.strokeStyle = '#b58f45'; c.lineWidth = 2; c.stroke();
+}
+function drawWell(c, i) {
+  const w = annex(i, 88), lit = V.well.glow;
+  shadow(c, w.x, w.y + 6, 30, 0.25);
+  c.fillStyle = '#9aa3ad'; c.beginPath(); c.ellipse(w.x, w.y, 26, 15, 0, 0, TAU); c.fill();
+  c.fillStyle = '#1c2236'; c.beginPath(); c.ellipse(w.x, w.y - 2, 17, 9, 0, 0, TAU); c.fill();
+  if (lit > 0) { const g = c.createRadialGradient(w.x, w.y - 2, 1, w.x, w.y - 2, 26); g.addColorStop(0, `rgba(255,240,160,${lit})`); g.addColorStop(1, 'rgba(255,240,160,0)'); c.fillStyle = g; c.beginPath(); c.arc(w.x, w.y - 2, 26, 0, TAU); c.fill(); }
+  c.fillStyle = '#b7bec7'; for (let k = 0; k < 8; k++) { const a = (k / 8) * TAU; c.beginPath(); c.ellipse(w.x + Math.cos(a) * 22, w.y + Math.sin(a) * 12, 6, 4, a, 0, TAU); c.fill(); }
+  c.fillStyle = '#7a5232'; c.fillRect(w.x - 24, w.y - 42, 5, 40); c.fillRect(w.x + 19, w.y - 42, 5, 40);
+  c.fillStyle = '#c4553f'; c.beginPath(); c.moveTo(w.x - 32, w.y - 38); c.lineTo(w.x, w.y - 56); c.lineTo(w.x + 32, w.y - 38); c.closePath(); c.fill();
+  glazeSpot(c, w.x - 10, w.y - 46, 8, 3, 0.5);
+  annexNight(c, w.x, w.y - 10, 34, 30, tileTime(i));
+}
+function drawBell(c, i) {
+  const b = annex(i, 36), sw = Math.sin(Clock.t / 140) * V.bell.swing;
+  c.fillStyle = '#7a5232'; c.fillRect(b.x - 22, b.y - 58, 4, 58); c.fillRect(b.x + 18, b.y - 58, 4, 58);
+  c.fillStyle = '#5f3f26'; rr(c, b.x - 26, b.y - 64, 52, 8, 3); c.fill();
+  c.save(); c.translate(b.x, b.y - 56); c.rotate(sw);
+  const g = c.createLinearGradient(-12, 0, 12, 0); g.addColorStop(0, '#e2a93a'); g.addColorStop(0.4, '#ffe08a'); g.addColorStop(1, '#b97f22');
+  c.fillStyle = g; c.beginPath(); c.moveTo(-6, 4); c.quadraticCurveTo(-8, 18, -14, 24); c.lineTo(14, 24); c.quadraticCurveTo(8, 18, 6, 4); c.quadraticCurveTo(0, 0, -6, 4); c.fill();
+  c.fillStyle = '#8a5a1a'; c.beginPath(); c.arc(0, 26, 3, 0, TAU); c.fill();
+  c.restore();
+  if (V.bell.ring > 0) {
+    c.strokeStyle = `rgba(255,230,140,${V.bell.ring})`; c.lineWidth = 2.5;
+    for (let k = 0; k < 2; k++) { const r = 20 + k * 12 + (1 - V.bell.ring) * 20; c.beginPath(); c.arc(b.x, b.y - 40, r, -2.6, -0.5); c.stroke(); }
+  }
+}
+// rainbow ceramic bridge (broken until the two meet)
+const SPAN = { N: [{ x: 500, y: 268 }, { x: 500, y: 154 }], W: [{ x: 440, y: 110 }, { x: 268, y: 160 }], E: [{ x: 560, y: 110 }, { x: 732, y: 160 }] };
+const RAINBOW = ['#ff6b6b', '#ffa94d', '#ffd43b', '#8ce99a', '#4dabf7', '#748ffc', '#da77f2'];
+function drawBridge(c) {
+  for (const d of ['N', 'W', 'E']) {
+    const [a, b] = SPAN[d], p = V.bridge[d], len = dist(a.x, a.y, b.x, b.y), ang = Math.atan2(b.y - a.y, b.x - a.x);
+    c.save(); c.translate(a.x, a.y); c.rotate(ang);
+    // pillars
+    for (const q of [0.33, 0.66]) { c.fillStyle = 'rgba(20,40,80,0.35)'; c.beginPath(); c.ellipse(len * q, 6, 9, 5, 0, 0, TAU); c.fill(); c.fillStyle = '#d8d0c0'; rr(c, len * q - 5, -6, 10, 14, 3); c.fill(); }
+    const n = Math.max(4, Math.round(len / 17)), pw = len / n;
+    for (let k = 0; k < n; k++) {
+      const q0 = k / n, built = q0 < p, stub = d === 'N' && (q0 < 0.18 || q0 > 0.84) || (d !== 'N' && (q0 < 0.12 || q0 > 0.88));
+      if (!built && !stub) continue;
+      c.fillStyle = built ? RAINBOW[k % RAINBOW.length] : '#cdbfa6';
+      const wob = built ? Math.sin(Clock.t / 300 + k) * V.bridgeGlow * 1.5 : 0;
+      rr(c, k * pw + 1, -13 + wob, pw - 2, 26, 4); c.fill();
+      if (built) { c.fillStyle = 'rgba(255,255,255,0.45)'; rr(c, k * pw + 3, -11 + wob, pw - 6, 7, 3); c.fill(); }
+    }
+    if (p <= 0 && d === 'N') { c.save(); c.translate(len * 0.5, 4); c.rotate(0.35 + Math.sin(Clock.t / 700) * 0.06); c.fillStyle = '#cdbfa6'; rr(c, -10, -9, 20, 18, 4); c.fill(); c.restore(); }
+    if (p > 0) {
+      c.strokeStyle = 'rgba(255,250,235,0.9)'; c.lineWidth = 3;
+      for (const sd of [-15, 15]) { c.beginPath(); c.moveTo(0, sd); c.lineTo(len * p, sd); c.stroke(); }
+      if (V.bridgeGlow > 0) { const gx = ((Clock.t / 900) % 1) * len * p; const g = c.createRadialGradient(gx, 0, 1, gx, 0, 30); g.addColorStop(0, `rgba(255,255,255,${0.6 * V.bridgeGlow})`); g.addColorStop(1, 'rgba(255,255,255,0)'); c.fillStyle = g; c.fillRect(gx - 30, -30, 60, 60); }
+    }
+    c.restore();
+  }
+}
+function drawPlaza(c) {
+  if (V.plaza <= 0) return;
+  const s = GEO.stage, k = E.outC(V.plaza);
+  c.save(); c.translate(s.x, s.y + 10); c.scale(k, k);
+  const g = c.createRadialGradient(0, 0, 20, 0, 0, 330);
+  g.addColorStop(0, '#fff1c4'); g.addColorStop(0.5, '#ffc46b'); g.addColorStop(0.85, '#f08a43'); g.addColorStop(1, 'rgba(240,138,67,0)');
+  c.fillStyle = g; c.beginPath(); c.ellipse(0, 0, 340, 290, 0, 0, TAU); c.fill();
+  c.fillStyle = 'rgba(255,250,220,0.35)';
+  for (let p = 0; p < 16; p++) { const a = (p / 16) * TAU + Clock.t / 9000; c.beginPath(); c.moveTo(0, 0); c.arc(0, 0, 320, a, a + 0.11); c.closePath(); c.fill(); }
+  c.strokeStyle = 'rgba(160,80,30,0.25)'; c.lineWidth = 3;
+  for (const r of [90, 150, 210, 270]) { c.beginPath(); c.ellipse(0, 0, r, r * 0.85, 0, 0, TAU); c.stroke(); }
+  c.restore();
+}
+function drawSeatGems(c) {
+  if (G.concertT < 0.5 || !V.stageGems) return;
+  for (let n = 0; n < V.stageGems; n++) {
+    const i = SEAT_TILES[n % SEAT_TILES.length], t = GEO.tiles[i], tv = V.tiles[i], row = Math.floor(n / SEAT_TILES.length);
+    drawGem(c, t.x + tv.dx - 22 + row * 14, t.y + tv.dy + 20, GEM_COLS[n % 5], 0.7);
+  }
+}
+function drawStage(c) {
+  const s = GEO.stage, k = 1 + E.outB(clamp(V.stageK, 0, 1)) * 0.8;
+  c.save(); c.translate(s.x, s.y); c.scale(k, k);
+  shadow(c, 0, 14, 66, 0.25);
+  c.fillStyle = '#c98f5a'; rr(c, -60, -6, 120, 22, 10); c.fill();
+  c.fillStyle = '#e8b27a'; c.fillRect(-60, 2, 120, 4);
+  const g = c.createRadialGradient(-16, -14, 4, 0, -6, 64);
+  g.addColorStop(0, '#fff6e2'); g.addColorStop(0.6, '#f3d9b0'); g.addColorStop(1, '#d9b07a');
+  c.fillStyle = g; c.beginPath(); c.ellipse(0, -6, 60, 24, 0, 0, TAU); c.fill();
+  c.strokeStyle = 'rgba(140,90,40,0.4)'; c.lineWidth = 2; c.stroke();
+  c.strokeStyle = 'rgba(230,140,80,0.5)'; c.lineWidth = 3; c.beginPath(); c.ellipse(0, -6, 38, 14, 0, 0, TAU); c.stroke();
+  for (let i = 0; i < Math.min(15, V.stageGems); i++) {
+    const a = -Math.PI / 2 + (i * TAU) / 15;
+    drawGem(c, Math.cos(a) * 49, -6 + Math.sin(a) * 18, GEM_COLS[i % 5], 0.8);
+  }
+  glazeSpot(c, -22, -16, 18, 6, 0.55);
+  c.restore();
+}
+function drawFootprints(c) {
+  for (const f of FOOT) {
+    const age = (Clock.t - f.t0) / 5200, a = Math.max(0, 1 - age) * 0.9;
+    if (a <= 0) continue;
+    const col = f.who === 'mole' ? '255,214,110' : '214,255,140';
+    c.save(); c.translate(f.x, f.y); c.rotate(f.ang);
+    c.fillStyle = `rgba(${col},${a * 0.35})`; c.beginPath(); c.ellipse(0, 0, 16, 11, 0, 0, TAU); c.fill();
+    c.fillStyle = `rgba(${col},${a})`;
+    for (const s of [-1, 1]) { c.beginPath(); c.ellipse(s * 2, s * 6, 4.5, 3.2, 0, 0, TAU); c.fill(); }
+    c.restore();
+  }
+}
+function drawNoteShape(c, x, y, s) {
+  c.beginPath(); c.ellipse(x, y, 4 * s, 3 * s, -0.4, 0, TAU); c.fill();
+  c.fillRect(x + 3 * s, y - 13 * s, 1.6 * s, 13 * s);
+  c.beginPath(); c.moveTo(x + 4.6 * s, y - 13 * s); c.quadraticCurveTo(x + 10 * s, y - 10 * s, x + 8 * s, y - 5 * s); c.lineTo(x + 4.6 * s, y - 9 * s); c.fill();
+}
+function drawParticles(c) {
+  for (const p of PART) {
+    const a = 1 - p.t / p.life;
+    c.globalAlpha = Math.max(0, Math.min(1, a * 1.4));
+    c.fillStyle = p.color;
+    if (p.kind === 'star') { c.save(); c.translate(p.x, p.y); c.rotate(p.rot); star4(c, 0, 0, p.size * (0.6 + a * 0.4)); c.restore(); }
+    else if (p.kind === 'shard') { c.save(); c.translate(p.x, p.y); c.rotate(p.rot); c.beginPath(); c.moveTo(-p.size / 2, -p.size / 3); c.lineTo(p.size / 2, -p.size / 2); c.lineTo(p.size / 3, p.size / 2); c.closePath(); c.fill(); c.restore(); }
+    else if (p.kind === 'note') drawNoteShape(c, p.x, p.y, p.size / 8);
+    else { c.beginPath(); c.arc(p.x, p.y, p.size * 0.5, 0, TAU); c.fill(); }
+  }
+  c.globalAlpha = 1;
+}
+function drawLantern(c, i) {
+  const lv = V.lanterns[i];
+  if (!lv || !lv.ready) return;
+  const p = lanternPos(i), sw = Math.sin(Clock.t / 500 + i) * 0.1;
+  c.save(); c.translate(p.x, p.y); c.rotate(sw); c.scale(0.5 * lv.k, 0.5 * lv.k);
+  drawRadish(c, 0, 26, 1, 1, 0);
+  c.restore();
+}
+function drawWorld(c) {
+  const st = G.st, L = V.layShown;
+  if (Cache.island) c.drawImage(Cache.island, CONTENT.x, CONTENT.y, CONTENT.w, CONTENT.h);
+  drawPlaza(c);
+  drawHalos(c);
+  drawBridge(c);
+  c.globalAlpha = V.annexA;
+  drawPond(c, L.pond);
+  c.globalAlpha = 1;
+  drawStage(c);
+  for (let i = 0; i < GEO.tiles.length; i++) drawTile(c, i);
+  drawSeatGems(c);
+  if (V.annexA > 0.01 && !V.tiles[L.field].flip && G.concertT < 0.05) { c.globalAlpha = V.annexA; drawFieldTile(c, L.field); c.globalAlpha = 1; }
+  drawFootprints(c);
+  const ents = [];
+  const add = (y, fn) => ents.push({ y, fn });
+  add(V.mole.y, () => drawMole(c, V.mole));
+  add(V.fly.y + 2, () => drawFirefly(c, V.fly));
+  for (const r of V.residents) add(r.y, () => drawResident(c, r));
+  if (V.duck) add(V.duck.y, () => drawDuck(c, V.duck));
+  for (const b of V.birds) if (!b.fly) add(b.road ? b.y : GEO.tree.y + 1 + b.y * 0.0001, () => drawBird(c, b));
+  add(GEO.tree.y, () => drawTree(c, GEO.tree.x, GEO.tree.y));
+  if (V.annexA > 0.01) {
+    const bt = annex(L.bell, 36), wt = annex(L.well, 88);
+    add(bt.y, () => { c.globalAlpha = V.annexA; drawBell(c, L.bell); c.globalAlpha = 1; });
+    add(wt.y, () => { c.globalAlpha = V.annexA; drawWell(c, L.well); c.globalAlpha = 1; });
+  }
+  if (V.radish && V.radish.st !== 'ready') add(V.radish.y, () => drawRadish(c, V.radish.x, V.radish.y, V.radish.k, V.radish.lantern || 0, 0));
+  st.lanterns.forEach((l, i) => { if (l.h === 'tile' || l.h === 'stage') { const p = lanternPos(i); add(p.y + 30, () => drawLantern(c, i)); } });
+  for (const ch of V.chests) add(ch.y + 60, () => drawChest(c, ch.x, ch.y, ch.lid, ch.k));
+  for (const g of V.gems) if (g.state === 'loose' || g.state === 'fly') add(g.y, () => drawGem(c, g.x, g.y - (g.h || 0), g.col, 1.1));
+  ents.sort((a, b) => a.y - b.y);
+  for (const e of ents) e.fn();
+  st.lanterns.forEach((l, i) => { if (l.h === 'mole' || l.h === 'fly' || (V.lanterns[i] && V.lanterns[i].fly)) drawLantern(c, i); });
+  drawParticles(c);
+  for (const b of V.birds) if (b.fly) drawBird(c, b);
+}
+// ---- screen-space UI: the two dice and the demo hand
+const PIP_POS = { 1: [[0, 0]], 2: [[-0.22, -0.2], [0.22, 0.2]], 3: [[-0.25, -0.25], [0, 0], [0.25, 0.25]] };
+function drawDice(c) {
+  const ds = VIEW.dieSize;
+  for (const k of ['sun', 'moon']) {
+    const P = VIEW.dice[k], dv = V.dice[k], spr = Cache.dice[k];
+    if (!spr) continue;
+    const isT = G.target === k && !G.concert;
+    if (isT || dv.glow > 0.01) {
+      const pulse = 0.6 + Math.sin(Clock.t / 240) * 0.3, a = Math.max(isT ? pulse : 0, dv.glow);
+      const col = k === 'sun' ? '255,214,100' : '170,205,255';
+      const g = c.createRadialGradient(P.x, P.y, ds * 0.25, P.x, P.y, ds * 0.92);
+      g.addColorStop(0, `rgba(${col},${0.85 * a})`); g.addColorStop(0.6, `rgba(${col},${0.35 * a})`); g.addColorStop(1, `rgba(${col},0)`);
+      c.fillStyle = g; c.beginPath(); c.arc(P.x, P.y, ds * 0.92, 0, TAU); c.fill();
+      if (isT) {
+        const rr0 = ds * (0.66 + ((Clock.t % 1400) / 1400) * 0.22);
+        c.strokeStyle = `rgba(255,255,240,${0.75 * (1 - (Clock.t % 1400) / 1400)})`; c.lineWidth = Math.max(3, ds * 0.035);
+        c.beginPath(); c.arc(P.x, P.y + ds * 0.02, rr0, 0, TAU); c.stroke();
+      }
+    }
+    const bottom = P.y + ds * 0.42;
+    c.save();
+    c.translate(P.x, bottom - dv.hop * ds * 0.14);
+    c.scale(1 / dv.sq, dv.sq);
+    c.translate(0, -ds * 0.42);
+    c.drawImage(spr.cnv, -spr.S / 2, -spr.S / 2, spr.S, spr.S);
+    if (dv.pips > 0) {
+      const f = spr.face, cx0 = f.x + f.f / 2, cy0 = f.y + f.f / 2;
+      c.fillStyle = k === 'sun' ? 'rgba(255,210,110,0.92)' : 'rgba(120,150,225,0.92)';
+      rr(c, f.x + f.f * 0.12, f.y + f.f * 0.12, f.f * 0.76, f.f * 0.76, f.f * 0.2); c.fill();
+      PIP_POS[dv.pips].forEach(([px, py], idx) => {
+        const lit = idx < dv.pipsLeft, x = cx0 + px * f.f, y = cy0 + py * f.f, r = f.f * 0.1;
+        c.fillStyle = lit ? (k === 'sun' ? '#fffbe6' : '#ffffff') : 'rgba(255,255,255,0.3)';
+        if (k === 'sun') { c.beginPath(); c.arc(x, y, r, 0, TAU); c.fill(); if (lit) for (let q = 0; q < 6; q++) { const a = (q / 6) * TAU; c.beginPath(); c.arc(x + Math.cos(a) * r * 1.5, y + Math.sin(a) * r * 1.5, r * 0.28, 0, TAU); c.fill(); } }
+        else star4(c, x, y, r * 1.5);
+      });
+    }
+    c.restore();
+  }
+}
+function drawHand(c) {
+  const h = G.hand;
+  if (!h) return;
+  c.save(); c.globalAlpha = h.a * 0.75; c.translate(h.x, h.y); c.scale(h.s, h.s); c.rotate(-0.35);
+  c.fillStyle = '#ffffff'; c.strokeStyle = 'rgba(80,90,120,0.6)'; c.lineWidth = 2.2;
+  c.beginPath(); c.moveTo(-6, 0); c.quadraticCurveTo(-7, -2, -7, 8); c.lineTo(-7, 34); c.quadraticCurveTo(-24, 30, -20, 44); c.quadraticCurveTo(-8, 66, 10, 72);
+  c.quadraticCurveTo(34, 72, 36, 50); c.lineTo(36, 34); c.quadraticCurveTo(36, 26, 28, 27); c.quadraticCurveTo(26, 20, 18, 22); c.quadraticCurveTo(16, 15, 8, 18);
+  c.lineTo(7, 4); c.quadraticCurveTo(7, -6, -6, 0); c.closePath(); c.fill(); c.stroke();
+  c.restore();
+}
+
+// ================================================================ turns: tap -> rules.step -> animated playback
+const SPART = [];   // screen-space sparkles around the dice
+function screenSparkle(x, y, n, col) {
+  for (let k = 0; k < n; k++) {
+    if (SPART.length > 40) SPART.shift();
+    const a = rand(0, TAU), sp = rand(60, 220);
+    SPART.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 60, t: 0, life: rand(0.35, 0.7), size: rand(4, 8), col: col || pick(['#fff3c4', '#ffd76a', '#ffffff']) });
+  }
+}
+const until = async (fn, maxMs) => { const t0 = Clock.t; while (!fn() && Clock.t - t0 < (maxMs || 3000)) await wait(40); };
+const speed = () => (G.queue.length ? 1.8 : 1);
+function markSave() { G.saveDue = true; }
+function pressDie(die) {
+  const dv = V.dice[die], P = VIEW.dice[die];
+  dv.sq = 0.74; dv.v = 0; dv.press = 1;
+  Snd.diePress(die);
+  screenSparkle(P.x, P.y - VIEW.dieSize * 0.2, 8, die === 'sun' ? null : '#dfe8ff');
+  G.idle = 0; G.demoDone = false; G.gazeDone = false; G.hand = null;
+  if (G.concert) { concertDance(die); return; }
+  if (G.queue.length >= 2) return;
+  G.queue.push(die);
+  pumpTurns();
+}
+function pumpTurns() {
+  if (G.busy || !G.queue.length || G.concert) return;
+  const die = G.queue.shift();
+  G.busy = true;
+  run(async () => {
+    try { await playTurn(die); }
+    finally { G.busy = false; afterTurn(); pumpTurns(); }
+  });
+}
+function terrainAt(i) {
+  const L = G.st.lay;
+  return i === L.pond ? 'water' : i === L.field ? 'field' : i === L.bell ? 'bell' : i === L.well ? 'well' : 'plain';
+}
+function melodyNote(die, tile) {
+  const m = G.mel;
+  if (Clock.t - m.t > 2300) m.step = 0;
+  m.step += m.die && m.die !== die ? 2 : 1;
+  if (m.step > 11) m.step = 4 + (m.step % 5);
+  m.t = Clock.t; m.die = die;
+  return Snd.degree(faceOf(G.st, tile), m.step);
+}
+function panOf(x) { const p = worldToScreen(x, 0); return clamp((p.x / VIEW.W) * 2 - 1, -0.8, 0.8); }
+async function hopPiece(pc, to, dur, die) {
+  const ax = pc.x, ay = pc.y;
+  pc.anim = true; pc.tile = to;
+  const b = restPos(pc.kind);
+  if (Math.abs(b.x - ax) > 2) pc.face = b.x > ax ? 1 : -1;
+  footprint(ax, ay, Math.atan2(b.y - ay, b.x - ax) + Math.PI / 2, pc.kind);
+  Snd.hop(melodyNote(die, to), terrainAt(to), panOf(b.x));
+  pc.sq = 0.84;
+  await tween(dur, (e, t) => {
+    pc.x = lerp(ax, b.x, e); pc.y = lerp(ay, b.y, e);
+    pc.hy = Math.sin(t * Math.PI) * 42;
+  }, E.ioS);
+  pc.hy = 0; pc.sq = 0.76; pc.anim = false;
+  sparkle(b.x, b.y - 6, 5, { min: 30, max: 110, up: 60, size: 0.7, color: pc.kind === 'mole' ? null : '#e8ffb0' });
+  Snd.land(panOf(b.x));
+}
+function flipBoundary(die) {
+  syncFaces(die === 'sun' ? 1 : -1);
+  Snd.flip();
+  const t = tileXY(G.st.s);
+  sparkle(t.x, t.y, 6, { color: '#ffb067', min: 20, max: 90, up: 50, size: 0.8 });
+}
+async function playTurn(die) {
+  const st0 = G.st;
+  const roll = DBG.forceRoll || Rules.chooseRoll(st0, die, Math.random);
+  const res = Rules.step(st0, die, roll), ev = res.ev;
+  G.st = res.st; markSave();
+  const who = die === 'sun' ? 'mole' : 'fly', pc = V[who], dv = V.dice[die];
+  dv.pips = roll; dv.pipsLeft = roll; dv.pipT = Clock.t;
+  if (ev[0].k === 'shift') flipBoundary(die);
+  else { const tv = V.tiles[G.st.s]; tv.wob = 1; Snd.tick(500); }
+  await until(() => !pc.scene, 2600);
+  const mv = ev.find(e => e.k === 'move');
+  pc.idleAct = 0;
+  for (let k = 0; k < mv.hops.length; k++) {
+    const h = mv.hops[k];
+    await hopPiece(pc, h.to, 230 / speed(), die);
+    dv.pipsLeft = Math.max(0, roll - 1 - k);
+    for (const x of h.ev) {
+      if (x.k === 'ripple') rippleFx(x);
+      else if (x.k === 'pickup') pickupFx(x);
+    }
+  }
+  dv.pipsLeft = 0;
+  for (const e of ev) {
+    if (e.k === 'pass') passFx();
+    else if (e.k === 'radish') await radishScene(e);
+    else if (e.k === 'lantern') run(() => lanternScene(e));
+    else if (e.k === 'sprout') sproutFx();
+    else if (e.k === 'stones') run(() => stonesScene(e));
+    else if (e.k === 'bellDing') bellDing();
+    else if (e.k === 'chorus') run(() => chorusScene(e));
+    else if (e.k === 'treasure') await treasureScene(e);
+    else if (e.k === 'meet') await meetScene(e);
+    else if (e.k === 'concert') run(() => concertScene(e));
+  }
+  if (!G.concert) { if (!V.mole.scene) V.mole.tile = G.st.mole.i; if (!V.fly.scene) V.fly.tile = G.st.fly.i; }
+}
+function afterTurn() {
+  updateTarget();
+  bellModeMusic();
+}
+// ---------------------------------------------------------------- small reactions
+function passFx() {
+  for (const p of [V.mole, V.fly]) { p.turnBack = 1; p.wide = 0.6; }
+  Snd.squeak(1200);
+}
+function rippleFx(x) {
+  V.ripples.push({ u: x.u, v: x.v, t0: Clock.t });
+  const pf = pondFrame(G.st.lay.pond), p = pondPt(pf, x.u, x.v);
+  Snd.ripple();
+  sparkle(p.x, p.y, 6, { color: '#fff6a8', min: 10, max: 60, up: 20, g: 20, size: 0.7 });
+}
+function pickupFx(x) {
+  const pc = V[x.who];
+  pc.spin = 0.01; pc.proud = 1;
+  Snd.chime(Snd.mtof(84));
+  sparkle(pc.x, pc.y - 30, 10, { color: '#fff1a0' });
+}
+function sproutFx() {
+  V.radish = { st: 'ready', k: 1 };
+  const t = tileXY(G.st.lay.field);
+  sparkle(t.x, t.y - 10, 6, { color: '#a8f08c', min: 20, max: 70 });
+}
+function bellDing() {
+  V.bell.swing = Math.max(V.bell.swing, 0.25); V.bell.ring = 0.5;
+  Snd.bell(Snd.mtof(81), 0.035, 1.2);
+}
+// ---------------------------------------------------------------- discovery scenes
+function dirt(x, y, n) { shards(x, y, n, ['#8a5a32', '#a97b4c', '#6b4325', '#c49a6c']); }
+async function radishScene(e) {
+  const m = V.mole, ft0 = tileXY(e.at), ft = { x: ft0.x + ft0.tx * 26 + ft0.nx * 10, y: ft0.y + ft0.ty * 26 + ft0.ny * 10 };
+  m.scene = true;
+  V.radish = { st: 'pop', x: ft.x, y: ft.y + 4, k: 0.25, lantern: 0, shake: 1 };
+  const mb = { x: ft0.x - ft0.tx * 16, y: ft0.y - ft0.ty * 16 + 6 }, ma = { x: m.x, y: m.y };
+  run(() => tween(200, (k) => { m.x = lerp(ma.x, mb.x, k); m.y = lerp(ma.y, mb.y, k); }));
+  Snd.dig(); dirt(ft.x, ft.y, 5);
+  await wait(300);
+  Snd.pop();
+  V.radish.shake = 0;
+  dirt(ft.x, ft.y, 10);
+  sparkle(ft.x, ft.y - 30, 14);
+  await tween(440, (k) => { V.radish.k = lerp(0.25, 1.15, k); V.radish.y = ft.y + 4 - Math.sin(k * Math.PI) * 54; }, E.outC);
+  m.sit = 1; m.wide = 1.4; m.face = V.radish.x >= m.x ? 1 : -1;
+  Snd.boing();
+  await wait(560);
+  await tween(220, (k) => { m.sit = 1 - k; });
+  m.carry = 'radish'; V.radish.st = 'carried'; m.proud = 1;
+  Snd.chime(Snd.mtof(79), 0, 0.05);
+  for (let i = e.at + 1; i <= e.stand; i++) await hopPiece(m, i, 270, 'sun');
+  const pt = tileXY(e.place), a = { x: V.radish.x, y: V.radish.y }, b = { x: pt.x + pt.nx * 16, y: pt.y + pt.ny * 16 + 10 };
+  V.radish.st = 'placing';
+  await tween(380, (k) => { V.radish.x = lerp(a.x, b.x, k); V.radish.y = lerp(a.y, b.y, k) - Math.sin(k * Math.PI) * 30; V.radish.k = lerp(0.62, 0.66, k); }, E.ioS);
+  V.radish.st = 'placed'; V.radish.t = e.place; m.carry = null; m.proud = 1.6;
+  Snd.thud();
+  sparkle(b.x, b.y - 10, 8, { color: '#ffcf8a' });
+  m.scene = false;
+}
+async function lanternScene(e) {
+  const f = V.fly, lv = mkLanternV(e.idx);
+  lv.ready = false; V.lanterns[e.idx] = lv;
+  await until(() => !f.scene && !f.anim, 3000);
+  f.scene = true;
+  const pt = tileXY(e.t), rx = V.radish ? V.radish.x : pt.x, ry = V.radish ? V.radish.y : pt.y;
+  const ax = f.x, ay = f.y;
+  f.pulse = 1; Snd.sing(Snd.mtof(76), 0.6);
+  await tween(620, (k) => { f.x = lerp(ax, rx, k); f.y = lerp(ay, ry - 6, k); }, E.ioS);
+  await tween(260, (k) => { f.dive = k; });
+  Snd.glow();
+  await tween(950, (k) => { if (V.radish) V.radish.lantern = k; }, E.ioS);
+  sparkle(rx, ry - 30, 16, { color: '#fff3a0' });
+  V.radish = null; lv.ready = true; lv.k = 0;
+  run(() => tween(420, (k) => { lv.k = k; }, E.outB));
+  await tween(260, (k) => { f.dive = 1 - k; });
+  f.tile = G.st.fly.i;
+  const b = restPos('fly'), cx0 = f.x, cy0 = f.y;
+  await tween(560, (k) => { f.x = lerp(cx0, b.x, k); f.y = lerp(cy0, b.y, k); }, E.ioS);
+  f.scene = false;
+}
+async function stonesScene(e) {
+  const pf = pondFrame(V.layShown.pond);
+  for (const sk of e.sunk) {
+    const s = V.stones.find(o => o.u === sk.u && o.v === sk.v && !o.sinking);
+    if (s) { s.sinking = true; run(async () => { await tween(800, (k) => { s.sink = k; }); const i = V.stones.indexOf(s); if (i >= 0) V.stones.splice(i, 1); }); }
+  }
+  let n = 0;
+  for (const a of e.added) {
+    const ri = V.ripples.findIndex(r => r.u === a.u && r.v === a.v);
+    if (ri >= 0) V.ripples.splice(ri, 1);
+    const s = { u: a.u, v: a.v, form: 0, sink: 0 };
+    V.stones.push(s);
+    const p = pondPt(pf, a.u, a.v);
+    Snd.stone(n++);
+    sparkle(p.x, p.y, 7, { color: '#ffffff', min: 20, max: 80, size: 0.7 });
+    await tween(400, (k) => { s.form = k; }, E.outB);
+  }
+  if (V.duck) V.duck.wait = 300;
+}
+async function chorusScene(e) {
+  const L = G.st.lay, b = annex(L.bell, 36), f = V.fly;
+  V.bell.swing = 0.9; V.bell.ring = 1;
+  const seq = [0, 2, 4, 7];
+  for (let k = 0; k < seq.length; k++) {
+    Snd.bell(Snd.degree('day', seq[k] + 5), 0.07, 2.2);
+    V.bell.ring = 1;
+    spawn({ kind: 'note', x: b.x, y: b.y - 60, vx: rand(-30, 30), vy: -60, g: -10, life: 1.6, size: 10, color: '#ffd76a', rot: 0, vr: 0, drag: 0.5 });
+    await wait(340);
+    f.pulse = 1;
+    Snd.sing(Snd.degree('night', seq[k] + 5), 0.55);
+    spawn({ kind: 'note', x: f.x, y: f.y - 60, vx: rand(-30, 30), vy: -50, g: -10, life: 1.6, size: 10, color: '#e8ffb0', rot: 0, vr: 0, drag: 0.5 });
+    await wait(340);
+  }
+  for (const r of V.residents) { r.inst = true; r.task = null; r.path = []; }
+  bellModeMusic();
+}
+async function treasureScene(e) {
+  const m = V.mole, w = annex(e.well, 88);
+  await until(() => !m.scene && !m.anim, 3000);
+  m.scene = true;
+  Snd.chime(Snd.mtof(88), 0, 0.06);
+  run(() => tween(900, (k) => { V.well.glow = k; }));
+  sparkle(w.x, w.y - 10, 10, { color: '#fff3a0', up: 10, g: -40 });
+  await wait(450);
+  const a = { x: m.x, y: m.y };
+  m.tile = e.well;
+  const b = restPos('mole');
+  if (dist(a.x, a.y, b.x, b.y) > 12) {
+    Snd.dig(); dirt(a.x, a.y, 6);
+    await tween(300, (k) => { m.under = k; });
+    await tween(Math.min(1100, 250 + dist(a.x, a.y, b.x, b.y) * 1.4), (k) => { m.x = lerp(a.x, b.x, k); m.y = lerp(a.y, b.y, k); if (Math.random() < 0.15) dirt(m.x, m.y, 1); }, E.ioS);
+    await tween(280, (k) => { m.under = 1 - k; });
+  }
+  m.face = w.x > m.x ? 1 : -1;
+  Snd.dig(); dirt(w.x, w.y, 8);
+  m.scene = false;
+  run(async () => {
+    const ch = { x: w.x, y: w.y + 8, lid: 0, k: 0.3 };
+    V.chests.push(ch);
+    Snd.creak();
+    await tween(1150, (k) => { ch.k = lerp(0.3, 1, k); ch.y = w.y + 8 - k * 34 + Math.sin(k * 40) * 1.5; }, E.outC);
+    await tween(420, (k) => { ch.lid = k; }, E.outB);
+    Snd.sparkle();
+    sparkle(ch.x, ch.y - 24, 14, { color: '#fff6c4' });
+    for (let g = 0; g < e.gems; g++) {
+      V.gems.push({ x: ch.x, y: ch.y - 18, gy: w.y + rand(18, 46), vx: rand(-110, 110), vy: rand(-260, -160), h: 0, state: 'fly', col: GEM_COLS[(V.stageGems + V.gems.length) % 5] });
+    }
+    await wait(5200);
+    await tween(700, (k) => { ch.k = 1 - k; });
+    const i = V.chests.indexOf(ch); if (i >= 0) V.chests.splice(i, 1);
+    if (!V.chests.length) await tween(1400, (k) => { V.well.glow = Math.min(V.well.glow, 1 - k); });
+  });
+}
+async function meetScene(e) {
+  const m = V.mole, f = V.fly;
+  await until(() => !m.anim && !f.anim && !m.scene && !f.scene, 2500);
+  m.face = f.x >= m.x ? 1 : -1; f.face = -m.face;
+  m.lean = 1; f.lean = 1;
+  V.link = { k: 0 };
+  run(() => tween(260, (k) => { if (V.link) V.link.k = k; }));
+  Snd.chime(Snd.mtof(76), 0, 0.06); Snd.chime(Snd.mtof(83), 0.14, 0.05);
+  await wait(500 / speed());
+  const mid = { x: (m.x + f.x) / 2, y: (m.y + f.y) / 2 - 34 };
+  sparkle(mid.x, mid.y, 12, { color: '#fff7c9' });
+  run(() => lightBeam(mid, e));
+  m.spin = 0.01; f.spin = 0.01;
+  if (e.key === 'dawn') birdsSing();
+  await wait(420 / speed());
+  m.lean = 0; f.lean = 0;
+  run(async () => { await tween(500, (k) => { if (V.link) V.link.k = 1 - k; }); V.link = null; });
+}
+async function lightBeam(from, e) {
+  const target = e.ext ? SPAN[e.ext][0] : SPAN.N[0];
+  const orb = { x: from.x, y: from.y };
+  V.orbs.push(orb);
+  Snd.whoosh(0.8);
+  await tween(950, (k) => {
+    orb.x = lerp(from.x, target.x, k); orb.y = lerp(from.y, target.y, k) - Math.sin(k * Math.PI) * 120;
+    if (Math.random() < 0.6) spawn({ kind: 'star', x: orb.x, y: orb.y, vx: rand(-20, 20), vy: rand(-20, 20), g: 0, life: 0.6, size: 6, color: pick(RAINBOW), rot: 0, vr: 3, drag: 1 });
+  }, E.ioS);
+  V.orbs.splice(V.orbs.indexOf(orb), 1);
+  V.bridgeGlow = 1;
+  if (e.ext) {
+    let last = -1;
+    await tween(1800, (k) => { V.bridge[e.ext] = k; const n = Math.floor(k * 8); if (n > last) { last = n; Snd.bridge(n + 2); } }, E.ioS);
+    V.bridge[e.ext] = 1;
+    const end = SPAN[e.ext][1];
+    sparkle(end.x, end.y, 14, { color: pick(RAINBOW) });
+    residentsTo(e.ext === 'N' ? 'N' : e.ext);
+  } else if (e.fresh) {
+    Snd.glow();
+    const built = G.st.bridgeDirs.filter(d => d !== G.resDest);
+    residentsTo(built.length ? pick(built) : G.resDest || 'N');
+  } else Snd.chime(Snd.mtof(84), 0, 0.04);
+}
+// the child hands a lantern to a piece (by tap or drag)
+function giveLanternTo(idx, who) {
+  const p0 = lanternPos(idx), res = Rules.giveLantern(G.st, idx, who);
+  G.st = res.st; markSave();
+  const lv = V.lanterns[idx] || (V.lanterns[idx] = mkLanternV(idx));
+  lv.fly = { x: p0.x, y: p0.y };
+  lv.x = p0.x; lv.y = p0.y;
+  const to = G.st.lanterns[idx].h;
+  run(async () => {
+    await tween(460, (k) => { lv.fly = null; const q = lanternPos(idx); lv.fly = { x: lerp(p0.x, q.x, k), y: lerp(p0.y, q.y, k) - Math.sin(k * Math.PI) * 50 }; lv.x = lv.fly.x; lv.y = lv.fly.y; }, E.ioS);
+    lv.fly = null;
+    if (to === 'mole' || to === 'fly') { const pc = V[to]; pc.spin = 0.01; pc.proud = 1.3; pc.wide = 0.5; sparkle(pc.x, pc.y - 36, 12, { color: '#fff1a0' }); }
+    Snd.chime(Snd.mtof(84), 0, 0.06); Snd.chime(Snd.mtof(88), 0.1, 0.04);
+    for (const e of res.ev) if (e.k === 'treasure') await treasureScene(e);
+    updateTarget();
+  });
+}
+function dropLanternAt(idx, tile) {
+  const res = Rules.dropLantern(G.st, idx, tile);
+  G.st = res.st; markSave();
+  const lv = V.lanterns[idx]; if (lv) lv.fly = null;
+  const t = tileXY(tile);
+  Snd.thud(); sparkle(t.x, t.y - 10, 6, { color: '#fff1a0' });
+  run(async () => { for (const e of res.ev) if (e.k === 'treasure') await treasureScene(e); updateTarget(); });
+}
+// ---------------------------------------------------------------- the island turns into an open-air concert
+function concertLayout() {
+  const T = [], s = GEO.stage;
+  const arch = [3, 4, 5, 6, 7, 8], seats = [0, 1, 2, 9, 10, 11];
+  arch.forEach((i, n) => { const a = Math.PI * (1.1 + (n / 5) * 0.8); T[i] = { x: s.x + Math.cos(a) * 168, y: s.y - 34 + Math.sin(a) * 118, ang: a + Math.PI / 2, sc: 0.72 }; });
+  seats.forEach((i, n) => { const a = Math.PI * (0.86 - (n / 5) * 0.72); T[i] = { x: s.x + Math.cos(a) * 210, y: s.y + 40 + Math.sin(a) * 120, ang: 0, sc: 0.66 }; });
+  return T;
+}
+const SEAT_TILES = [1, 2, 9, 10, 0, 11];
+function seatPos(n) {
+  const i = SEAT_TILES[n % SEAT_TILES.length], t = GEO.tiles[i], tv = V.tiles[i];
+  return { x: t.x + tv.dx, y: t.y + tv.dy + 4 };
+}
+async function concertScene(e) {
+  G.concert = true; G.queue.length = 0;
+  await wait(2800);
+  await until(() => !V.mole.scene && !V.fly.scene && !V.mole.anim && !V.fly.anim, 3500);
+  for (const r of V.residents) {
+    const T = r.task;
+    if (T && T.phase === 1) { const i = V.gems.indexOf(T.gem); if (i >= 0) V.gems.splice(i, 1); V.stageGems = Math.min(G.st.gems, V.stageGems + 1); }
+    else if (T) T.gem.claimed = false;
+    r.carry = null;
+  }
+  const fy0 = CAM.fy;
+  Snd.rumble();
+  run(() => tween(1400, (k) => { CAM.shake = Math.sin(k * Math.PI) * 2.4; }));
+  for (const r of V.residents) { r.task = null; r.path = []; r.mode = 'concert'; }
+  await wait(900);
+  const order = [...Array(12).keys()].sort((a, b) => Math.abs(a - 5.5) - Math.abs(b - 5.5));
+  order.forEach((i, n) => { startFlip(i, 'back', i < 6 ? -1 : 1, n * 90); run(async () => { await wait(n * 90); Snd.flip(); }); });
+  run(() => tween(1400, (k) => { G.concertT = k; }));
+  run(() => tween(1900, (k) => { V.plaza = k; }, E.outC));
+  run(() => tween(1300, (k) => { V.annexA = 1 - k; }));
+  Snd.whoosh(1.4);
+  await wait(1150);
+  run(() => tween(1900, (k) => { CAM.zoom = lerp(1, 0.86, k); CAM.fy = lerp(fy0, GEO.stage.y - 70, k); }, E.ioS));
+  run(() => tween(1500, (k) => { V.stageK = Math.max(V.stageK, k); }, E.outB));
+  const T = concertLayout();
+  await tween(1500, (k) => {
+    for (let i = 0; i < 12; i++) {
+      const t = GEO.tiles[i], g = T[i], tv = V.tiles[i];
+      tv.dx = (g.x - t.x) * k; tv.dy = (g.y - t.y) * k; tv.dang = (g.ang - t.ang) * k; tv.sc = lerp(1, g.sc, k);
+    }
+  }, E.ioC);
+  // seats and costumes sparkle with the gems the residents carried to the stage
+  V.residents.forEach((r, n) => { r.gemHat = V.stageGems >= (n + 1) * 2 ? GEM_COLS[n % 5] : null; r.path = [seatPos(n)]; r.inst = true; });
+  if (V.duck) { V.duck.concert = G.st.stones.length > 0; V.duck.wait = 0; }
+  const m = V.mole, f = V.fly, s = GEO.stage;
+  m.scene = f.scene = true;
+  const ma = { x: m.x, y: m.y }, fa = { x: f.x, y: f.y };
+  await tween(800, (k) => { m.x = lerp(ma.x, s.x - 34, k); m.y = lerp(ma.y, s.y - 8, k); m.hy = Math.sin(k * Math.PI) * 60; f.x = lerp(fa.x, s.x + 34, k); f.y = lerp(fa.y, s.y - 8, k); }, E.ioS);
+  m.hy = 0;
+  const L = G.st;
+  Snd.setMusic({ concert: true, layers: { bell: L.bellAwake, firefly: true, duck: !!(V.duck && V.duck.concert), gems: V.stageGems, rabbit: true, frog: true } });
+  const t0 = Clock.t;
+  let n = 0;
+  while (Clock.t - t0 < 8600) {
+    await wait(520);
+    n++;
+    if (n % 2 === 0) { m.spin = 0.01; m.proud = 1; } else { f.spin = 0.01; f.pulse = 1; }
+    spawn({ kind: 'note', x: s.x + rand(-80, 80), y: s.y - 70, vx: rand(-20, 20), vy: -50, g: -12, life: 1.8, size: rand(9, 13), color: pick(['#ffd76a', '#ffffff', '#ffb0c8', '#b8f0ff']), rot: 0, vr: 0, drag: 0.4 });
+    if (n % 3 === 0) sparkle(s.x + rand(-120, 120), s.y - 120, 6, { color: pick(RAINBOW), g: 60, up: 20 });
+    for (const r of V.residents) r.hop = 1;
+  }
+  await birdsMove(e.first);
+  Snd.setMusic({ concert: false });
+  // fold back into a path with a new arrangement
+  V.layShown = Object.assign({}, G.st.lay);
+  await tween(1400, (k) => {
+    for (let i = 0; i < 12; i++) { const tv = V.tiles[i], t = GEO.tiles[i], g = T[i]; tv.dx = (g.x - t.x) * (1 - k); tv.dy = (g.y - t.y) * (1 - k); tv.dang = (g.ang - t.ang) * (1 - k); tv.sc = lerp(g.sc, 1, k); }
+  }, E.ioC);
+  syncFaces(1);
+  for (let i = 0; i < 12; i++) run(async () => { await wait(i * 40); Snd.flip(); });
+  run(() => tween(1600, (k) => { V.plaza = 1 - k; G.concertT = 1 - k; V.annexA = k; V.stageK = lerp(1, 0.22, k); CAM.zoom = lerp(0.86, 1, k); CAM.fy = lerp(GEO.stage.y - 70, fy0, k); }, E.ioS));
+  const mb = { x: m.x, y: m.y }, fb = { x: f.x, y: f.y };
+  m.tile = G.st.mole.i; f.tile = G.st.fly.i;
+  const mr = restPos('mole'), fr = restPos('fly');
+  await tween(1100, (k) => { m.x = lerp(mb.x, mr.x, k); m.y = lerp(mb.y, mr.y, k); m.hy = Math.sin(k * Math.PI) * 50; f.x = lerp(fb.x, fr.x, k); f.y = lerp(fb.y, fr.y, k); }, E.ioS);
+  m.hy = 0; m.scene = f.scene = false;
+  for (const r of V.residents) { r.mode = null; r.path = []; r.gemHat = null; }
+  if (V.duck) V.duck.concert = false;
+  G.concert = false; G.concertT = 0;
+  markSave(); updateTarget(); bellModeMusic();
+}
+function concertDance(die) {
+  const pc = die === 'sun' ? V.mole : V.fly;
+  pc.spin = 0.01; pc.sq = 0.8;
+  if (die === 'moon') pc.pulse = 1; else pc.proud = 1;
+  G.mel.step = (G.mel.step + (G.mel.die !== die ? 2 : 1)) % 10; G.mel.die = die;
+  Snd.melodyNote(Snd.degree(die === 'sun' ? 'day' : 'dusk', G.mel.step + 3), die === 'sun' ? 'triangle' : 'sine', 0.06, 0.6, die === 'sun' ? -0.4 : 0.4);
+  spawn({ kind: 'note', x: pc.x, y: pc.y - 70, vx: rand(-30, 30), vy: -70, g: -10, life: 1.4, size: 11, color: die === 'sun' ? '#ffd76a' : '#e8ffb0', rot: 0, vr: 0, drag: 0.5 });
+}
+async function birdsMove(first) {
+  const pair = first && Math.random() < 0.22;
+  if (pair) { G.st.birdPair = true; markSave(); }
+  if (V.birdRoad < 1) run(async () => { await wait(500); await tween(1400, (k) => { V.birdRoad = k; }, E.outB); for (let i = 12; i < 16; i++) Snd.flip(); });
+  const dests = [12, 13, 14, 15].map(i => ({ x: GEO.tiles[i].x + rand(-10, 10), y: GEO.tiles[i].y - 2 }));
+  const jobs = V.birds.map((b, n) => run(async () => {
+    await wait(pair && n === 1 ? 0 : n * 260);
+    const a = { x: b.x, y: b.y }, d = dests[n % 4];
+    if (pair && n === 1) { const p0 = V.birds[0]; d.x = dests[0].x + 22; d.y = dests[0].y; b.pairWith = p0; }
+    b.fly = true; b.face = d.x > a.x ? 1 : -1;
+    Snd.chirp(panOf(a.x));
+    await tween(1700 + n * 120, (k) => { b.x = lerp(a.x, d.x, k); b.y = lerp(a.y, d.y, k); b.hy = Math.sin(k * Math.PI) * 140 + (pair && n < 2 ? Math.sin(k * 20) * 6 : 0); }, E.ioS);
+    b.fly = false; b.hy = 0; b.home = d; b.road = true; b.pairWith = null;
+    Snd.chirp(panOf(d.x));
+  }));
+  V.birdPair = pair;
+  await wait(2300);
+  V.birdPair = false;
+  return jobs;
+}
+function birdsSing() {
+  V.birds.forEach((b, n) => run(async () => { await wait(n * 180); b.hop = 1; Snd.chirp(panOf(b.x)); sparkle(b.x, b.y - 20, 4, { color: '#ffd1e6', size: 0.6 }); }));
+}
+function bellModeMusic() {
+  const st = G.st;
+  if (!st) return;
+  const mode = st.bellAwake ? tileTime(st.lay.bell) : null;
+  Snd.setMusic({ bell: mode === 'dawn' ? 'day' : mode, dayRatio: st.s / 11 });
+}
+
+// ================================================================ autonomous residents, duck and birds
+const TREE_PERCH = [[-28, -58], [24, -64], [0, -86]];
+const BIRD_LOOK = [{ col: '#5aa9e6', wing: '#3d86c6' }, { col: '#ffd45e', wing: '#e8a93a' }, { col: '#ff9cb8', wing: '#e6789a' }];
+const ROAD = [11, 12, 13, 14, 15, 0];
+function isletSpot(d, n) { const I = GEO.islets[d]; return { x: I.x + (n - 1) * 20, y: I.y + 8 + (n % 2) * 10 }; }
+function bellSpot(n) {
+  const L = V.layShown, t = GEO.tiles[L.bell], mode = tileTime(L.bell);
+  const side = mode === 'day' ? -1 : mode === 'night' ? 1 : (n - 1);
+  const b = annex(L.bell, 74 + (n % 2) * 18);
+  return { x: b.x + t.tx * (side * 34 + (n - 1) * 16), y: b.y + t.ty * (side * 34 + (n - 1) * 16) };
+}
+function region(p) {
+  for (const d of ['N', 'W', 'E']) { const I = GEO.islets[d]; if (dist(p.x, p.y, I.x, I.y) < I.r + 26) return d; }
+  return 'main';
+}
+function route(a, b) {
+  const ra = region(a), rb = region(b);
+  if (ra === rb) return [{ x: b.x, y: b.y }];
+  const pts = [];
+  if (ra === 'main') pts.push(SPAN.N[0], SPAN.N[1]);
+  else if (ra === 'W') pts.push(SPAN.W[1], SPAN.W[0]);
+  else if (ra === 'E') pts.push(SPAN.E[1], SPAN.E[0]);
+  if (rb === 'main') pts.push(SPAN.N[1], SPAN.N[0]);
+  else if (rb === 'W') pts.push(SPAN.W[0], SPAN.W[1]);
+  else if (rb === 'E') pts.push(SPAN.E[0], SPAN.E[1]);
+  pts.push(b);
+  return pts.map(p => ({ x: p.x, y: p.y }));
+}
+function residentsTo(d) {
+  G.resDest = d; G.resDestT = Clock.t;
+  V.residents.forEach((r, n) => { if (r.mode === 'concert') return; r.task = null; r.path = route(r, isletSpot(d, n)); r.hop = 1; });
+}
+function initAgents() {
+  const st = G.st;
+  G.resDest = st.bridge ? st.bridgeDirs[st.bridgeDirs.length - 1] : null; G.resDestT = -1e9;
+  V.residents = GEO.houses.map((h, n) => {
+    const home = { x: h.x + (n === 2 ? 34 : 30 * (n ? 1 : -1)), y: h.y + 22 };
+    const p = G.resDest ? isletSpot(G.resDest, n) : home;
+    return { kind: h.k, x: p.x, y: p.y, home, face: 1, hy: 0, sq: 1, tilt: 0, blink: 0, nextBlink: rand(800, 4000), lx: 0, ly: 0, seed: n * 7 + 1,
+      path: [], task: null, carry: null, inst: st.bellAwake, gemHat: null, wanderT: rand(1500, 4000), hop: 0, mode: null, walkPh: 0, speed: 62 + n * 6 };
+  });
+  V.duck = { u: 0.25, v: -1.32, world: null, x: 0, y: 0, face: 1, hy: 0, waddle: 0, blink: 0, nextBlink: 2000, wait: 2500, path: [], flower: false, concert: false, look: 0 };
+  V.birds = BIRD_LOOK.map((L, n) => {
+    const road = st.birdsMoved;
+    const p = road ? { x: GEO.tiles[12 + n].x, y: GEO.tiles[12 + n].y - 2 } : { x: GEO.tree.x + TREE_PERCH[n][0], y: GEO.tree.y + TREE_PERCH[n][1] };
+    return { col: L.col, wing: L.wing, x: p.x, y: p.y, home: p, face: n % 2 ? -1 : 1, hy: 0, fly: false, road, seed: n * 3, t: rand(1000, 4000), hop: 0, at: road ? 12 + n : n, anim: null };
+  });
+}
+function walkTo(a, tgt, sp, dt) {
+  const dx = tgt.x - a.x, dy = tgt.y - a.y, d = Math.hypot(dx, dy), step = sp * dt;
+  if (d <= step || d < 1) { a.x = tgt.x; a.y = tgt.y; return true; }
+  a.x += (dx / d) * step; a.y += (dy / d) * step;
+  if (Math.abs(dx) > 3) a.face = dx > 0 ? 1 : -1;
+  return false;
+}
+function updateResidents(dt) {
+  const s = dt / 1000, st = G.st;
+  // gems waiting on the ground get picked up by whoever is free
+  for (const g of V.gems) {
+    if (g.state !== 'loose' || g.claimed) continue;
+    let best = null, bd = 1e9;
+    for (const r of V.residents) { if (r.task || r.mode === 'concert') continue; const d = dist(r.x, r.y, g.x, g.y); if (d < bd) { bd = d; best = r; } }
+    if (best) { g.claimed = true; best.task = { gem: g, phase: 0 }; best.path = route(best, { x: g.x + 8, y: g.y + 4 }); }
+  }
+  V.residents.forEach((r, n) => {
+    r.nextBlink -= dt; if (r.nextBlink <= 0) { r.blink = 1; r.nextBlink = rand(2000, 5000); }
+    r.blink = Math.max(0, r.blink - s * 7);
+    r.sqv = (r.sqv || 0) + ((1 - r.sq) * 300 - r.sqv * 15) * s; r.sq += r.sqv * s;
+    if (r.hop > 0) { r.hop = Math.max(0, r.hop - s * 2.4); r.hy = Math.sin((1 - r.hop) * Math.PI) * 14; }
+    if (r.path.length) {
+      r.walkPh += s * 11;
+      const arrived = walkTo(r, r.path[0], r.speed, s);
+      if (!r.hop) r.hy = Math.abs(Math.sin(r.walkPh)) * 5;
+      if (arrived) {
+        r.path.shift();
+        if (!r.path.length && r.task) {
+          const T = r.task;
+          if (T.phase === 0) {
+            T.gem.state = 'carried'; r.carry = T.gem.col; T.phase = 1; Snd.tick(1500, panOf(r.x));
+            r.path = route(r, { x: GEO.stage.x + rand(-40, 40), y: GEO.stage.y + 24 });
+          } else {
+            r.carry = null; V.gems.splice(V.gems.indexOf(T.gem), 1);
+            V.stageGems = Math.min(st.gems, V.stageGems + 1);
+            Snd.chime(Snd.degree('day', 6 + (V.stageGems % 5)), 0, 0.05);
+            sparkle(GEO.stage.x, GEO.stage.y - 20, 8, { color: T.gem.col });
+            r.task = null; r.hop = 1;
+          }
+        }
+      }
+      return;
+    }
+    if (r.mode === 'concert') { r.tilt = Math.sin(Clock.t / 200 + n) * 0.12; if (Math.random() < s * 1.5 && !r.hop) r.hop = 1; return; }
+    // choose where to be: a newly reached islet, the bell's music, the islet, or home
+    let goal = r.home;
+    if (G.resDest && Clock.t - G.resDestT < 16000) goal = isletSpot(G.resDest, n);
+    else if (st.bellAwake) goal = bellSpot(n);
+    else if (G.resDest) goal = isletSpot(G.resDest, n);
+    if (dist(r.x, r.y, goal.x, goal.y) > 28) { r.path = route(r, goal); return; }
+    r.hy = 0;
+    if (st.bellAwake && Clock.t - G.resDestT >= 16000) {
+      const mode = tileTime(V.layShown.bell);
+      if (mode === 'night') r.tilt = Math.sin(Clock.t / 520 + n) * 0.16;
+      else { r.tilt = Math.sin(Clock.t / 160 + n) * 0.06; if (!r.hop && Math.random() < s * (mode === 'day' ? 1.6 : 0.8)) r.hop = 1; }
+    } else {
+      r.tilt *= 0.9;
+      r.wanderT -= dt;
+      if (r.wanderT <= 0) { r.wanderT = rand(2500, 6000); r.path = [{ x: goal.x + rand(-18, 18), y: goal.y + rand(-10, 10) }]; }
+    }
+  });
+}
+function updateGems(dt) {
+  const s = dt / 1000;
+  for (let i = V.gems.length - 1; i >= 0; i--) {
+    const g = V.gems[i];
+    if (g.state === 'loose' && !g.claimed) {
+      g.age = (g.age || 0) + dt;
+      if (g.age > 25000) { V.gems.splice(i, 1); V.stageGems = Math.min(G.st.gems, V.stageGems + 1); sparkle(GEO.stage.x, GEO.stage.y - 20, 6, { color: g.col }); }
+    }
+  }
+  for (const g of V.gems) {
+    if (g.state !== 'fly') continue;
+    g.vy += 620 * s; g.x += g.vx * s; g.y += g.vy * s;
+    if (g.vy > 0 && g.y >= g.gy) { g.y = g.gy; if (Math.abs(g.vy) > 120) { g.vy *= -0.35; g.vx *= 0.6; Snd.tick(2200, panOf(g.x)); } else { g.state = 'loose'; } }
+  }
+}
+const NEST = { u: 0.25, v: -1.32 };
+function planDuck(d) {
+  const stones = V.stones.filter(o => o.form >= 1 && !o.sinking).sort((a, b) => a.u - b.u);
+  const nest = { u: NEST.u, v: NEST.v };
+  if (stones.length) {
+    const lastS = stones[stones.length - 1], far = { u: 1.34, v: lastS.v < 0 ? -0.5 : 0.5 };
+    const go = [{ u: -1.08, v: stones[0].v * 0.7 }].concat(stones.map(o => ({ u: o.u, v: o.v, jump: true })), [Object.assign({ jump: true }, far)]);
+    const back = go.slice(0, -1).reverse().map(p => Object.assign({}, p, { jump: p.jump }));
+    d.path = [{ u: -0.55, v: -1.12 }].concat(go, [{ pause: 1600, flower: far.v < 0, trip: true }], back, [{ u: -1.08, v: stones[0].v * 0.7, jump: true }, { u: -0.55, v: -1.12 }, nest]);
+  } else {
+    d.path = [{ u: -0.55, v: -1.12 }, { u: -1.04, v: -0.45 }, { pause: 1500, look: true }, { u: -0.55, v: -1.12 }, nest];
+  }
+  d.wait = rand(2600, 5200);
+}
+function updateDuck(dt) {
+  const d = V.duck;
+  if (!d) return;
+  const s = dt / 1000, pf = pondFrame(V.layShown.pond);
+  d.nextBlink -= dt; if (d.nextBlink <= 0) { d.blink = 1; d.nextBlink = rand(2000, 5000); }
+  d.blink = Math.max(0, d.blink - s * 7);
+  if (d.concert || d.world) {
+    const tgt = d.concert ? seatPos(4) : pondPt(pf, NEST.u, NEST.v);
+    if (!d.world) { d.world = { x: d.x, y: d.y }; d.path = []; }
+    const done = walkTo(d.world, tgt, 70, s);
+    d.face = d.world.face || d.face;
+    d.x = d.world.x; d.y = d.world.y; d.waddle += s * 12;
+    if (done && !d.concert) { d.world = null; d.u = NEST.u; d.v = NEST.v; }
+    return;
+  }
+  if (d.path.length) {
+    const p = d.path[0];
+    if (p.pause != null) {
+      p.pause -= dt;
+      if (p.look) d.face = (pf.ux > 0 ? 1 : -1);
+      if (p.flower != null && !p.done) { p.done = true; d.flower = p.flower; G.st.duckTrips++; markSave(); Snd.quack(); sparkle(d.x, d.y - 30, 6, { color: '#ffd1e6', size: 0.6 }); }
+      if (p.pause <= 0) d.path.shift();
+    } else {
+      const cur = { x: d.u, y: d.v }, tg = { x: p.u, y: p.v };
+      const dd = Math.hypot((tg.x - cur.x) * pf.ru, (tg.y - cur.y) * pf.rv);
+      const sp = (p.jump ? 70 : 40) / Math.max(1, dd) * s;
+      if (!p.from) p.from = { u: d.u, v: d.v, k: 0 };
+      p.from.k = Math.min(1, p.from.k + sp);
+      d.u = lerp(p.from.u, p.u, p.from.k); d.v = lerp(p.from.v, p.v, p.from.k);
+      d.hy = p.jump ? Math.sin(p.from.k * Math.PI) * 16 : 0;
+      d.waddle += s * (p.jump ? 4 : 12);
+      const w0 = pondPt(pf, p.from.u, p.from.v), w1 = pondPt(pf, p.u, p.v);
+      if (Math.abs(w1.x - w0.x) > 2) d.face = w1.x > w0.x ? 1 : -1;
+      if (p.from.k >= 1) { d.path.shift(); if (p.jump) Snd.tick(900, panOf(d.x)); }
+    }
+  } else {
+    d.hy = 0; d.waddle *= 0.9;
+    d.wait -= dt;
+    if (d.wait <= 0) { if (d.flower) d.flower = false; planDuck(d); if (Math.random() < 0.4) Snd.quack(); }
+  }
+  const w = pondPt(pf, d.u, d.v);
+  d.x = w.x; d.y = w.y;
+}
+function updateBirds(dt) {
+  const s = dt / 1000;
+  for (const b of V.birds) {
+    if (b.fly) continue;
+    if (b.hop > 0) { b.hop = Math.max(0, b.hop - s * 3); b.hy = Math.sin((1 - b.hop) * Math.PI) * 10; }
+    if (b.anim) {
+      b.anim.k = Math.min(1, b.anim.k + s / b.anim.d);
+      b.x = lerp(b.anim.a.x, b.anim.b.x, b.anim.k); b.y = lerp(b.anim.a.y, b.anim.b.y, b.anim.k);
+      b.hy = Math.sin(b.anim.k * Math.PI) * (b.anim.big ? 26 : 12);
+      if (b.anim.k >= 1) b.anim = null;
+      continue;
+    }
+    b.t -= dt;
+    if (b.t > 0) continue;
+    b.t = rand(1800, 5200);
+    if (Math.random() < 0.25) Snd.chirp(panOf(b.x));
+    if (b.road) {
+      // the shortcut road: hop along it (sometimes all the way to the path ends)
+      const i = ROAD.indexOf(b.at), j = clamp(i + (Math.random() < 0.5 ? -1 : 1), 0, ROAD.length - 1);
+      b.at = ROAD[j];
+      const t = GEO.tiles[b.at], dest = { x: t.x + rand(-12, 12), y: t.y - 2 + rand(-6, 6) };
+      b.face = dest.x > b.x ? 1 : -1;
+      b.anim = { a: { x: b.x, y: b.y }, b: dest, k: 0, d: 0.5, big: j === 0 || j === ROAD.length - 1 };
+    } else {
+      b.at = (b.at + 1 + ((Math.random() * 2) | 0)) % 3;
+      const dest = { x: GEO.tree.x + TREE_PERCH[b.at][0] + rand(-4, 4), y: GEO.tree.y + TREE_PERCH[b.at][1] };
+      b.face = dest.x > b.x ? 1 : -1;
+      b.anim = { a: { x: b.x, y: b.y }, b: dest, k: 0, d: 0.45, big: false };
+    }
+  }
+}
+
+// ================================================================ the two pieces' own little lives
+function updatePiece(p, dt) {
+  const s = dt / 1000, st = G.st, other = p === V.mole ? V.fly : V.mole;
+  p.sqv = (p.sqv || 0) + ((1 - p.sq) * 320 - p.sqv * 15) * s; p.sq += p.sqv * s;
+  if (p.spin > 0) { p.spin += s * 1.5; if (p.spin >= 1) p.spin = 0; }
+  p.proud = Math.max(0, p.proud - s * 0.3); p.wide = Math.max(0, p.wide - s); p.pulse = Math.max(0, p.pulse - s * 1.1);
+  p.turnBack = Math.max(0, p.turnBack - s * 1.2); p.wave = Math.max(0, p.wave - s);
+  p.nextBlink -= dt;
+  if (p.nextBlink <= 0) { p.blink = 1; p.nextBlink = G.idle > 12000 ? rand(900, 1800) : rand(1800, 4600); }
+  p.blink = Math.max(0, p.blink - s * (G.idle > 12000 ? 3 : 7));
+  if (!p.anim && !p.scene) {
+    const r = restPos(p.kind), k = Math.min(1, s * 9);
+    p.x += (r.x - p.x) * k; p.y += (r.y - p.y) * k;
+  }
+  // who to look at: the child's finger, the friend, the glowing target, or around
+  let tx = null, ty = null;
+  if (G.touch && Clock.t - G.touch.t < 1600) { tx = G.touch.wx; ty = G.touch.wy; }
+  else if (G.idle > 6000 && G.target && !G.concert) { const q = targetScreen(); if (q) { const w = screenToWorld(q.x, q.y); tx = w.x; ty = w.y; } }
+  else if (dist(p.x, p.y, other.x, other.y) < 380) { tx = other.x; ty = other.y - 30; }
+  if (p.turnBack > 0) { tx = other.x; ty = other.y - 30; }
+  if (tx != null) {
+    const dx = tx - p.x, dy = ty - (p.y - 40), d = Math.hypot(dx, dy) || 1;
+    p.lx = lerp(p.lx, dx / d, Math.min(1, s * 8)); p.ly = lerp(p.ly, (dy / d) * 0.8, Math.min(1, s * 8));
+    if (!p.anim && !p.scene && Math.abs(dx) > 40 && (p.turnBack > 0 || G.idle > 6000 || (G.touch && Clock.t - G.touch.t < 1600))) p.face = dx > 0 ? 1 : -1;
+  } else { p.lx *= 0.95; p.ly *= 0.95; }
+  const lean = p.lean ? 0.2 * p.face : 0, gazeLean = G.idle > 6000 && !G.concert ? Math.sin(Clock.t / 500) * 0.05 : 0;
+  p.tilt = lerp(p.tilt, lean + gazeLean + (p.turnBack > 0 ? -0.12 * p.face : 0), Math.min(1, s * 8));
+  // greet when the friend comes near (but not when already holding hands)
+  const near = Rules.ringDist(st, st.mole.i, st.fly.i) <= 3 && !st.together;
+  if (near && !p.near && !G.concert) { p.wave = 1.4; if (p === V.mole) Snd.squeak(1100); }
+  p.near = near;
+  // small idle acts that depend on what the piece has and where it is
+  p.idleAct += dt;
+  if (p.anim || p.scene || G.concert) return;
+  if (p.kind === 'mole') {
+    p.sniff = (p.sniff + s * (st.field.ready && Math.abs(st.mole.i - st.lay.field) <= 2 ? 1.6 : 0.5)) % 1;
+    if (p.idleAct > 4200) {
+      p.idleAct = rand(-1500, 0);
+      const holds = st.lanterns.some(l => l.h === 'mole');
+      if (holds) { p.proud = 1; p.face = GEO.tiles[st.lay.well].x > p.x ? 1 : -1; }
+      else if (st.bellAwake && Math.abs(st.mole.i - st.lay.bell) <= 3) { p.sq = 0.86; }
+      else if (Rules.ringDist(st, st.mole.i, st.fly.i) > 5) { p.face = -p.face; p.turnBack = 0.6; }
+      else p.sniff = 0.01;
+    }
+  } else {
+    if (p.idleAct > 3600) {
+      p.idleAct = rand(-1500, 0);
+      const holds = st.lanterns.some(l => l.h === 'fly');
+      if (holds) { p.pulse = 0.6; p.tilt = 0.1; }
+      else if (st.bellAwake && Math.abs(st.fly.i - st.lay.bell) <= 3) { p.pulse = 1; Snd.sing(Snd.degree('night', 5 + ((Math.random() * 3) | 0)), 0.5); }
+      else if (Math.abs(st.fly.i - st.lay.pond) <= 2 && (V.stones.length || V.ripples.length)) { p.face = GEO.tiles[st.lay.pond].x > p.x ? 1 : -1; p.pulse = 0.5; }
+      else p.pulse = 0.4;
+    }
+  }
+}
+// radish follows the mole while carried; placed radish sits on its (possibly moving) tile
+function updateItems(dt) {
+  const r = V.radish;
+  if (r && r.st === 'carried') { const m = V.mole; r.x = m.x + m.face * 18; r.y = m.y - m.hy + 2; r.k = 0.62; }
+  else if (r && r.st === 'placed' && r.t != null) { const t = tileXY(r.t), tv = V.tiles[r.t]; r.x = t.x + t.nx * 16 + tv.dx; r.y = t.y + t.ny * 16 + 10 + tv.dy; }
+  V.bell.swing = Math.max(0, V.bell.swing - dt / 2600); V.bell.ring = Math.max(0, V.bell.ring - dt / 900);
+  V.bridgeGlow = Math.max(G.concert ? 1 : 0, V.bridgeGlow - dt / 4000);
+  for (const tv of V.tiles) if (tv.wob > 0) { tv.wob = Math.max(0, tv.wob - dt / 500); tv.lift = Math.sin(tv.wob * 18) * tv.wob * 5; }
+  for (const k of ['sun', 'moon']) {
+    const dv = V.dice[k], s = dt / 1000;
+    dv.v += ((1 - dv.sq) * 520 - dv.v * 13) * s; dv.sq += dv.v * s;
+    dv.glow = Math.max(0, dv.glow - s * 2);
+    if (dv.pips && dv.pipsLeft === 0 && !G.busy && Clock.t - (dv.pipT || 0) > 1600) dv.pips = 0;
+    const isT = G.target === k && !G.concert;
+    const ph = (Clock.t % 1900) / 1900;
+    dv.hop = isT && ph < 0.22 ? Math.sin((ph / 0.22) * Math.PI) : 0;
+  }
+  for (let i = SPART.length - 1; i >= 0; i--) {
+    const p = SPART[i], s = dt / 1000;
+    p.t += s; if (p.t >= p.life) { SPART.splice(i, 1); continue; }
+    p.vy += 300 * s; p.x += p.vx * s; p.y += p.vy * s;
+  }
+}
+
+// ================================================================ guidance: one glowing target, gaze at 6 s, one hand demo at 10 s
+function updateTarget() {
+  const st = G.st;
+  if (!st) return;
+  const li = st.lanterns.findIndex((l, i) => l.h === 'tile' && l.idle < 6 && V.lanterns[i] && V.lanterns[i].ready);
+  if (li >= 0) { G.target = 'lantern'; G.targetLantern = li; G.goal = 'give'; return; }
+  try { const p = Rules.plan(st, 3, Math.random); G.target = p.die; G.goal = p.goal; }
+  catch (e) { G.target = st.lastDie === 'sun' ? 'moon' : 'sun'; }
+}
+function targetScreen() {
+  if (G.target === 'sun' || G.target === 'moon') return VIEW.dice[G.target];
+  if (G.target === 'lantern') { const p = lanternPos(G.targetLantern); return worldToScreen(p.x, p.y); }
+  return null;
+}
+function startHandDemo() {
+  const q = targetScreen();
+  if (!q) return;
+  G.demoDone = true;
+  const tx = q.x + 6, ty = q.y + 10, h = { x: tx + 90, y: ty + 120, a: 0, s: clamp(VIEW.dieSize / 105, 0.9, 1.9) };
+  G.hand = h;
+  run(async () => {
+    await tween(600, (k) => { h.a = k; h.x = lerp(tx + 90, tx, k); h.y = lerp(ty + 120, ty, k); }, E.outC);
+    await tween(170, (k) => { h.y = ty + k * 8; h.s *= 0.995; });
+    if (G.hand === h) {
+      if (G.target === 'sun' || G.target === 'moon') { V.dice[G.target].sq = 0.86; V.dice[G.target].glow = 1; }
+      Snd.tick(700);
+    }
+    await tween(240, (k) => { h.y = ty + 8 - k * 14; });
+    await wait(350);
+    await tween(450, (k) => { h.a = 1 - k; });
+    if (G.hand === h) G.hand = null;
+  });
+}
+function updateGuidance(dt) {
+  if (!G.busy) G.idle += dt;
+  if (G.idle > 10000 && !G.demoDone && !G.concert && !G.busy && !G.drag) startHandDemo();
+}
+
+// ================================================================ overlays (hand-holding light, hints)
+function drawOverlays(c) {
+  const st = G.st;
+  if (st.radish && V.radish && V.radish.st === 'placed' && tileTime(st.radish.t) !== 'night') {
+    const t = tileXY(st.radish.t), ph = 0.5 + 0.5 * Math.sin(Clock.t / 420), dir = st.loop ? 1 : 1;
+    c.save(); c.translate(t.x + t.tx * 34 * dir, t.y + t.ty * 34 * dir);
+    const g = c.createRadialGradient(0, 0, 4, 0, 0, 62);
+    g.addColorStop(0, `rgba(36,46,140,${0.45 + 0.3 * ph})`); g.addColorStop(0.6, `rgba(36,46,140,${0.2 + 0.15 * ph})`); g.addColorStop(1, 'rgba(36,46,140,0)');
+    c.fillStyle = g; c.beginPath(); c.arc(0, 0, 62, 0, TAU); c.fill();
+    c.fillStyle = `rgba(255,236,170,${0.55 + 0.35 * ph})`; c.beginPath(); c.arc(8, -4, 9, 0, TAU); c.fill();
+    c.fillStyle = `rgba(36,46,140,0.9)`; c.beginPath(); c.arc(13, -7, 8, 0, TAU); c.fill();
+    c.fillStyle = `rgba(230,236,255,${0.5 + 0.4 * ph})`;
+    for (let k = 0; k < 3; k++) { const a = Clock.t / 1300 + k * 2.1; star4(c, Math.cos(a) * 22, Math.sin(a) * 14 - 6, 3); }
+    c.restore();
+  }
+  if (G.target === 'lantern' && !G.drag) {
+    const p = lanternPos(G.targetLantern), ph = 0.5 + 0.5 * Math.sin(Clock.t / 260);
+    const g = c.createRadialGradient(p.x, p.y, 6, p.x, p.y, 54);
+    g.addColorStop(0, `rgba(255,240,150,${0.35 + 0.3 * ph})`); g.addColorStop(1, 'rgba(255,240,150,0)');
+    c.fillStyle = g; c.beginPath(); c.arc(p.x, p.y, 54, 0, TAU); c.fill();
+  }
+  if (V.link && V.link.k > 0) {
+    const m = V.mole, f = V.fly, a = { x: m.x + m.face * 20, y: m.y - 30 - m.hy }, b = { x: f.x + f.face * 14, y: f.y - 50 };
+    c.save(); c.globalAlpha = V.link.k;
+    c.strokeStyle = 'rgba(255,248,200,0.9)'; c.lineWidth = 7; c.lineCap = 'round';
+    c.beginPath(); c.moveTo(a.x, a.y); c.quadraticCurveTo((a.x + b.x) / 2, Math.min(a.y, b.y) - 18, b.x, b.y); c.stroke();
+    c.strokeStyle = 'rgba(255,255,255,0.95)'; c.lineWidth = 2.5; c.stroke();
+    c.restore(); c.lineCap = 'butt';
+  }
+  for (const o of V.orbs) {
+    const g = c.createRadialGradient(o.x, o.y, 1, o.x, o.y, 26);
+    g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(0.4, 'rgba(255,240,180,0.7)'); g.addColorStop(1, 'rgba(255,220,150,0)');
+    c.fillStyle = g; c.beginPath(); c.arc(o.x, o.y, 26, 0, TAU); c.fill();
+  }
+  if (V.birdPair && V.birds.length > 1) {
+    const a = V.birds[0], b = V.birds[1];
+    c.strokeStyle = '#ff7fa8'; c.lineWidth = 3;
+    c.beginPath(); c.moveTo(a.x + 6, a.y - a.hy - 8); c.quadraticCurveTo((a.x + b.x) / 2, (a.y - a.hy + b.y - b.hy) / 2 + 12, b.x - 6, b.y - b.hy - 8); c.stroke();
+  }
+}
+
+// ================================================================ input (Pointer Events; one finger is enough, extra fingers never break the state)
+function hitLantern(w) {
+  const r = Math.max(42, 34 / camScale());
+  let best = -1, bd = r;
+  G.st.lanterns.forEach((l, i) => {
+    if (l.h === 'stage' || !V.lanterns[i] || !V.lanterns[i].ready || V.lanterns[i].fly) return;
+    const p = lanternPos(i), d = dist(w.x, w.y, p.x, p.y);
+    if (d < bd) { bd = d; best = i; }
+  });
+  return best;
+}
+function pokeAt(w) {
+  const near = (x, y, r) => dist(w.x, w.y, x, y) < Math.max(r, 22 / camScale());
+  const L = V.layShown;
+  if (near(V.mole.x, V.mole.y - 26, 40)) { V.mole.sq = 0.84; V.mole.wide = 0.6; Snd.squeak(900); return; }
+  if (near(V.fly.x, V.fly.y - 42, 40)) { V.fly.sq = 0.84; V.fly.pulse = 0.7; Snd.squeak(1300); return; }
+  for (const r of V.residents) if (near(r.x, r.y - 18, 28)) { r.hop = 1; Snd.squeak(RES_LOOK[r.kind].note); return; }
+  if (V.duck && near(V.duck.x, V.duck.y - 14, 28)) { V.duck.waddle += 3; Snd.quack(); return; }
+  for (const b of V.birds) if (near(b.x, b.y - 10 - b.hy, 26)) { b.hop = 1; Snd.chirp(panOf(b.x)); return; }
+  const bt = annex(L.bell, 36);
+  if (near(bt.x, bt.y - 40, 34)) { V.bell.swing = Math.max(V.bell.swing, 0.12); Snd.bell(Snd.mtof(86), 0.02, 0.6); return; }
+  const wt = annex(L.well, 88);
+  if (near(wt.x, wt.y - 16, 36)) { Snd.tick(420); return; }
+  const pf = pondFrame(L.pond);
+  if (near(pf.x, pf.y, 52)) { Snd.tick(1500); return; }
+  const ft = tileXY(L.field);
+  if (near(ft.x, ft.y, 40)) { if (V.radish && V.radish.st === 'ready') { V.radish.shake = 0.4; setTimeout(() => { if (V.radish) V.radish.shake = 0; }, 260); } Snd.tick(800); return; }
+  if (near(GEO.stage.x, GEO.stage.y, 60)) { Snd.tick(1100); return; }
+}
+function pointerXY(e) { return { x: e.clientX, y: e.clientY }; }
+function onDown(e) {
+  if (e.cancelable) e.preventDefault();
+  Snd.unlock(); G.started = true;
+  const { x, y } = pointerXY(e), w = screenToWorld(x, y);
+  G.idle = 0; G.hand = null; G.demoDone = false;
+  G.touch = { wx: w.x, wy: w.y, t: Clock.t };
+  for (const k of ['sun', 'moon']) {
+    const P = VIEW.dice[k];
+    if (Math.abs(x - P.x) < VIEW.dieSize * 0.64 && Math.abs(y - P.y) < VIEW.dieSize * 0.64) { pressDie(k); return; }
+  }
+  if (G.concert) return;
+  if (!G.drag) {
+    const li = hitLantern(w);
+    if (li >= 0) {
+      G.drag = { id: e.pointerId, idx: li, x0: x, y0: y, moved: false };
+      try { cv.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      Snd.tick(1300);
+      return;
+    }
+  }
+  pokeAt(w);
+}
+function onMove(e) {
+  const d = G.drag;
+  if (!d || e.pointerId !== d.id) return;
+  if (e.cancelable) e.preventDefault();
+  const { x, y } = pointerXY(e);
+  if (!d.moved && dist(x, y, d.x0, d.y0) > 12) d.moved = true;
+  if (d.moved) {
+    const w = screenToWorld(x, y), lv = V.lanterns[d.idx];
+    if (lv) { lv.fly = { x: w.x, y: w.y - 14 }; lv.x = w.x; lv.y = w.y - 14; }
+    G.touch = { wx: w.x, wy: w.y, t: Clock.t };
+    G.idle = 0;
+  }
+}
+function endDrag(e, cancel) {
+  const d = G.drag;
+  if (!d || e.pointerId !== d.id) return;
+  G.drag = null;
+  try { cv.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+  const l = G.st.lanterns[d.idx], lv = V.lanterns[d.idx];
+  if (!l || !lv) return;
+  if (cancel) { lv.fly = null; return; }
+  if (!d.moved) {
+    if (l.h === 'tile') {
+      const t = tileXY(l.t);
+      const dm = dist(V.mole.x, V.mole.y, t.x, t.y), df = dist(V.fly.x, V.fly.y, t.x, t.y);
+      giveLanternTo(d.idx, dm <= df ? 'mole' : 'fly');
+    } else { const pc = V[l.h]; if (pc) { pc.spin = 0.01; pc.proud = 1; Snd.chime(Snd.mtof(86), 0, 0.04); } }
+    return;
+  }
+  const { x, y } = pointerXY(e), w = screenToWorld(x, y), R = Math.max(70, 40 / camScale());
+  const dm = dist(w.x, w.y, V.mole.x, V.mole.y - 30), df = dist(w.x, w.y, V.fly.x, V.fly.y - 40);
+  if (Math.min(dm, df) < R) { giveLanternTo(d.idx, dm <= df ? 'mole' : 'fly'); return; }
+  let bt = -1, bd = R;
+  for (let i = 0; i < 12; i++) { const t = tileXY(i), dd = dist(w.x, w.y, t.x, t.y); if (dd < bd) { bd = dd; bt = i; } }
+  if (bt >= 0) dropLanternAt(d.idx, bt);
+  else lv.fly = null;
+}
+cv.addEventListener('pointerdown', onDown, { passive: false });
+cv.addEventListener('pointermove', onMove, { passive: false });
+cv.addEventListener('pointerup', (e) => endDrag(e, false), { passive: false });
+cv.addEventListener('pointercancel', (e) => endDrag(e, true), { passive: false });
+cv.addEventListener('lostpointercapture', (e) => { if (G.drag && e.pointerId === G.drag.id) endDrag(e, true); });
+for (const ev of ['touchstart', 'touchmove', 'touchend', 'gesturestart', 'gesturechange', 'dblclick', 'contextmenu', 'selectstart']) {
+  document.addEventListener(ev, (e) => { if (e.cancelable) e.preventDefault(); }, { passive: false });
+}
+document.addEventListener('touchend', () => Snd.unlock(), { passive: true });
+cv.addEventListener('pointerup', () => Snd.unlock());
+
+// ================================================================ memory of play (localStorage; falls back to this session only)
+function serialize(st) {
+  return {
+    v: 1, bridge: st.bridge, bridgeDirs: st.bridgeDirs.slice(),
+    stones: st.stones.map(o => ({ u: +o.u.toFixed(3), v: +o.v.toFixed(3) })),
+    lanterns: st.lanterns.map(l => (l.h === 'tile' ? 'stage' : l.h)),
+    gems: st.gems, bellAwake: st.bellAwake, birdsMoved: st.birdsMoved, birdPair: !!st.birdPair, shortcut: st.loop,
+    concerts: st.concerts, duckTrips: st.duckTrips, visits: G.visits || 0, disc: Object.assign({}, st.disc),
+  };
+}
+function saveNow() { if (G.st) { Store.save(serialize(G.st)); G.saveDue = false; } }
+let saveClock = 0;
+
+// ================================================================ main loop (requestAnimationFrame only; stops while hidden)
+let lastT = 0, raf = 0, running = true, needLayout = false;
+function update(dt) {
+  tickClock(dt);
+  updateGuidance(dt);
+  updatePiece(V.mole, dt); updatePiece(V.fly, dt);
+  updateItems(dt);
+  updateResidents(dt); updateDuck(dt); updateBirds(dt); updateGems(dt);
+  updateParticles(dt);
+  if (CAM.shake > 0) { CAM.sx = (Math.random() - 0.5) * CAM.shake * 2; CAM.sy = (Math.random() - 0.5) * CAM.shake * 2; } else { CAM.sx = CAM.sy = 0; }
+  Snd.tickMusic();
+  saveClock += dt;
+  if (saveClock > 1000) { saveClock = 0; if (G.saveDue) saveNow(); }
+}
+function draw() {
+  if (Cache.dirty) buildCaches();
+  setScreenTransform();
+  ctx.drawImage(Cache.sea, 0, 0, VIEW.W, VIEW.H);
+  setWorldTransform();
+  drawWorld(ctx);
+  drawOverlays(ctx);
+  setScreenTransform();
+  drawDice(ctx);
+  for (const p of SPART) { ctx.globalAlpha = 1 - p.t / p.life; ctx.fillStyle = p.col; star4(ctx, p.x, p.y, p.size); }
+  ctx.globalAlpha = 1;
+  drawHand(ctx);
+}
+function frame(now) {
+  raf = 0;
+  if (!running) return;
+  if (needLayout) { needLayout = false; layout(); }
+  let dt = lastT ? now - lastT : 16;
+  lastT = now;
+  dt = clamp(dt, 0, 100) * DBG.timeScale;
+  try {
+    while (dt > 0) { const d = Math.min(dt, 50); update(d); dt -= d; }
+    draw();
+  } catch (e) { DBG.errors.push(String(e && e.stack || e)); }
+  raf = requestAnimationFrame(frame);
+}
+function start() { if (!raf && running) { lastT = 0; raf = requestAnimationFrame(frame); } }
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { running = false; if (raf) cancelAnimationFrame(raf); raf = 0; Snd.suspend(); saveNow(); }
+  else { running = true; start(); Snd.resume(); }
+});
+window.addEventListener('pagehide', saveNow);
+window.addEventListener('resize', () => { needLayout = true; });
+window.addEventListener('orientationchange', () => { needLayout = true; setTimeout(() => { needLayout = true; }, 300); });
+if (window.visualViewport) window.visualViewport.addEventListener('resize', () => { needLayout = true; });
+
+// ================================================================ boot
+function boot() {
+  const save = Store.load();
+  const seed = qsNum('seed') != null ? qsNum('seed') : ((Date.now() ^ Math.floor(Math.random() * 1e9)) >>> 0);
+  G.visits = save ? (save.visits || 0) + 1 : 1;
+  G.st = Rules.newState(save, seed);
+  syncVisualFromState(G.st);
+  initAgents();
+  layout();
+  updateTarget();
+  bellModeMusic();
+  markSave();
+  start();
+}
+if (TEST) {
+  window.__MH = {
+    G, V, VIEW, Clock, CAM, DBG, Rules, Store,
+    st: () => G.st,
+    press: (die) => pressDie(die),
+    give: (idx, who) => giveLanternTo(idx, who),
+    drop: (idx, t) => dropLanternAt(idx, t),
+    setTimeScale: (x) => { DBG.timeScale = x; },
+    forceRoll: (r) => { DBG.forceRoll = r; },
+    diceScreen: () => ({ sun: VIEW.dice.sun, moon: VIEW.dice.moon, size: VIEW.dieSize }),
+    toScreen: (x, y) => worldToScreen(x, y),
+    tileScreen: (i) => worldToScreen(GEO.tiles[i].x, GEO.tiles[i].y),
+    lanternScreen: (i) => { const p = lanternPos(i); return worldToScreen(p.x, p.y); },
+    pieceScreen: (k) => worldToScreen(V[k].x, V[k].y - 30),
+    errors: () => DBG.errors.slice(),
+    busy: () => G.busy || G.concert || G.queue.length > 0,
+    counts: () => ({ particles: PART.length, foot: FOOT.length, tweens: Clock.tweens.length, waits: Clock.waits.length }),
+  };
+}
+boot();
+})();
+</script>
+</body>
+</html>

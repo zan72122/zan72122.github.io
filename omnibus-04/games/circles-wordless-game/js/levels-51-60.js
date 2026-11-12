@@ -1,0 +1,31 @@
+(function(){
+ const {ball:b,ring:r,single,two,serial,stage:s,paint,pair,C}=StageBuilder;
+ const red={type:'dye',color:C.paintR},blue={type:'dye',color:C.paintB},piece={type:'piece'},sp=.075/Math.sqrt(3),merge={type:'merge'},mr=.045*Math.SQRT2;
+ LEVELS.push(
+  s('色ごとの通り道',two(),[r(red,-.23,-.36),r(blue,.23,-.36)],
+    [b('dye','d1',-.27,.31),b('dye','d2',.24,.30),paint('pr',.33,.36,C.paintR),paint('pb',-.33,.36,C.paintB)],{bg:'#F8F0FF'}),
+  s('向こうで集める',single(),[r(merge,-.24,-.35,mr)],
+    [...pair(-.31,.31,.27,.18),b('merge','m1',-.12,.30,.045),b('merge','m2',.28,.33,.045)],{bg:'#ECF5F7'}),
+  s('一つずつ見送る',serial(),[r(piece,.22,-.35,sp),r(piece,.08,-.43,sp),r(piece,-.33,.37,sp)],
+    [b('split','big',-.24,.36,.075)],{bg:'#FFF1EE'}),
+  s('小さく連れて開く',single(true),[r('violet',.24,-.35,.033)],
+    [b('sticky','violet',.25,.29,.055,{minScale:.6}),b('shrink','cold',-.26,.30,.05)],
+    {bg:'#F0ECFF',player:{cx:0,cy:.42,r:.07,minScale:.6}}),
+  s('飛び出してから考える',single(),[r('orb',-.24,-.35,.048)],
+    [b('orbit','orb',-.08,.27,.048,{orbitR:.11,speed:1.15,phase:0})],{bg:'#EAF8FF'}),
+  s('染める広場と流す道',two(),[r(red,-.23,-.36),r(blue,.23,-.36)],
+    [b('dye','d1',-.20,.28),b('dye','d2',.20,.28),paint('pr',-.33,.35,C.paintR),paint('pb',.33,.35,C.paintB),
+     {type:'flow',cx:.20,cy:-.195,angle:-90,length:.15,width:.13,speed:.16}],{bg:'#FFF1F8'}),
+  s('集めてから、どちらへ',two(),[r(merge,-.23,-.36,mr),r(merge,.23,-.36,mr)],
+    [b('merge','m1',-.29,.23,.045),b('merge','m2',-.09,.34,.045),b('merge','m3',.11,.22,.045),b('merge','m4',.29,.34,.045)],{bg:'#E5F9F4'}),
+  s('道と、集める場所',two(),[r(merge,-.23,-.36,mr),r(merge,.23,-.36,mr)],
+    [b('merge','m1',-.29,.31,.045),b('merge','m2',.28,.24,.045),b('merge','m3',-.08,.23,.045),b('merge','m4',.10,.35,.045),
+     b('wall','island',0,.12,.055)],{bg:'#EDF8F1'}),
+  s('迎えに戻る道',two(),[r(red,-.23,-.36),r('pal',.25,.34)],
+    [b('dye','white',-.24,.28),paint('pr',-.32,.27,C.paintR),b('follow','pal',.23,-.36,.055,{wakeDistance:.34})],{bg:'#FFF4E9'}),
+  s('自分で作った道を使う',two(),[r(red,-.23,-.37),r(blue,.23,-.37),r('player',0,.40,.07)],
+    [b('dye','d1',-.12,.24),b('dye','d2',.12,.24),paint('pr',.32,.35,C.paintR),paint('pb',-.32,.35,C.paintB),
+     {type:'flow',cx:-.20,cy:-.195,angle:-90,length:.15,width:.13,speed:.16},
+     {type:'flow',cx:.20,cy:-.195,angle:-90,length:.15,width:.13,speed:.16}],{bg:'#FFF1F6'})
+ );
+})();

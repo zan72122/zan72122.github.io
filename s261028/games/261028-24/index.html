@@ -1,0 +1,2530 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta name="robots" content="noindex,nofollow">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#f3e6cb">
+<meta name="format-detection" content="telephone=no">
+<title>ねこの朝ごはん</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#f3e6cb;}
+body{position:fixed;left:0;top:0;right:0;bottom:0;touch-action:none;-webkit-user-select:none;user-select:none;
+  -webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;overscroll-behavior:none;}
+canvas{display:block;position:absolute;left:0;top:0;width:100%;height:100%;touch-action:none;outline:none;}
+#sa{position:absolute;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;
+  padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);
+  padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left);}
+</style>
+
+<script src="/gf-nav.js" defer></script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+"use strict";
+// ===== 基本ユーティリティ =====
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = (arr) => arr[(Math.random() * arr.length) | 0];
+const hyp = Math.hypot;
+const sgn = (v) => (v < 0 ? -1 : 1);
+const ease = (t) => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t));
+const easeOut = (t) => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
+const easeBack = (t) => { t = clamp(t, 0, 1); const c = 1.9; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+const angDiff = (a, b) => { let d = (b - a) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; };
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay; const l2 = dx * dx + dy * dy || 1;
+  const t = clamp(((px - ax) * dx + (py - ay) * dy) / l2, 0, 1);
+  const qx = ax + dx * t, qy = ay + dy * t;
+  return { d: hyp(px - qx, py - qy), qx, qy, t };
+}
+
+// ===== 色（シルクスクリーンの限定色）=====
+const C = {
+  paper: '#f6ead1', paper2: '#eedcb8', cream: '#fbf3df', white: '#fffaee',
+  ink: '#2e2933', ink2: '#4a4250',
+  ver: '#e3532e', verD: '#b83b1d', verL: '#f0896a',
+  yg: '#9dc144', ygD: '#6c9230', ygL: '#c3dc82',
+  yam: '#f2a71e', yamD: '#c7810f', yamL: '#f8c868',
+  sky: '#80c8dd', skyD: '#4f9bb6', skyL: '#b5e0ec',
+  tin: '#c9cdd0', tinD: '#8e959b', tinL: '#eef0ee',
+};
+// セッションごとの配色の入れ替え（限定4色の役割だけを回す）
+const ACC = [C.ver, C.yg, C.yam, C.sky];
+const ACC_D = { [C.ver]: C.verD, [C.yg]: C.ygD, [C.yam]: C.yamD, [C.sky]: C.skyD };
+const ACC_L = { [C.ver]: C.verL, [C.yg]: C.ygL, [C.yam]: C.yamL, [C.sky]: C.skyL };
+const dk = (c) => ACC_D[c] || c;
+const lt = (c) => ACC_L[c] || c;
+
+// ===== キャンバスとカメラ =====
+const cv = document.getElementById('c');
+let g = cv.getContext("2d");
+let W = 1, H = 1, DPR = 1;
+const cam = { s: 1, ox: 0, oy: 0, z: 1, zx: 360, zy: 450 };
+const VIEW = { x0: 0, x1: 720, y0: -50, y1: 960 };
+const SAFE = { t: 0, r: 0, b: 0, l: 0 };
+let VIS = { x0: 0, y0: 0, x1: 720, y1: 960 }; // 実際に見えている world 範囲
+let layoutGen = 0;
+
+function readSafe() {
+  try {
+    const s = getComputedStyle(document.getElementById('sa'));
+    SAFE.t = parseFloat(s.paddingTop) || 0; SAFE.r = parseFloat(s.paddingRight) || 0;
+    SAFE.b = parseFloat(s.paddingBottom) || 0; SAFE.l = parseFloat(s.paddingLeft) || 0;
+  } catch (e) { SAFE.t = SAFE.r = SAFE.b = SAFE.l = 0; }
+}
+function resize() {
+  readSafe();
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  const aw = Math.max(50, W - SAFE.l - SAFE.r), ah = Math.max(50, H - SAFE.t - SAFE.b);
+  const vw = VIEW.x1 - VIEW.x0, vh = VIEW.y1 - VIEW.y0;
+  const s = Math.min(aw / vw, ah / vh);
+  cam.s = s;
+  cam.ox = SAFE.l + (aw - vw * s) / 2 - VIEW.x0 * s;
+  // 縦に余るときは少し上寄せ（屋根と空を多めに）
+  const extraY = ah - vh * s;
+  cam.oy = SAFE.t + extraY * 0.42 - VIEW.y0 * s;
+  updateVis();
+  layoutGen++;
+}
+function updateVis() {
+  const s = cam.s * cam.z;
+  const ox = cam.ox + (cam.zx * cam.s) * (1 - cam.z), oy = cam.oy + (cam.zy * cam.s) * (1 - cam.z);
+  VIS = { x0: (0 - ox) / s, y0: (0 - oy) / s, x1: (W - ox) / s, y1: (H - oy) / s, s, ox, oy };
+}
+function toWorld(cx, cy) {
+  const r = cv.getBoundingClientRect();
+  return { x: (cx - r.left - VIS.ox) / VIS.s, y: (cy - r.top - VIS.oy) / VIS.s };
+}
+
+// ===== 音（Web Audio 合成） =====
+const AU = {
+  ctx: null, out: null, ok: false, noiseBuf: null, last: {}, loops: {},
+  unlock() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        const comp = this.ctx.createDynamicsCompressor();
+        comp.threshold.value = -16; comp.knee.value = 18; comp.ratio.value = 4;
+        comp.attack.value = 0.004; comp.release.value = 0.2;
+        this.out = this.ctx.createGain(); this.out.gain.value = 0.8;
+        this.out.connect(comp); comp.connect(this.ctx.destination);
+        const len = this.ctx.sampleRate * 1.5;
+        this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const d = this.noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      }
+      if (this.ctx.state !== 'running') this.ctx.resume().catch(() => {});
+      this.ok = true;
+    } catch (e) { this.ok = false; }
+  },
+  ready() { return this.ok && this.ctx && this.ctx.state === 'running'; },
+  gate(key, gap) { // 連打防止
+    const n = performance.now(); if (this.last[key] && n - this.last[key] < gap) return false;
+    this.last[key] = n; return true;
+  },
+  tone(f, dur, o = {}) {
+    if (!this.ready()) return;
+    try {
+      const c = this.ctx, t = c.currentTime + (o.delay || 0);
+      if (f > c.sampleRate * 0.45 || (o.f2 && o.f2 > c.sampleRate * 0.45)) return;
+      const osc = c.createOscillator(), gn = c.createGain();
+      osc.type = o.type || 'sine';
+      osc.frequency.setValueAtTime(f, t);
+      if (o.f2) osc.frequency.exponentialRampToValueAtTime(Math.max(20, o.f2), t + (o.sweep || dur));
+      if (o.vib) { const l = c.createOscillator(), lg = c.createGain(); l.frequency.value = o.vib; lg.gain.value = o.vibAmt || f * 0.03; l.connect(lg); lg.connect(osc.frequency); l.start(t); l.stop(t + dur + 0.05); }
+      const a = o.a || 0.004, v = o.g == null ? 0.2 : o.g;
+      gn.gain.setValueAtTime(0.0001, t);
+      gn.gain.exponentialRampToValueAtTime(v, t + a);
+      gn.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      let node = osc;
+      if (o.lp) { const fl = c.createBiquadFilter(); fl.type = 'lowpass'; fl.frequency.value = o.lp; node.connect(fl); node = fl; }
+      node.connect(gn);
+      if (o.pan && c.createStereoPanner) { const p = c.createStereoPanner(); p.pan.value = clamp(o.pan, -1, 1); gn.connect(p); p.connect(this.out); } else gn.connect(this.out);
+      osc.start(t); osc.stop(t + dur + 0.05);
+    } catch (e) {}
+  },
+  noise(dur, o = {}) {
+    if (!this.ready()) return;
+    try {
+      const c = this.ctx, t = c.currentTime + (o.delay || 0);
+      const src = c.createBufferSource(); src.buffer = this.noiseBuf;
+      src.playbackRate.value = o.rate || 1;
+      const fl = c.createBiquadFilter(); fl.type = o.ft || 'bandpass';
+      fl.frequency.setValueAtTime(o.f || 1200, t); fl.Q.value = o.q || 1;
+      if (o.f2) fl.frequency.exponentialRampToValueAtTime(o.f2, t + dur);
+      const gn = c.createGain(); const v = o.g == null ? 0.2 : o.g;
+      gn.gain.setValueAtTime(0.0001, t);
+      gn.gain.exponentialRampToValueAtTime(v, t + (o.a || 0.003));
+      gn.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      src.connect(fl); fl.connect(gn);
+      if (o.pan && c.createStereoPanner) { const p = c.createStereoPanner(); p.pan.value = clamp(o.pan, -1, 1); gn.connect(p); p.connect(this.out); } else gn.connect(this.out);
+      src.start(t, Math.random() * 0.8); src.stop(t + dur + 0.05);
+    } catch (e) {}
+  },
+  // 連続音（注ぐ水・湯気）: gain を毎フレーム更新
+  loop(key, ft, f, q) {
+    if (!this.ready()) return null;
+    if (this.loops[key]) return this.loops[key];
+    try {
+      const c = this.ctx; const src = c.createBufferSource(); src.buffer = this.noiseBuf; src.loop = true;
+      const fl = c.createBiquadFilter(); fl.type = ft; fl.frequency.value = f; fl.Q.value = q;
+      const gn = c.createGain(); gn.gain.value = 0;
+      src.connect(fl); fl.connect(gn); gn.connect(this.out); src.start();
+      this.loops[key] = { src, fl, gn, v: 0 };
+      return this.loops[key];
+    } catch (e) { return null; }
+  },
+  setLoop(key, v, f) {
+    const L = this.loops[key] || (v > 0.001 ? this.loop(key, key === 'pour' ? 'bandpass' : 'highpass', key === 'pour' ? 900 : 3200, key === 'pour' ? 0.8 : 0.5) : null);
+    if (!L) return;
+    if (Math.abs(L.v - v) < 0.002 && !f) return;
+    L.v = v;
+    try { const t = this.ctx.currentTime; L.gn.gain.setTargetAtTime(v, t, 0.06); if (f) L.fl.frequency.setTargetAtTime(f, t, 0.1); } catch (e) {}
+  },
+  suspend() { try { if (this.ctx && this.ctx.state === 'running') this.ctx.suspend(); } catch (e) {} },
+  resume() { try { if (this.ctx && this.ok && this.ctx.state !== 'running') this.ctx.resume().catch(() => {}); } catch (e) {} },
+};
+const panOf = (x) => clamp((x - 360) / 420, -0.8, 0.8);
+function bellTone(f, g, dur, pan, delay) {
+  const P = [1, 2.76, 5.4, 8.93];
+  P.forEach((m, i) => AU.tone(f * m, dur / (1 + i * 0.7), { g: g / (1 + i * 1.3), a: 0.002, pan, delay }));
+}
+const SFX = {
+  tink(x) { if (AU.gate('tink', 60)) { AU.tone(2400, 0.22, { g: 0.12, pan: panOf(x) }); AU.tone(3620, 0.16, { g: 0.07, pan: panOf(x) }); } },
+  kotoN(x, s = 1) { if (!AU.gate('koto', 70)) return; AU.tone(240, 0.16, { g: 0.22 * s, f2: 150, sweep: 0.12, pan: panOf(x) }); AU.noise(0.08, { f: 700, q: 1.2, g: 0.18 * s, pan: panOf(x) }); AU.tone(1820, 0.18, { g: 0.06 * s, pan: panOf(x) }); },
+  garan(x, s = 1) { if (!AU.gate('garan', 120)) return; [312, 761, 1287, 1833, 2471].forEach((f, i) => AU.tone(f * rnd(0.98, 1.02), 1.3 - i * 0.18, { g: 0.13 * s / (1 + i * 0.5), pan: panOf(x), type: i === 0 ? 'triangle' : 'sine' })); AU.noise(0.12, { f: 2400, q: 0.8, g: 0.15 * s, pan: panOf(x) }); },
+  kan(x, s = 1) { if (!AU.gate('kan', 90)) return; [880, 1953, 3110].forEach((f, i) => AU.tone(f, 0.5 - i * 0.12, { g: 0.12 * s / (1 + i), pan: panOf(x) })); },
+  click(x, s = 1) { if (!AU.gate('click', 40)) return; AU.noise(0.025, { f: 2600, q: 3, g: 0.09 * s, pan: panOf(x) }); AU.tone(920 * rnd(0.95, 1.05), 0.03, { g: 0.05 * s, type: 'triangle', pan: panOf(x) }); },
+  pon(x, p = 1) { if (!AU.gate('pon', 80)) return; AU.tone(760 * p, 0.14, { g: 0.3, f2: 210 * p, sweep: 0.1, pan: panOf(x) }); AU.noise(0.05, { f: 1600, q: 1, g: 0.2, pan: panOf(x) }); AU.tone(1300 * p, 0.12, { g: 0.06, delay: 0.03, pan: panOf(x) }); },
+  bellMain(x) { if (AU.gate('bm', 150)) bellTone(1568, 0.22, 2.2, panOf(x)); },
+  bellSmall(x) { if (AU.gate('bs', 120)) { bellTone(2637, 0.12, 0.9, panOf(x)); bellTone(2637, 0.08, 0.7, panOf(x), 0.11); } },
+  bellOther(x) { if (AU.gate('bo', 150)) { bellTone(1175, 0.2, 2.0, panOf(x)); bellTone(1760, 0.1, 1.4, panOf(x), 0.16); } },
+  bellBig(x) { if (AU.gate('bb', 300)) { bellTone(587, 0.3, 3.2, panOf(x)); bellTone(880, 0.14, 2.4, panOf(x), 0.25); bellTone(1175, 0.1, 2, panOf(x), 0.5); } },
+  meow(x, k = 0) {
+    if (!AU.gate('meow', 300)) return;
+    const f = k === 1 ? 760 : k === 2 ? 540 : 620; const d = k === 1 ? 0.22 : k === 2 ? 0.6 : 0.38;
+    AU.tone(f, d, { type: 'triangle', g: 0.13, f2: f * (k === 1 ? 1.5 : 0.72), sweep: d, vib: 7, vibAmt: 18, lp: 2200, pan: panOf(x) });
+    AU.tone(f * 2, d * 0.8, { type: 'sine', g: 0.04, f2: f * 1.3, sweep: d, pan: panOf(x) });
+  },
+  purr(x) { if (!AU.gate('purr', 1200)) return; for (let i = 0; i < 9; i++) AU.noise(0.09, { ft: 'lowpass', f: 220, q: 0.7, g: 0.12, delay: i * 0.11, pan: panOf(x) }); },
+  yawn(x) { if (!AU.gate('yawn', 1500)) return; AU.tone(560, 0.9, { type: 'triangle', g: 0.07, f2: 260, sweep: 0.85, lp: 1400, pan: panOf(x) }); AU.noise(0.7, { f: 900, q: 0.6, g: 0.03, pan: panOf(x) }); },
+  boing(x, s = 1) { if (!AU.gate('boing', 90)) return; AU.tone(170, 0.45, { g: 0.22 * s, f2: 430, sweep: 0.14, vib: 16, vibAmt: 40, pan: panOf(x) }); AU.tone(420, 0.3, { g: 0.06, delay: 0.14, f2: 160, sweep: 0.25, pan: panOf(x) }); },
+  splash(x, s = 1) { if (AU.gate('splash', 90)) AU.noise(0.16, { f: 1400, q: 0.7, g: 0.07 * s, f2: 600, pan: panOf(x) }); },
+  drip(x) { if (AU.gate('drip', 70)) AU.tone(1300 * rnd(0.9, 1.15), 0.05, { g: 0.06, f2: 2100, sweep: 0.04, pan: panOf(x) }); },
+  flap(x) { if (!AU.gate('flap', 60)) return; AU.noise(0.09, { ft: 'lowpass', f: 700, q: 0.7, g: 0.22, pan: panOf(x) }); AU.tone(130, 0.12, { g: 0.18, f2: 80, pan: panOf(x) }); },
+  success() { if (!AU.gate('succ', 400)) return; [1047, 1319, 1568, 2093].forEach((f, i) => { AU.tone(f, 0.6, { type: 'triangle', g: 0.12, delay: i * 0.09 }); AU.tone(f * 2, 0.3, { g: 0.03, delay: i * 0.09 }); }); },
+  fanfare() { if (!AU.gate('fan', 800)) return; [784, 988, 1175, 1568, 1319, 1568, 2093].forEach((f, i) => AU.tone(f, 0.5, { type: 'triangle', g: 0.12, delay: i * 0.12 })); },
+  pick() { if (AU.gate('pick', 60)) AU.tone(480, 0.07, { g: 0.12, f2: 820, sweep: 0.05 }); },
+  drop(x) { if (AU.gate('drop', 60)) AU.tone(320, 0.09, { g: 0.12, f2: 190, sweep: 0.07, pan: panOf(x) }); },
+  creak(x) { if (AU.gate('creak', 260)) AU.tone(92, 0.28, { type: 'sawtooth', g: 0.035, f2: 120, lp: 700, vib: 30, vibAmt: 12, pan: panOf(x) }); },
+  whoosh(x) { if (AU.gate('wh', 120)) AU.noise(0.4, { f: 400, f2: 2200, q: 0.8, g: 0.1, pan: panOf(x) }); },
+  munch(x) { if (!AU.gate('munch', 400)) return; for (let i = 0; i < 4; i++) AU.noise(0.05, { f: 1800, q: 1.4, g: 0.08, delay: i * 0.16, pan: panOf(x) }); },
+  hop(x) { if (AU.gate('hop', 120)) AU.tone(420, 0.13, { g: 0.1, f2: 980, sweep: 0.1, pan: panOf(x) }); },
+  clink(x) { if (AU.gate('clink', 80)) { AU.tone(3100, 0.12, { g: 0.12, pan: panOf(x) }); AU.tone(4300, 0.08, { g: 0.06, pan: panOf(x) }); } },
+  tap(x) { if (AU.gate('tap', 80)) AU.tone(700 * rnd(0.9, 1.1), 0.05, { g: 0.05, type: 'triangle', pan: panOf(x) }); },
+  hiss(x) { if (AU.gate('hiss', 300)) AU.noise(0.5, { ft: 'highpass', f: 3000, q: 0.5, g: 0.05, pan: panOf(x) }); },
+  pat(x) { if (AU.gate('pat', 50)) AU.noise(0.04, { ft: 'lowpass', f: 500, g: 0.12, pan: panOf(x) }); },
+};
+// ===== シルクスクリーン風の描画ヘルパー =====
+const MIS = { x: 2.3, y: 1.8 };   // 版ずれ
+let HT = null, HTL = null, GRAIN = null, GRAIN_PAT = null, STRIPE = null;
+function makePatterns() {
+  const mk = (w, h, f) => { const c = document.createElement('canvas'); c.width = w; c.height = h; f(c.getContext('2d')); return c; };
+  HT = g.createPattern(mk(7, 7, (x) => { x.fillStyle = 'rgba(46,41,51,0.6)'; x.beginPath(); x.arc(3.5, 3.5, 1.45, 0, TAU); x.fill(); }), 'repeat');
+  HTL = g.createPattern(mk(6, 6, (x) => { x.fillStyle = 'rgba(255,250,238,0.75)'; x.beginPath(); x.arc(3, 3, 1.2, 0, TAU); x.fill(); }), 'repeat');
+  STRIPE = g.createPattern(mk(10, 10, (x) => { x.strokeStyle = 'rgba(46,41,51,0.22)'; x.lineWidth = 2; x.beginPath(); x.moveTo(-2, 12); x.lineTo(12, -2); x.stroke(); }), 'repeat');
+  GRAIN = mk(220, 220, (x) => {
+    for (let i = 0; i < 1500; i++) {
+      const a = Math.random();
+      x.fillStyle = a < 0.75 ? 'rgba(60,45,40,' + (0.05 + Math.random() * 0.09) + ')' : 'rgba(255,252,240,' + (0.12 + Math.random() * 0.2) + ')';
+      const r = Math.random() < 0.9 ? 0.6 + Math.random() * 0.9 : 1.6 + Math.random() * 1.6;
+      x.fillRect(Math.random() * 220, Math.random() * 220, r, r * (0.6 + Math.random() * 0.8));
+    }
+  });
+  GRAIN_PAT = g.createPattern(GRAIN, 'repeat');
+}
+function worldTf(ctx) { ctx.setTransform(DPR * VIS.s, 0, 0, DPR * VIS.s, DPR * VIS.ox, DPR * VIS.oy); }
+function rrPath(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+function ellPath(x, y, rx, ry, rot = 0) { g.moveTo(x + rx * Math.cos(rot), y + rx * Math.sin(rot)); g.ellipse(x, y, rx, ry, rot, 0, TAU); }
+function polyPath(pts) { g.moveTo(pts[0], pts[1]); for (let i = 2; i < pts.length; i += 2) g.lineTo(pts[i], pts[i + 1]); g.closePath(); }
+function fillMis(fn, col, a) {
+  g.save(); g.translate(MIS.x, MIS.y); g.beginPath(); fn(); g.fillStyle = col; if (a != null) g.globalAlpha = a; g.fill(); g.restore();
+}
+function strokeP(fn, lw = 4, col = C.ink) {
+  g.beginPath(); fn(); g.lineWidth = lw; g.strokeStyle = col; g.lineJoin = 'round'; g.lineCap = 'round'; g.stroke();
+}
+// 版画の塊: ずれた塗り + ぷっくり陰影(網点) + 太い輪郭
+function shape(fn, col, o = {}) {
+  fillMis(fn, col);
+  if (o.bb && o.shade !== false) {
+    const [x, y, w, h] = o.bb;
+    g.save(); g.beginPath(); fn(); g.clip();
+    g.globalAlpha = o.ht == null ? 0.5 : o.ht; g.fillStyle = HT;
+    g.beginPath(); g.ellipse(x + w * 0.92, y + h * 1.02, w * 0.72, h * 0.62, 0, 0, TAU); g.fill();
+    g.globalAlpha = o.hl == null ? 0.5 : o.hl; g.fillStyle = C.white;
+    g.beginPath(); g.ellipse(x + w * 0.3, y + h * 0.26, Math.max(2, w * 0.2), Math.max(2, h * 0.14), -0.5, 0, TAU); g.fill();
+    g.restore();
+  }
+  if (o.lw !== 0) strokeP(fn, o.lw || 4, o.stroke || C.ink);
+}
+function line(x1, y1, x2, y2, lw = 4, col = C.ink) { g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.lineWidth = lw; g.strokeStyle = col; g.lineCap = 'round'; g.stroke(); }
+function dot(x, y, r, col) { g.beginPath(); g.arc(x, y, r, 0, TAU); g.fillStyle = col; g.fill(); }
+function circ(x, y, r, col, lw = 4, o) { shape(() => g.arc(x, y, r, 0, TAU), col, Object.assign({ bb: [x - r, y - r, r * 2, r * 2], lw }, o || {})); }
+function rrect(x, y, w, h, r, col, o) { shape(() => rrPath(x, y, w, h, r), col, Object.assign({ bb: [x, y, w, h] }, o || {})); }
+// きらり（成功時の光片）
+function sparkle(x, y, r, col, rot = 0) {
+  g.save(); g.translate(x, y); g.rotate(rot);
+  g.beginPath();
+  for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4, rr = i % 2 ? r * 0.32 : r; g.lineTo(Math.cos(a) * rr, Math.sin(a) * rr); }
+  g.closePath(); g.fillStyle = col; g.fill(); g.lineWidth = 2; g.strokeStyle = C.ink; g.stroke();
+  g.restore();
+}
+function heart(x, y, r, col) {
+  g.save(); g.translate(x, y);
+  const f = () => { g.moveTo(0, r * 0.9); g.bezierCurveTo(-r * 1.4, -r * 0.1, -r * 0.7, -r * 1.2, 0, -r * 0.45); g.bezierCurveTo(r * 0.7, -r * 1.2, r * 1.4, -r * 0.1, 0, r * 0.9); };
+  shape(f, col, { lw: 2.5 });
+  g.restore();
+}
+// お手本の手（半透明）
+function drawHand(x, y, press, alpha) {
+  g.save(); g.globalAlpha = alpha; g.translate(x, y); g.rotate(-0.35); const s = 1 - press * 0.08; g.scale(s, s);
+  const f = () => {
+    g.moveTo(-6, 0); g.quadraticCurveTo(-8, -38, 0, -40); g.quadraticCurveTo(8, -38, 7, 0);
+    g.lineTo(9, 4); g.quadraticCurveTo(24, 2, 26, 14); g.quadraticCurveTo(30, 50, 10, 64);
+    g.lineTo(-14, 64); g.quadraticCurveTo(-30, 46, -28, 22); g.quadraticCurveTo(-26, 10, -6, 6); g.closePath();
+  };
+  fillMis(f, C.white); strokeP(f, 3.5, C.ink);
+  line(9, 6, 10, 20, 2.5); line(17, 8, 18, 22, 2.5);
+  if (press > 0.3) { g.globalAlpha = alpha * press; strokeP(() => g.arc(0, -42, 14 + press * 8, 0, TAU), 3, C.ver); }
+  g.restore();
+}
+// ===== 世界の状態 =====
+const GRAV = 1800;
+const YC = 900; // カウンター天板
+let T = 0;      // ゲーム内時間(秒)
+let timeScale = 1;
+const S = {     // 保存対象を含む主要状態
+  phase: 'kitchen',        // kitchen | morph | stall
+  morphT: 0,
+  spoonSlot: 'L',
+  curtain: 0, curtainT: 0, // 0..1 開き具合
+  flag: 0,                 // 0..1 旗の高さ
+  shelfOpen: 0, doorOpen: 0,
+  catSpot: 'cushion',
+  served: 0, rounds: 0,
+  found: {},               // 発見の記録（内部・誘導用）
+  pal: 0,
+};
+// セッションごとの小さな違い
+const SES = {
+  pal: (Math.random() * 4) | 0,
+  kettle0: rnd(0.72, 1.0),
+  guestOrder: null,
+  seed: Math.random(),
+};
+function palette() { const p = SES.pal; return { collar: ACC[(p + 3) % 4], curtain: ACC[(p + 0) % 4], tile: ACC[(p + 1) % 4], awn: ACC[p % 2 === 0 ? 0 : 2], accent: ACC[(p + 2) % 4] }; }
+let PAL = palette();
+
+// 静的な面（転がる物・落ちる物がのる線分）: [x1,y1,x2,y2, 種類]
+const SEGS = [
+  [0, YC, 720, YC, 'counter'],
+  [54, 245, 236, 245, 'spoonShelf'],
+  [120, 630, 236, 630, 'bellShelf'],
+  [498, 790, 498, 900, 'toasterL'],
+  [622, 790, 622, 900, 'toasterR'],
+  [400, 300, 600, 300, 'stove'],
+  [498, 790, 622, 790, 'toasterTop'],
+  [446, 198, 652, 198, 'sill'],
+];
+// 道具がのせられる面（離したとき下へ落ちる先）
+const SURF = [
+  { x1: 4, x2: 716, y: YC, k: 'counter' },
+  { x1: 56, x2: 234, y: 245, k: 'spoonShelf' },
+  { x1: 120, x2: 236, y: 630, k: 'bellShelf' },
+  { x1: 402, x2: 598, y: 300, k: 'stove' },
+  { x1: 446, x2: 652, y: 198, k: 'sill' },
+  { x1: 300, x2: 430, y: 470, k: 'cupboard' },
+  { x1: 290, x2: 492, y: 812, k: 'table', toolOnly: true },
+];
+
+// ===== 粒子 =====
+const WATER = [], STEAM = [], FX = [];
+const MAXW = 170, MAXS = 60, MAXFX = 90;
+function addFX(o) { if (FX.length >= MAXFX) FX.shift(); o.t = 0; FX.push(o); return o; }
+function puff(x, y, n, col, sp = 120, life = 0.5, r = 6) {
+  for (let i = 0; i < n; i++) { const a = rnd(0, TAU), v = rnd(0.3, 1) * sp; addFX({ k: 'puff', x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 30, life: life * rnd(0.7, 1.2), r: r * rnd(0.6, 1.3), col }); }
+}
+function sparks(x, y, n, cols) { for (let i = 0; i < n; i++) { const a = rnd(0, TAU), v = rnd(90, 260); addFX({ k: 'spark', x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 120, life: rnd(0.5, 0.9), r: rnd(5, 9), col: pick(cols), rot: rnd(0, TAU) }); } }
+function ring(x, y, col, r0 = 10, r1 = 60, life = 0.45) { addFX({ k: 'ring', x, y, r0, r1, life, col }); }
+
+// ===== 転がる/飛ぶ体（みかん・ふた・パン・ホットケーキ） =====
+const BODIES = [];
+function mkBody(o) {
+  const b = Object.assign({ x: 0, y: 0, vx: 0, vy: 0, r: 20, ang: 0, va: 0, e: 0.3, fr: 0.5, rest: 0, alive: true, held: false, onSurf: null, age: 0, k: 'body', mag: false, owner: null }, o);
+  BODIES.push(b); return b;
+}
+function stepBody(b, dt) {
+  if (!b.alive || b.held || b.carried) return;
+  b.age += dt;
+  b.vy += GRAV * dt;
+  if (b.mag && TOOLS.magnet && !TOOLS.magnet.drag) magnetPull(b, dt);
+  b.x += b.vx * dt; b.y += b.vy * dt;
+  b.ang += b.va * dt;
+  let touched = false;
+  for (const s of SEGS) {
+    if (s[4] === 'sill' && b.k !== 'bread' && b.k !== 'pancake') continue;
+    const q = segDist(b.x, b.y, s[0], s[1], s[2], s[3]);
+    if (q.d < b.r && q.d > 0.0001) {
+      const nx = (b.x - q.qx) / q.d, ny = (b.y - q.qy) / q.d;
+      if (ny > 0.2 && s[1] === s[3]) continue; // 下からは通り抜け（棚の裏）
+      b.x = q.qx + nx * b.r; b.y = q.qy + ny * b.r;
+      const vn = b.vx * nx + b.vy * ny;
+      if (vn < 0) {
+        const tx = -ny, ty = nx; const vt = b.vx * tx + b.vy * ty;
+        const e = Math.abs(vn) > 140 ? b.e : 0;
+        b.vx -= (1 + e) * vn * nx; b.vy -= (1 + e) * vn * ny;
+        const fr = b.roll ? 0.0035 : b.fr * dt * 6;
+        b.vx -= vt * tx * fr; b.vy -= vt * ty * fr;
+        if (Math.abs(vn) > 160 && b.onHit) b.onHit(s, Math.abs(vn));
+      }
+      touched = true; b.onSurf = s;
+      if (b.roll) b.va = (b.vx * -ny + b.vy * nx) / b.r;
+    }
+  }
+  // 左右の壁
+  const mnx = b.minX || b.r;
+  if (b.x < mnx) { b.x = mnx; if (b.vx < 0) { b.vx = -b.vx * 0.45; if (b.onWall) b.onWall(); } }
+  if (b.x > 720 - b.r) { b.x = 720 - b.r; if (b.vx > 0) b.vx = -b.vx * 0.45; }
+  if (b.y > 1100) { b.alive = false; }
+  if (!touched) b.onSurf = null;
+  else if (b.k === 'mandarin' && b.onSurf && b.onSurf[4] === 'spoonShelf' && Math.abs(b.vx) < 160) b.vx += (128 - b.x) * 5 * dt - b.vx * 1.5 * dt;
+  if (touched && hyp(b.vx, b.vy) < 12) { b.rest += dt; b.vx *= 0.9; } else b.rest = 0;
+}
+
+// ===== スプーン =====
+const SPOON = {
+  slot: 'L', x: 84, y: 245, L: 150, th: 0, w: 0, state: 'stand', // stand | fall | down | held | rise
+  fallDir: 1, hitM: false, sway: 0, held: false, hx: 0, hy: 0, downT: 0, riseT: 0, push: 0,
+  slotX(s) { return s === 'L' ? 84 : 188; },
+  tip() { return { x: this.x + Math.sin(this.th) * this.L, y: this.y - Math.cos(this.th) * this.L }; },
+};
+function spoonStep(dt) {
+  const sp = SPOON;
+  if (sp.state === 'stand') {
+    // 不安定に立つ: ばねで戻る + 小さな揺れ。磁石が近いと引かれる
+    let tq = -sp.th * 26 - sp.w * 3.2 + Math.sin(T * 2.1) * 0.35 + Math.sin(T * 3.7 + 1) * 0.18;
+    const mg = TOOLS.magnet; if (mg && !mg.drag) { const t = sp.tip(); const d = hyp(mg.x - t.x, mg.y - t.y); if (d < 170) tq += clamp((mg.x - t.x) / d, -1, 1) * (170 - d) / 170 * 34; }
+    tq += sp.push;
+    sp.w += tq * dt; sp.th += sp.w * dt;
+    if (Math.abs(sp.th) > 0.4) { sp.state = 'fall'; sp.fallDir = sgn(sp.th); sp.hitM = false; SFX.tink(sp.x); startRound('spoon'); }
+  } else if (sp.state === 'fall') {
+    sp.w += Math.sin(sp.th) * (3 * GRAV / (2 * sp.L)) * dt;
+    sp.th += sp.w * dt;
+    // みかんに当たる
+    const m = ROLL.mandarin;
+    if (!sp.hitM && m && m.alive && !m.held) {
+      const tip = sp.tip(); const q = segDist(m.x, m.y, sp.x, sp.y - 8, tip.x, tip.y);
+      if (q.d < m.r + 9 && sgn(m.x - sp.x) === sp.fallDir) {
+        sp.hitM = true;
+        const spd = Math.max(330, Math.abs(sp.w) * sp.L * q.t * 0.95);
+        m.vx = sp.fallDir * spd; m.vy = -40; m.roll = true;
+        SFX.kotoN(m.x, 0.8); ring(q.qx, q.qy, C.white, 6, 26, 0.25);
+        S.found[sp.fallDir > 0 ? 'spoonR' : 'spoonL'] = 1;
+      }
+    }
+    // 鍋のふたに当たる（右スロットから右へ倒したとき）
+    if (sp.fallDir > 0 && sp.slot === 'R' && LID.on && Math.abs(sp.th) > 1.05 && !sp.hitLid) {
+      sp.hitLid = true; SFX.clink(POT.x); LID.jig = 1; POT.w += 0.25; S.found.spoonLid = 1;
+    }
+    const lim = 1.46;
+    if (Math.abs(sp.th) >= lim) {
+      sp.th = lim * sgn(sp.th); sp.w = -sp.w * 0.28;
+      if (Math.abs(sp.w) < 0.6) { sp.state = 'down'; sp.w = 0; sp.downT = 0; }
+      SFX.kotoN(sp.tip().x, 1); puff(sp.tip().x, sp.y - 6, 3, C.cream, 60, 0.4, 5);
+    }
+  } else if (sp.state === 'down') {
+    sp.downT += dt;
+  } else if (sp.state === 'rise') {
+    sp.riseT += dt;
+    const k = easeBack(sp.riseT / 0.55);
+    sp.th = lerp(sp.riseFrom, 0, k);
+    if (sp.riseT >= 0.55) { sp.state = 'stand'; sp.th = 0.02 * sgn(sp.riseFrom); sp.w = -0.4 * sgn(sp.riseFrom); sp.hitLid = false; SFX.kotoN(sp.x, 0.6); }
+  } else if (sp.state === 'held') {
+    sp.th = lerp(sp.th, clamp((sp.hvx || 0) * 0.0015, -0.4, 0.4), 0.2);
+  }
+}
+function spoonRise() {
+  if (SPOON.state !== 'down') return;
+  SPOON.state = 'rise'; SPOON.riseT = 0; SPOON.riseFrom = SPOON.th; SPOON.hitLid = false;
+}
+// ===== 仕掛け: 吊り鍋・ふた・やかん・水・湯気・水車・トースター =====
+const ROLL = { mandarin: null };
+const POT = {
+  hx: 352, hy: -10, L: 290, a: 0, w: 0, hw: 62, water: 0.75, hitCool: 0, kettleCool: 0, fillT: 0,
+  get x() { return this.hx + Math.sin(this.a) * this.L; },
+  get y() { return this.hy + Math.cos(this.a) * this.L; },
+};
+const LID = { on: true, body: null, jig: 0, stuck: false, home() { return { x: POT.x - Math.sin(POT.a) * -48, y: POT.y - Math.cos(POT.a) * 48 }; } };
+const KET = { px: 575, py: 300, a: 0, w: 0, state: 'rest', pourT: 0, water: 0.9, lastPour: -9, dripT: 0, hitT: -9 };
+const WHEEL = { x: 615, y: 645, r: 64, ang: 0, w: 0, clickA: 0 };
+const TOAST = { x: 560, y: 790, wind: 0, bread: true, reloadT: 0, lever: 0, popT: -9, rattle: 0 };
+const BRACKET = { x: 612, y: 540, tilt: -0.44 };
+
+function kettleLocal(lx, ly) { // やかんのローカル（支点原点）→ world
+  const c = Math.cos(KET.a), s = Math.sin(KET.a);
+  return { x: KET.px + lx * c - ly * s, y: KET.py + lx * s + ly * c };
+}
+function newMandarin(fromNet) {
+  if (ROLL.mandarin && ROLL.mandarin.alive && !ROLL.mandarin.eaten) return;
+  const m = mkBody({ k: 'mandarin', x: 128, y: fromNet ? 40 : 221, r: 24, e: 0.32, fr: 0.6, roll: true, food: 1 });
+  m.onHit = (s, v) => { if (v > 260) SFX.pat(m.x); };
+  m.vy = fromNet ? 60 : 0;
+  ROLL.mandarin = m;
+  if (fromNet) { SFX.drip(128); puff(128, 60, 3, C.yamL, 50, 0.4, 4); }
+}
+function potStep(dt) {
+  const P = POT;
+  P.w += (-(GRAV / P.L) * Math.sin(P.a) - 0.42 * P.w) * dt;
+  P.a += P.w * dt;
+  if (P.a < -0.12) { P.a = -0.12; if (P.w < 0) P.w = -P.w * 0.3; SFX.kotoN(P.x - 60, 0.3); } // 棚にぶつからない
+  P.hitCool -= dt; P.kettleCool -= dt;
+  // みかんとの衝突
+  const m = ROLL.mandarin;
+  if (m && m.alive && !m.held && !m.carried) {
+    const d = hyp(m.x - P.x, m.y - P.y);
+    if (d < m.r + 58 && P.hitCool <= 0) {
+      const nx = (m.x - P.x) / d, ny = (m.y - P.y) / d;
+      const vrel = m.vx * -nx + m.vy * -ny;
+      if (vrel > 40) {
+        const imp = Math.max(1.25, Math.min(2.1, vrel * 0.0046));
+        P.w += imp * (nx < 0 ? 1 : -1);
+        m.vx = 15; m.vy = -40;
+        m.x = P.x + nx * (m.r + 59); m.y = P.y + ny * (m.r + 59);
+        P.hitCool = 0.3;
+        SFX.garan(P.x, 1); ring(m.x, m.y, C.white, 8, 40, 0.3); puff(P.x - 50, P.y, 4, C.cream, 90, 0.4, 6);
+        bumpCat('far');
+        if (LID.on) popLid(P.w);
+        S.found.pot = 1; markChain('pot');
+      }
+    }
+  }
+  // やかんへ当たる
+  const right = P.x + P.hw * Math.cos(P.a) + 4;
+  if (right > 462 && P.w > 0.35 && P.kettleCool <= 0) {
+    KET.w += Math.min(4.5, 1.6 + P.w * 1.9); KET.hitT = T;
+    P.w = -P.w * 0.38; P.kettleCool = 0.4;
+    SFX.garan(470, 0.7); SFX.kan(500, 1); ring(462, 250, C.white, 8, 36, 0.3);
+    markChain('kettle');
+  }
+  // 傾きに応じて鍋の水がこぼれる
+  if (Math.abs(P.a) > 0.27 && P.water > 0.02) {
+    const side = sgn(P.a) * -1; // 右へ振れる→上縁の左が上がり、右縁から
+    P.spillAcc = (P.spillAcc || 0) + dt * 40 * (Math.abs(P.a) - 0.25);
+    while (P.spillAcc > 1) {
+      P.spillAcc -= 1; P.water = Math.max(0, P.water - 0.02);
+      const ex = P.x - side * P.hw * 0.95, ey = P.y - 40;
+      addWater(ex, ey, -side * rnd(30, 70) + P.w * 60, rnd(-30, 10), 'pot');
+    }
+  }
+  // 水の補充（鍋が落ち着いているとき）
+  if (Math.abs(P.a) < 0.06 && Math.abs(P.w) < 0.1 && P.water < 0.75 && !ROUND.active) {
+    P.fillT += dt; if (P.fillT > 0.22) { P.fillT = 0; P.water = Math.min(0.75, P.water + 0.03); addFX({ k: 'drop', x: 330, y: 34, vy: 200, y1: P.y - 36, life: 1 }); }
+  }
+  if (LID.jig > 0) LID.jig = Math.max(0, LID.jig - dt * 2.5);
+}
+function popLid(w) {
+  LID.on = false;
+  const h = LID.home();
+  const b = mkBody({ k: 'lid', x: h.x, y: h.y - 6, r: 26, e: 0.3, fr: 5, mag: true, va: -9, minX: 56 });
+  b.vx = -420 - Math.abs(w) * 6; b.vy = -20;
+  b.onHit = (s, v) => { if (v > 180) { SFX.garan(b.x, Math.min(1, v / 700) * 0.6); b.wob = 1.4; b.vx *= 0.25; } };
+  b.onWall = () => { SFX.kan(b.x, 0.5); b.vx *= 0.4; };
+  LID.body = b; SFX.clink(h.x);
+}
+function returnLid() {
+  if (LID.on) return;
+  const b = LID.body;
+  if (b) { b.alive = false; addFX({ k: 'lidFly', x0: b.x, y0: b.y, life: 0.7 }); }
+  LID.body = null; LID.stuck = false;
+}
+function addWater(x, y, vx, vy, src) {
+  if (WATER.length >= MAXW) return null;
+  const p = { x, y, vx, vy, life: 4, src, usedW: false, r: rnd(3.5, 5.5) };
+  WATER.push(p); return p;
+}
+function kettleStep(dt) {
+  const K = KET;
+  if (K.state === 'rest') {
+    K.w += (-14 * K.a - 4 * K.w) * dt; K.a += K.w * dt;
+    if (K.a < 0) { K.a = 0; if (K.w < 0) K.w = -K.w * 0.2; }
+    if (K.a > 0.3) { K.state = 'pour'; K.pourT = 0; SFX.kotoN(K.px, 0.5); markChain('pour'); }
+    // 補充
+    if (K.water < 1 && T - K.lastPour > 1.6 && K.a < 0.05) {
+      K.dripT += dt;
+      if (K.dripT > 0.16) { K.dripT = 0; K.water = Math.min(1, K.water + 0.016); addFX({ k: 'drop', x: 520, y: 152, vy: 160, y1: 190, life: 1 }); if (Math.random() < 0.3) SFX.drip(520); }
+    }
+  } else if (K.state === 'pour') {
+    K.pourT += dt; const tgt = K.water > 0.03 ? 0.78 : 0.2;
+    K.a += (tgt - K.a) * Math.min(1, dt * 6); K.w = 0;
+    if (K.water > 0.0 && K.a > 0.45) {
+      const rate = 44 * Math.min(1, K.water * 3);
+      K.acc = (K.acc || 0) + rate * dt;
+      while (K.acc > 1) {
+        K.acc -= 1; K.water = Math.max(0, K.water - 0.0082);
+        const tip = kettleLocal(30, -66);
+        addWater(tip.x + rnd(-2, 2), tip.y + rnd(-2, 2), rnd(18, 32), rnd(20, 50), 'kettle');
+      }
+      K.lastPour = T;
+    }
+    if (K.pourT > 2.0 || K.water <= 0.02) { K.state = 'rest'; K.w = -0.5; }
+  }
+}
+function steamStep(dt) {
+  const K = KET;
+  if (K.water > 0.04 && K.a < 0.3 && STEAM.length < MAXS) {
+    K.steamAcc = (K.steamAcc || 0) + dt * (5 + K.water * 6);
+    while (K.steamAcc > 1) {
+      K.steamAcc -= 1;
+      const fromSpout = Math.random() < 0.65; const p = fromSpout ? kettleLocal(30, -68) : kettleLocal(-60, -104);
+      STEAM.push({ x: p.x + rnd(-3, 3), y: p.y, vx: rnd(-8, 14), vy: -rnd(60, 95), life: rnd(2, 2.8), age: 0, r: rnd(7, 10), hitW: 0 });
+    }
+  }
+  const wm = TOOLS.windmill;
+  for (let i = STEAM.length - 1; i >= 0; i--) {
+    const p = STEAM[i]; p.age += dt;
+    p.vx += Math.sin(p.age * 3 + p.x * 0.05) * 14 * dt; p.vy *= 1 - dt * 0.25;
+    p.x += p.vx * dt; p.y += p.vy * dt; p.r += dt * 9;
+    if (wm && !wm.drag) {
+      const d = hyp(p.x - wm.x, p.y - wm.y);
+      if (d < 44 + p.r * 0.4 && p.hitW < 3) { p.hitW++; wm.w += 0.42 * (1 - p.age / p.life) + 0.08; p.vx += sgn(p.x - wm.x) * 30; }
+    }
+    if (p.age > p.life || p.y < -260) STEAM.splice(i, 1);
+  }
+}
+function waterStep(dt) {
+  for (let i = WATER.length - 1; i >= 0; i--) {
+    const p = WATER[i];
+    p.vy += GRAV * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+    let dead = p.life <= 0 || p.x < -20 || p.x > 740;
+    // 皿にたまる
+    if (!dead) for (const pl of PLATES) { if (plateCatch(pl, p)) { dead = true; break; } }
+    // 水車
+    if (!dead && !p.usedW) {
+      const dx = p.x - WHEEL.x, dy = p.y - WHEEL.y, d = hyp(dx, dy);
+      if (d < WHEEL.r + 3 && p.vy > 0) {
+        p.usedW = true;
+        const side = clamp(dx / WHEEL.r, -1, 1);
+        WHEEL.w += 0.075 * side * clamp(p.vy / 450, 0.4, 1.6);
+        p.vx = side * rnd(40, 90); p.vy *= 0.35;
+        if (Math.random() < 0.25) addFX({ k: 'drip', x: p.x, y: p.y, vx: side * 80, vy: -60, life: 0.3, r: 3 });
+        markChain('wheel');
+      }
+    }
+    // 熱いコンロ → じゅっ（湯気）
+    if (!dead && p.y > 296 && p.y < 316 && p.x > 400 && p.x < 600 && p.vy > 0) {
+      dead = true; if (STEAM.length < MAXS) STEAM.push({ x: p.x, y: 292, vx: rnd(-20, 20), vy: -rnd(70, 110), life: 1.8, age: 0, r: 8, hitW: 0 });
+      if (Math.random() < 0.2) SFX.hiss(p.x);
+    }
+    // 棚・カウンター
+    if (!dead) {
+      for (const s of SEGS) {
+        if (s[1] !== s[3]) continue;
+        if (p.x > s[0] && p.x < s[2] && p.y >= s[1] - 2 && p.y < s[1] + 14 && p.vy > 0) {
+          dead = true; if (Math.random() < 0.35) addFX({ k: 'drip', x: p.x, y: s[1] - 2, vx: rnd(-60, 60), vy: -rnd(40, 110), life: 0.28, r: 2.5 });
+          if (Math.random() < 0.12) SFX.splash(p.x, 0.6);
+          if (s[4] === 'counter') PUDDLE.add(p.x);
+          break;
+        }
+      }
+    }
+    // 寝ている猫に水
+    if (!dead && CAT.state === 'sleep' && hyp(p.x - CAT.x, p.y - (CAT.y - 30)) < 44) { dead = true; catWake('water'); }
+    if (dead) WATER.splice(i, 1);
+  }
+  const pourAmt = WATER.filter((p) => p.src === 'kettle' && !p.usedW).length;
+  AU.setLoop('pour', Math.min(0.12, pourAmt * 0.004));
+}
+const PUDDLE = { list: [], add(x) { for (const q of this.list) if (Math.abs(q.x - x) < 26) { q.a = Math.min(1, q.a + 0.05); return; } if (this.list.length < 8) this.list.push({ x, a: 0.15 }); }, step(dt) { for (const q of this.list) q.a -= dt * 0.03; this.list = this.list.filter((q) => q.a > 0); } };
+
+function wheelStep(dt) {
+  const Wh = WHEEL;
+  Wh.w *= Math.exp(-0.75 * dt);
+  Wh.ang += Wh.w * dt;
+  Wh.clickA += Math.abs(Wh.w) * dt;
+  if (Wh.clickA > 0.62) { Wh.clickA = 0; SFX.click(Wh.x, Math.min(1, Math.abs(Wh.w) / 3)); }
+  // トースターのばねを巻く（どちら向きでも巻ける）
+  if (TOAST.bread && Math.abs(Wh.w) > 0.12) {
+    TOAST.wind += Math.abs(Wh.w) * dt * 0.34;
+    if (TOAST.wind >= 1) toasterPop();
+  }
+}
+function toasterPop() {
+  const t = TOAST; t.wind = 0; t.bread = false; t.popT = T;
+  const str = clamp(0.7 + Math.abs(WHEEL.w) * 0.1, 0.74, 1.08);
+  const b = mkBody({ k: 'bread', x: t.x, y: t.y - 14, r: 21, e: 0.16, fr: 6, food: 1, va: -7 * str, bounces: 0 });
+  b.vx = -205 * str; b.vy = -860 * str;
+  b.onHit = (s, v) => { if (v > 200) SFX.pat(b.x); };
+  SFX.pon(t.x, 0.85 + (str - 0.8) * 1.4);
+  puff(t.x, t.y - 10, 7, C.cream, 160, 0.45, 7); ring(t.x, t.y - 20, C.yamL, 10, 70, 0.4);
+  S.found.pop = 1; markChain('pop');
+  catHearPop();
+}
+function toasterStep(dt) {
+  const t = TOAST;
+  t.lever = lerp(t.lever, t.bread ? 0.25 + t.wind * 0.75 : 0, Math.min(1, dt * 8));
+  if (t.rattle > 0) t.rattle = Math.max(0, t.rattle - dt * 3);
+  if (!t.bread && T - t.popT > 1.2 && !ROUND.active) {
+    t.reloadT += dt;
+    if (t.reloadT > 0.6) { t.reloadT = 0; t.bread = true; SFX.kotoN(t.x, 0.4); addFX({ k: 'slide', x: t.x, y: t.y, life: 0.4 }); }
+  }
+}
+// ===== シーソーとホットケーキ =====
+const SEE = { px: 540, py: 428, la: 70, ra: 72, a: -0.06, w: 0, state: 'rest', latchT: 0, pan: true, panCook: 0, jugT: 0, creakT: 0 };
+function seeLocal(lx, ly) { const c = Math.cos(SEE.a), s = Math.sin(SEE.a); return { x: SEE.px + lx * c - ly * s, y: SEE.py + lx * s + ly * c }; }
+function seesawStep(dt) {
+  const E = SEE;
+  const pl = PLATES.find((p) => p.slot === 'seesaw' && !p.drag);
+  const rightW = pl ? 0.6 + pl.water * 1.4 : 0;
+  const leftW = 0.7 + (E.pan ? 0.3 : 0);
+  if (E.state === 'rest') {
+    // 留め金で止まっている。水がたまると少しずつ沈む
+    const need = leftW + 0.4;
+    const f = clamp((rightW - 0.6) / (need - 0.6), 0, 1);
+    const tgt = -0.06 + 0.13 * f;
+    E.a += (tgt - E.a) * Math.min(1, dt * 3);
+    if (pl && pl.water > 0.05 && f > 0.15) { E.creakT += dt; if (E.creakT > 0.7) { E.creakT = 0; SFX.creak(E.px); } }
+    if (rightW >= need) { E.state = 'snap'; E.w = 7.5; SFX.boing(E.px, 0.8); markChain('seesaw'); S.found.seesaw = 1; }
+  } else if (E.state === 'snap' || E.state === 'down') {
+    if (E.state === 'snap') {
+      E.a += E.w * dt;
+      if (E.a >= 0.42) {
+        E.a = 0.42; E.state = 'down'; SFX.kotoN(E.px + 70, 1);
+        if (E.pan) launchPancake();
+        puff(E.px + 70, E.py + 10, 5, C.cream, 90, 0.4, 6);
+      }
+    }
+    if (E.state === 'down' && rightW < leftW - 0.05) { E.state = 'back'; }
+  } else if (E.state === 'back') {
+    E.a += (-0.06 - E.a) * Math.min(1, dt * 5);
+    if (Math.abs(E.a + 0.06) < 0.01) { E.state = 'rest'; E.a = -0.06; SFX.kotoN(E.px - 70, 0.6); }
+  }
+  // 生地の補充（受け皿が下にあるとき）
+  if (!E.pan && E.state === 'rest') {
+    E.jugT += dt;
+    if (E.jugT > 1.4) { E.jugT = 0; E.pan = true; E.panCook = 0; SFX.drip(E.px - 70); addFX({ k: 'batter', life: 0.8 }); }
+  }
+  if (E.pan) E.panCook = Math.min(1, E.panCook + dt * 0.5);
+}
+function launchPancake() {
+  SEE.pan = false;
+  const p = seeLocal(-70, -16);
+  const b = mkBody({ k: 'pancake', x: p.x, y: p.y, r: 24, e: 0.15, fr: 6, food: 1, va: 13 });
+  b.vx = -120; b.vy = -260;
+  b.onHit = (s, v) => { if (v > 200) SFX.pat(b.x); };
+  SFX.pon(p.x, 0.7); SFX.whoosh(p.x);
+  S.found.pancake = 1;
+}
+
+// ===== 皿（大皿・お客の皿）=====
+const PLATES = [];
+function mkPlate(o) {
+  const p = Object.assign({ kind: 'plate', id: 'p' + Math.random().toString(36).slice(2, 7), x: 0, y: YC, hw: 54, water: 0, slot: null, tilt: 0, drag: false, spill: 0, col: C.white, rim: C.sky, big: false, from: null, wob: 0, fall: null }, o);
+  PLATES.push(p); return p;
+}
+function plateCap(pl) { return pl.slot === 'bracket' ? 0.32 : 1; }
+function platePose(pl) { // スロットにあると位置が決まる
+  if (pl.slot === 'seesaw' && !pl.drag) { const e = seeLocal(72 + pl.hw - 16, -10); pl.x = e.x; pl.y = e.y; pl.tilt = SEE.a; }
+  else if (pl.slot === 'bracket' && !pl.drag) { pl.x = BRACKET.x; pl.y = BRACKET.y; pl.tilt = BRACKET.tilt; }
+  else if (!pl.drag && !pl.fall) pl.tilt *= 0.85;
+}
+function plateCatch(pl, p) {
+  if (pl.drag) return false;
+  const c = Math.cos(-pl.tilt), s = Math.sin(-pl.tilt);
+  const dx = p.x - pl.x, dy = p.y - pl.y;
+  const lx = dx * c - dy * s, ly = dx * s + dy * c;
+  if (Math.abs(lx) < pl.hw - 4 && ly > -20 && ly < 4 && p.vy > -20) {
+    pl.water = Math.min(plateCap(pl) + 0.25, pl.water + 0.022);
+    if (Math.random() < 0.15) SFX.drip(pl.x);
+    S.found.plateWater = 1;
+    return true;
+  }
+  return false;
+}
+function plateStep(pl, dt) {
+  platePose(pl);
+  if (pl.wob > 0) pl.wob = Math.max(0, pl.wob - dt * 2);
+  if (pl.fall) { // 離したあと下の面へ落ちる
+    const f = pl.fall; f.v += GRAV * dt; pl.y += f.v * dt;
+    if (pl.y >= f.y) { pl.y = f.y; pl.fall = null; pl.wob = 1; SFX.drop(pl.x); if (f.v > 300) puff(pl.x, pl.y, 3, C.cream, 60, 0.3, 4); }
+  }
+  // あふれ・こぼれ
+  const cap = plateCap(pl);
+  let spill = 0;
+  if (pl.water > cap) spill = (pl.water - cap) * 3 + 0.2;
+  if (pl.drag && Math.abs(pl.tilt) > 0.22 && pl.water > 0.02) spill = Math.max(spill, Math.abs(pl.tilt) * 1.6);
+  if (pl.slot === 'bracket' && pl.water > 0.01 && !pl.drag) spill = Math.max(spill, 0.55);
+  if (spill > 0 && pl.water > 0) {
+    pl.spillAcc = (pl.spillAcc || 0) + spill * dt * 45;
+    while (pl.spillAcc > 1 && pl.water > 0) {
+      pl.spillAcc -= 1; pl.water = Math.max(0, pl.water - 0.02);
+      const lowSide = pl.tilt === 0 ? (Math.random() < 0.5 ? -1 : 1) : (pl.tilt < 0 ? -1 : 1);
+      const c = Math.cos(pl.tilt), s = Math.sin(pl.tilt);
+      const lx = lowSide * (pl.hw + 2), ly = -6;
+      addWater(pl.x + lx * c - ly * s, pl.y + lx * s + ly * c, lowSide * rnd(12, 30), rnd(0, 30), 'plate');
+    }
+  }
+}
+
+// ===== 道具（磁石・バネ皿・風車）=====
+const TOOLS = {
+  magnet: { kind: 'magnet', x: 672, y: 770, drag: false, wob: 0, ang: 0 },
+  spring: { kind: 'spring', x: 596, y: 198, drag: false, squash: 0, sv: 0, wob: 0, fall: null },
+  windmill: { kind: 'windmill', x: 300, y: 92, drag: false, ang: 0, w: 0, wob: 0 },
+};
+function magnetPull(b, dt) {
+  const M = TOOLS.magnet;
+  if (b.stuck) { b.x = M.x + b.sx; b.y = M.y + b.sy; b.vx = b.vy = 0; b.va *= 0.9; return; }
+  const dx = M.x - b.x, dy = M.y - b.y; const d = hyp(dx, dy);
+  if (d < 270) {
+    const k = 3.3e7 * (1 / (d * d + 900) - 1 / (270 * 270 + 900));
+    b.vx += (dx / d) * k * dt; b.vy += (dy / d) * k * dt;
+    b.magFelt = Math.max(b.magFelt || 0, k);
+    if (d < 32 && hyp(b.vx, b.vy) < 300) { // ゆっくり近づくとくっつく
+      b.stuck = true; b.sx = -dx * 0.9; b.sy = -dy * 0.9; LID.stuck = b.k === 'lid'; SFX.clink(M.x); M.wob = 1; S.found.magStick = 1;
+    }
+  }
+}
+function toolsStep(dt) {
+  const M = TOOLS.magnet, Sp = TOOLS.spring, Wm = TOOLS.windmill;
+  for (const t of [M, Sp, Wm]) if (t.wob > 0) t.wob = Math.max(0, t.wob - dt * 2.2);
+  // バネ皿の伸び縮み
+  Sp.sv += (-Sp.squash * 260 - Sp.sv * 9) * dt; Sp.squash += Sp.sv * dt;
+  if (Sp.fall) { const f = Sp.fall; f.v += GRAV * dt; Sp.y += f.v * dt; if (Sp.y >= f.y) { Sp.y = f.y; Sp.fall = null; Sp.wob = 1; SFX.boing(Sp.x, 0.3); } }
+  // 風車
+  Wm.w *= Math.exp(-0.55 * dt); Wm.ang += Wm.w * dt;
+  if (Wm.w > 0.6) { Wm.clickA = (Wm.clickA || 0) + Wm.w * dt; if (Wm.clickA > 2.5) { Wm.clickA = 0; SFX.click(Wm.x, 0.35); } }
+  // ひもを巻くと旗が上がる / 止まると下がる
+  const before = S.flag;
+  S.flag = clamp(S.flag + (Wm.w > 0.8 ? Math.min(Wm.w, 9) * 0.024 : 0) * dt - 0.03 * dt, 0, 1);
+  if (before < 0.75 && S.flag >= 0.75) { S.found.flag = 1; SFX.success(); sparks(690, flagY() + 20, 8, [C.yam, C.ver, C.white]); }
+}
+function flagY() { return lerp(206, -38, S.flag); }
+
+// ===== ベル =====
+const BELLS = {
+  main: { x: 178, y: 610, r: 30, ring: 0, cool: 0, kind: 'main' },
+  small: { x: 36, y: 400, r: 18, ring: 0, cool: 0, kind: 'small' },
+  other: { x: 410, y: 455, r: 24, ring: 0, cool: 0, kind: 'other' },
+  big: { x: 330, y: -26, r: 32, ring: 0, cool: 0, kind: 'big' },
+};
+function ringBell(b, by) {
+  if (b.cool > 0) { b.ring = Math.max(b.ring, 0.4); return; }
+  b.ring = 1; b.cool = 0.5;
+  if (b.kind === 'main') SFX.bellMain(b.x); else if (b.kind === 'small') SFX.bellSmall(b.x); else if (b.kind === 'other') SFX.bellOther(b.x); else SFX.bellBig(b.x);
+  ring(b.x, b.y, C.yamL, b.r, b.r + 60, 0.5); ring(b.x, b.y, C.white, b.r * 0.6, b.r + 30, 0.35);
+  onBell(b, by);
+}
+function bellsStep(dt) {
+  for (const k in BELLS) { const b = BELLS[k]; b.ring = Math.max(0, b.ring - dt * 1.2); b.cool -= dt; }
+  // 物が当たると鳴る
+  for (const o of BODIES) {
+    if (!o.alive || o.held || o.carried || o.stuck) continue;
+    for (const k in BELLS) {
+      const b = BELLS[k]; if (k === 'big' && S.phase !== 'stall') continue;
+      const d = hyp(o.x - b.x, o.y - b.y);
+      if (d < o.r + b.r + (o.k === 'lid' && k === 'main' ? 14 : 0)) {
+        const sp = hyp(o.vx, o.vy);
+        if (sp > 90) {
+          ringBell(b, o.k);
+          const nx = (o.x - b.x) / d, ny = (o.y - b.y) / d; const vn = o.vx * nx + o.vy * ny;
+          if (vn < 0) { o.vx -= 1.5 * vn * nx; o.vy -= 1.5 * vn * ny; }
+          o.x = b.x + nx * (o.r + b.r + 1); o.y = b.y + ny * (o.r + b.r + 1);
+          if (k === 'small' && o.k === 'mandarin') { o.vx = 40; o.vy = 30; }
+        }
+      }
+    }
+  }
+}
+
+// ===== 引きひもとカーテン =====
+const CORD = { x: 270, y: 430, pull: 0, pv: 0, cool: 0 };
+function cordStep(dt) {
+  CORD.pv += (-CORD.pull * 90 - CORD.pv * 7) * dt; CORD.pull += CORD.pv * dt; CORD.cool -= dt;
+  S.curtainT = S.curtain; // 描画用は別に補間
+  for (const o of BODIES) {
+    if (!o.alive || o.held || o.carried || o.k === 'lid') continue;
+    if (o.vy < -150 && hyp(o.x - CORD.x, o.y - CORD.y) < 50 && CORD.cool <= 0) {
+      CORD.pv = 260; CORD.cool = 1; o.vy *= 0.8;
+      SFX.whoosh(CORD.x);
+      if (S.curtain < 0.5) { S.curtain = 1; S.found.curtain = 1; SFX.success(); sparks(545, 110, 8, [C.white, C.yam, C.sky]); }
+      else { CUR.shake = 1; }
+    }
+  }
+}
+const CUR = { v: 0, shake: 0 };
+// ===== 食べ物の当たり（バネ皿・お客の皿・テーブル）=====
+let FORCE_SUPER = false;
+const TABLE = { px: 392, py: 804, items: [],
+  free() { return this.items.length < 3; },
+  put(b) { b.held = false; b.carried = false; b.alive = false; this.items.push({ k: b.k, t: T }); SFX.success(); sparks(this.px, this.py - 20, 10, [C.yam, C.white, C.ver]); S.found.table = 1; S.served++; markChain('served'); },
+  // 屋台になったら、並べた朝ごはんはカウンターへ（最初のお客さんへ運べる）
+  release() { this.items.forEach((it, i) => { const b = mkBody({ k: it.k, x: this.px - 30 + i * 30, y: this.py - 20, r: it.k === 'mandarin' ? 24 : 22, e: 0.15, fr: 6, food: 1, roll: it.k === 'mandarin' }); b.vx = -30 + i * 20; b.vy = -260; }); this.items = []; },
+};
+function springTop() { const Sp = TOOLS.spring; return Sp.y - 30 + Sp.squash * 12; }
+function foodStep(dt) {
+  const Sp = TOOLS.spring;
+  let n = 0;
+  for (let i = BODIES.length - 1; i >= 0; i--) {
+    const b = BODIES[i];
+    if (!b.alive) { BODIES.splice(i, 1); continue; }
+    if (b.held || b.carried || b.stuck) continue;
+    if (b.fade != null) { b.fade -= dt; if (b.fade <= 0) b.alive = false; continue; }
+    if (b.food && b.rest > 0.5) n++;
+    // バネ皿
+    if ((b.food || b.k === 'lid') && !Sp.drag && !Sp.fall && b.vy > 0) {
+      const top = springTop();
+      if (Math.abs(b.x - Sp.x) < 50 && b.y + b.r > top && b.y - b.r < top + 8) {
+        b.bounces = (b.bounces || 0) + 1; b.y = top - b.r;
+        let v;
+        if (b.bounces === 1) v = b.k === 'lid' ? 700 : 1380;
+        else if (b.bounces === 2 && b.k === 'bread' && S.phase === 'stall' && (FORCE_SUPER || Math.random() < 0.13)) { v = 1900; b.superB = true; FORCE_SUPER = false; }
+        else v = Math.max(0, b.vy * 0.28);
+        b.vy = -v; b.vx *= b.bounces === 1 ? 0.12 : 0.35; b.va = (b.va || 0) * 0.5 + (Math.random() < 0.5 ? -8 : 8);
+        Sp.squash = 0.9; Sp.sv = 0; SFX.boing(Sp.x, v > 1000 ? 1 : 0.45);
+        if (v > 1000) { S.found.springB = 1; markChain('spring'); puff(Sp.x, top, 4, C.cream, 90, 0.35, 5); }
+      }
+    }
+    // お客の皿へ直接
+    if (b.food && b.vy > 0 && S.phase === 'stall') {
+      for (const gs of GUESTS) {
+        if (gs.state === 'wait' && hyp(b.x - gs.px, b.y - gs.py) < 44) { guestReceive(gs, b, 'air'); break; }
+      }
+    }
+    // 台所のテーブル（変身前）
+    if (b.food && b.vy > 0 && S.phase === 'kitchen' && TABLE.free() && hyp(b.x - TABLE.px, b.y - TABLE.py) < 36) { TABLE.put(b); continue; }
+    // ねこの体にぶつかると止まる（ねこの足もと）
+    if (!CAT.jump && !CAT.fly && !CAT.hold && CAT.state !== 'fetch' && CAT.state !== 'outside' && b.y > CAT.y - 110 && b.y < CAT.y + 4) {
+      const dx = b.x - CAT.x;
+      if (Math.abs(dx) < 50 + b.r && sgn(dx) !== sgn(b.vx) && Math.abs(b.vx) > 5) { b.x = CAT.x + sgn(dx) * (50 + b.r); b.vx = -b.vx * 0.15; if (CAT.state === 'sleep') CAT.earFlick = 1; }
+    }
+    // 着地したら平らに
+    if (b.rest > 0.12 && (b.k === 'bread' || b.k === 'pancake' || b.k === 'lid')) {
+      const tgt = Math.round(b.ang / Math.PI) * Math.PI; b.ang += (tgt - b.ang) * Math.min(1, dt * 8); b.va = 0;
+    }
+    if (b.k === 'lid' && b.wob > 0) {
+      b.wob -= dt; b.wobP = (b.wobP || 0) + dt * (12 + (1.4 - b.wob) * 26);
+      if (b.wobP > Math.PI) { b.wobP -= Math.PI; if (b.wob > 0.15) SFX.kan(b.x, 0.25 * b.wob); }
+    }
+  }
+  // 置きっぱなしの食べ物が増えすぎたら古いものから消える
+  if (n > 4) { const old = BODIES.filter((b) => b.food && b.rest > 0.5 && b.fade == null && !b.held && !b.carried).sort((a, b) => b.age - a.age)[0]; if (old) old.fade = 0.6; }
+}
+
+// ===== ゲーム内時間のタイマー =====
+const TIMERS = [];
+function later(s, fn) { TIMERS.push({ t: T + s, fn }); }
+function timersStep() { for (let i = TIMERS.length - 1; i >= 0; i--) { if (T >= TIMERS[i].t) { const f = TIMERS[i].fn; TIMERS.splice(i, 1); try { f(); } catch (e) { console.warn(e); } } } }
+
+// ===== 連鎖ラウンド =====
+const ROUND = { active: false, t: 0, quiet: 0, chain: {}, n: 0 };
+let lastEventT = 0;
+function startRound(src) {
+  if (!ROUND.active) { ROUND.active = true; ROUND.t = 0; ROUND.chain = {}; ROUND.n++; S.rounds++; }
+  ROUND.quiet = 0; ROUND.chain[src] = 1; lastEventT = T;
+}
+function markChain(k) { if (!ROUND.active) startRound(k); ROUND.chain[k] = 1; ROUND.quiet = 0; lastEventT = T; }
+function worldBusy() {
+  for (const b of BODIES) if (b.alive && !b.held && !b.carried && !b.stuck && b.fade == null && b.rest < 0.4 && b.y < 1050) return true;
+  if (WATER.length > 0) return true;
+  if (Math.abs(POT.w) > 0.25 || KET.state === 'pour' || Math.abs(WHEEL.w) > 0.35) return true;
+  if (SEE.state === 'snap') return true;
+  if (SPOON.state === 'fall') return true;
+  if (CAT.busy()) return true;
+  if (S.phase === 'morph') return true;
+  return false;
+}
+function roundStep(dt) {
+  if (!ROUND.active) return;
+  ROUND.t += dt;
+  if (worldBusy()) ROUND.quiet = 0; else ROUND.quiet += dt;
+  if (ROUND.quiet > 1.6 || ROUND.t > 40) endRound();
+}
+function endRound() {
+  ROUND.active = false;
+  rearm();
+  saveSoon();
+}
+function rearm() {
+  // 次の朝ごはんの準備（配置はそのまま、消費したものだけ補充）
+  later(0.25, () => spoonRise());
+  later(0.7, () => {
+    const m = ROLL.mandarin;
+    const onShelf = m && m.alive && !m.carried && !m.held && Math.abs(m.y - 221) < 20 && m.x > 16 && m.x < 236;
+    if (!onShelf) {
+      const extra = BODIES.filter((b) => b.k === 'mandarin' && b.alive && b.fade == null && !b.carried);
+      if (extra.length >= 2) extra.sort((a, b) => b.age - a.age)[0].fade = 0.6;
+      ROLL.mandarin = null; newMandarin(true);
+    }
+  });
+  later(1.0, () => { if (!LID.on) returnLid(); });
+}
+// ===== ねこ =====
+const SPOTS = {
+  cushion: { x: 205, y: 900, face: 1 },
+  sill: { x: 520, y: 198, face: -1 },
+  cupboard: { x: 352, y: 470, face: 1 },
+  door: { x: 96, y: 900, face: 1 },
+};
+const DOOR = { x: 85, y: 900 };
+const CAT = {
+  x: 205, y: 900, face: 1, state: 'sleep', t: 0, pose: 'loaf', jump: null, hold: null, mood: 'sleepy',
+  lookX: 0, lookY: 0, ear: 0, earFlick: 0, blinkT: 2, blink: 0, yawnT: 7, yawn: 0, sq: 0, shake: 0, purr: 0,
+  awakeT: 0, tries: 0, plan: null, wantT: 0, onShelf: null, fetchN: 0, eyeOpen: 0, startleT: 0, walk: null, wiggle: 0, onDone: null,
+  busy() { return !(this.state === 'sleep' || this.state === 'awake') || !!this.jump || !!this.walk || !!this.fly; },
+};
+function catSet(st) { CAT.state = st; CAT.t = 0; }
+// 跳ぶ: 頂点の高さ hUp（始点より上）
+function catJump(x1, y1, hUp, onLand, g = 2600) {
+  const C0 = CAT; const top = Math.min(C0.y, y1) - hUp;
+  const up = C0.y - top, down = y1 - top;
+  const vy0 = Math.sqrt(2 * g * Math.max(1, up));
+  const ta = vy0 / g, td = Math.sqrt(2 * Math.max(1, down) / g);
+  C0.jump = { x0: C0.x, y0: C0.y, x1, y1, vy0, g, dur: ta + td, t: 0, onLand };
+  C0.face = x1 >= C0.x - 2 ? 1 : -1; if (Math.abs(x1 - C0.x) < 6) C0.face = C0.face;
+  C0.walk = null; C0.sq = -0.3; C0.pose = 'leap';
+  SFX.hop(C0.x);
+}
+function catWalk(x1, onArrive, speed = 250) {
+  CAT.walk = { x1, sp: speed, onArrive }; CAT.face = x1 >= CAT.x ? 1 : -1; CAT.pose = 'walk';
+}
+// 近ければ歩く、遠ければ跳ぶ
+function catGo(x, y, onArrive) {
+  if (Math.abs(y - CAT.y) < 10 && Math.abs(x - CAT.x) < 260 && !catBlocked(CAT.x, x, y)) catWalk(x, onArrive);
+  else catJump(x, y, Math.max(70, Math.min(260, Math.abs(x - CAT.x) * 0.35 + 50)), onArrive);
+}
+function catBlocked(x0, x1, y) { // カウンター上でトースターをまたぐか
+  if (Math.abs(y - YC) > 10) return false;
+  const a = Math.min(x0, x1), b = Math.max(x0, x1);
+  return a < 498 && b > 498;
+}
+function catMove(dt) {
+  const c = CAT;
+  if (c.fly) {
+    const f = c.fly; f.t += dt; f.vy += 2600 * dt; c.x += f.vx * dt; c.y += f.vy * dt; c.pose = 'leap';
+    c.x = clamp(c.x, 40, 680);
+    if (f.vy > 0) { const sy = surfaceBelow(c.x, c.y - f.vy * dt - 2); if (c.y >= sy) { c.y = sy; c.fly = null; c.sq = 0.5; c.pose = 'sit'; SFX.pat(c.x); puff(c.x, c.y, 3, C.cream, 50, 0.3, 4); if (f.onLand) f.onLand(); } }
+  } else if (c.jump) {
+    const j = c.jump; j.t += dt;
+    const k = clamp(j.t / j.dur, 0, 1);
+    c.x = lerp(j.x0, j.x1, k);
+    c.y = j.y0 - j.vy0 * j.t + 0.5 * j.g * j.t * j.t;
+    if (j.t >= j.dur) { c.x = j.x1; c.y = j.y1; c.jump = null; c.sq = 0.45; c.pose = 'sit'; SFX.pat(c.x); puff(c.x, c.y, 3, C.cream, 50, 0.3, 4); if (j.onLand) j.onLand(); }
+  } else if (c.walk) {
+    const w = c.walk; const d = w.x1 - c.x;
+    if (Math.abs(d) < w.sp * dt) { c.x = w.x1; c.walk = null; c.pose = 'sit'; if (w.onArrive) w.onArrive(); }
+    else { c.x += sgn(d) * w.sp * dt; c.face = sgn(d); c.pose = 'walk'; }
+  }
+  if (c.hold) { const m = catMouth(); c.hold.x = m.x; c.hold.y = m.y; c.hold.vx = c.hold.vy = 0; }
+  c.sq *= Math.exp(-dt * 9);
+}
+function catMouth() { return { x: CAT.x + CAT.face * 44, y: CAT.y - (CAT.pose === 'leap' ? 52 : 50) }; }
+
+// ---- 刺激への反応 ----
+function bumpCat(kind) { if (CAT.state === 'sleep') { CAT.earFlick = 1; } }
+function catWake(by) {
+  const c = CAT;
+  if (c.state !== 'sleep' && c.state !== 'awake') return;
+  if (c.state === 'sleep') {
+    if (by === 'water') { c.shake = 1; SFX.meow(c.x, 1); }
+    else if (by === 'smallBell') { SFX.yawn(c.x); c.yawn = 1; }
+    else { SFX.meow(c.x, 0); }
+    S.found['wake_' + by] = 1;
+  }
+  catSet('awake'); c.mood = 'alert'; c.pose = 'sit'; c.awakeT = 0; c.ear = 1;
+  markChain('catWake');
+  later(by === 'smallBell' ? 1.1 : 0.6, () => { if (CAT.state === 'awake' && !CAT.hold) catTryFetch(true); });
+}
+function catHearPop() {
+  const c = CAT;
+  if (c.state === 'sleep') {
+    // びっくり → ベルへ大ジャンプ
+    catSet('startle'); c.mood = 'surprised'; c.pose = 'sit'; c.ear = 1; c.sq = -0.5; SFX.meow(c.x, 1);
+    puff(c.x, c.y - 70, 4, C.white, 80, 0.3, 4);
+    later(0.28, () => catStartleJump());
+  } else if (c.state === 'awake' && !c.hold && !c.jump && !c.fly) {
+    // 起きていたら空中キャッチ
+    catSet('pounce'); c.mood = 'focus';
+    later(0.12, () => catPounce());
+  }
+}
+function catStartleJump() {
+  const c = CAT, B = BELLS.main;
+  const st = findStep(c.x, c.y, B.x, B.y);
+  catSet('leap');
+  if (st) {
+    catJump(st.x, st.y - 8, 110, () => catStepOn(st));
+  } else {
+    catJump(B.x + 26, B.y + 20, 90, () => { ringBell(B, 'cat'); c.onShelf = 'bell'; catProud(); });
+  }
+}
+// ベルへの道の途中・ベルの横にある皿を探す（踏み台）
+function findStep(x0, y0, bx, by) {
+  let best = null, bd = 1e9;
+  for (const pl of PLATES) {
+    if (pl.drag || pl.fall || pl.slot === 'seesaw' || pl.slot === 'bracket') continue;
+    const q = segDist(pl.x, pl.y, x0, y0 - 40, bx, by);
+    const dB = hyp(pl.x - bx, pl.y - by), dF = hyp(pl.x - x0, pl.y - y0), dDoor = hyp(pl.x - DOOR.x, pl.y - DOOR.y);
+    const ok = (q.d < 80 || dB < 120 || dDoor < 120) && dF > 50 && dF < 560;
+    if (ok && dF < bd) { bd = dF; best = pl; }
+  }
+  return best;
+}
+function catStepOn(pl) {
+  const c = CAT; pl.wob = 1; SFX.boing(pl.x, 0.5); S.found.step = 1; markChain('step');
+  // 皿から次へ: 別のベル or 庭の扉（近い方）
+  const O = BELLS.other;
+  const dO = hyp(pl.x - O.x, pl.y - O.y), dD = hyp(pl.x - DOOR.x, pl.y - DOOR.y);
+  later(0.12, () => {
+    if (dD < dO) {
+      catJump(DOOR.x + 18, DOOR.y, 70, () => { openDoor(); c.onShelf = 'door'; catProud(); });
+    } else {
+      catJump(O.x - 30, O.y + 15, 80, () => { ringBell(O, 'cat'); c.onShelf = 'cupboard'; catProud(); });
+    }
+  });
+}
+function catPounce() {
+  const c = CAT;
+  // 飛んでいるパンの少し先を読んで、ちょうどその時刻に届くように跳ぶ
+  const b = BODIES.find((o) => o.k === 'bread' && o.alive && !o.carried && !o.held && o.rest === 0);
+  if (!b) { catSet('awake'); return; }
+  const tt = 0.42; const px = b.x + b.vx * tt, py = b.y + b.vy * tt + 0.5 * GRAV * tt * tt;
+  const face = px >= c.x ? 1 : -1;
+  const tx = px - face * 44, ty = py + 50;
+  c.face = face; c.walk = null; c.jump = null;
+  c.fly = { t: 0, vx: (tx - c.x) / tt, vy: (ty - c.y - 0.5 * 2600 * tt * tt) / tt, onLand: () => catLandAfterCatch() };
+  c.catchTarget = b; c.sq = -0.4; SFX.hop(c.x);
+}
+function catLandAfterCatch() {
+  const c = CAT; c.catchTarget = null;
+  if (c.hold) { S.found.airCatch = 1; catProud(); }
+  else { catSet('awake'); later(0.5, () => catTryFetch(true)); }
+}
+function surfaceBelow(x, y, tool) {
+  let best = YC;
+  for (const s of SURF) if ((tool || !s.toolOnly) && x >= s.x1 && x <= s.x2 && s.y >= y - 2 && s.y < best) best = s.y;
+  if (x > 498 && x < 622 && 790 >= y - 2 && 790 < best) best = 790;
+  return best;
+}
+function catCatchCheck() {
+  const c = CAT, b = c.catchTarget;
+  if (!b || !(c.jump || c.fly) || c.hold) return;
+  if (!b.alive || b.carried) { c.catchTarget = null; return; }
+  const m = catMouth();
+  if (hyp(b.x - m.x, b.y - m.y) < 64) { c.hold = b; b.carried = true; c.catchTarget = null; SFX.pat(c.x); SFX.meow(c.x, 0); sparks(m.x, m.y, 6, [C.yam, C.white]); markChain('catch'); if (c.fly) { c.fly.vx *= 0.25; c.fly.vy = Math.min(c.fly.vy, -200); } }
+}
+function catProud() {
+  const c = CAT; catSet('proud'); c.mood = 'proud'; c.pose = 'sit';
+  later(0.9, () => { if (CAT.state === 'proud') catTryFetch(false); });
+}
+// 食べ物を探して運ぶ
+function catTryFetch(soft) {
+  const c = CAT;
+  if (c.hold) { catDeliver(); return; }
+  const f = findFood();
+  if (!f) { if (soft) { catSet('awake'); } else catGoSleep(); return; }
+  catSet('fetch'); c.mood = 'want';
+  const fy = f.onSurf ? f.onSurf[1] : surfaceBelow(f.x, f.y - 10);
+  catGo(f.x - c.face * 0, fy, () => {
+    if (f.alive && !f.carried && hyp(f.x - c.x, f.y - (c.y - 30)) < 90) {
+      c.hold = f; f.carried = true; f.rest = 0; SFX.pat(c.x); later(0.25, () => catDeliver());
+    } else if (++c.tries < 3) later(0.2, () => catTryFetch(soft));
+    else { c.tries = 0; catGoSleep(); }
+  });
+}
+function findFood() {
+  let best = null, bd = 1e9;
+  for (const b of BODIES) {
+    if (!b.food || !b.alive || b.carried || b.held || b.fade != null || b.y > 960) continue;
+    if (b.k === 'mandarin' && b === ROLL.mandarin && Math.abs(b.y - 221) < 20 && b.x < 236) continue; // 棚の上は取らない
+    if (b.rest < 0.15 && !(b.onSurf && Math.abs(b.vx) < 120)) continue;
+    const d = hyp(b.x - CAT.x, b.y - CAT.y);
+    if (d < bd) { bd = d; best = b; }
+  }
+  return best;
+}
+function catDeliver() {
+  const c = CAT; catSet('carry'); c.mood = 'proud'; c.tries = 0;
+  if (S.phase !== 'stall') {
+    if (TABLE.free()) {
+      catGo(TABLE.px - 60, YC, () => { catSet('give'); later(0.35, () => { const f = c.hold; c.hold = null; if (f) { f.carried = false; TABLE.put(f); } catHappy(); }); });
+    } else { catSet('eat'); later(1.6, () => { if (c.hold) { c.hold.alive = false; c.hold = null; } catHappy(); }); SFX.munch(c.x); }
+    return;
+  }
+  const route = c.onShelf === 'door' && S.doorOpen ? 'garden' : c.onShelf === 'cupboard' && S.shelfOpen ? 'shelf' : 'direct';
+  c.onShelf = null;
+  if (route === 'garden') { catGardenRoute(); return; }
+  if (route === 'shelf') { catShelfRoute(); return; }
+  const gs = frontGuest();
+  if (!gs) { catGo(TABLE.px - 60, YC, () => { catSet('give'); later(0.35, () => { const f = c.hold; c.hold = null; if (f) { f.carried = false; f.vx = 20; f.vy = -120; } catHappy(); }); }); return; }
+  gs.calledBy = 'cat';
+  const tx = clamp(gs.px - 56, 240, 470);
+  catGo(tx, YC, () => { c.face = 1; catSet('give'); later(0.3, () => { const f = c.hold; c.hold = null; if (f && gs.state === 'wait') guestReceive(gs, f, 'cat'); else if (f) { f.carried = false; } catHappy(gs); }); });
+}
+function catShelfRoute() {
+  const c = CAT; S.found.shelfRoute = 1;
+  catGo(SPOTS.cupboard.x, SPOTS.cupboard.y, () => {
+    catSet('give'); c.face = 1;
+    later(0.3, () => { const f = c.hold; c.hold = null; if (f) startTray(f); catHappy(null, 'cupboard'); });
+  });
+}
+function catGardenRoute() {
+  const c = CAT; S.found.gardenRoute = 1;
+  catGo(DOOR.x, YC, () => {
+    catSet('outside'); c.out = 0; SFX.hop(c.x);
+    later(1.4, () => { const f = c.hold; c.hold = null; if (f) { f.alive = false; gardenFeed(f.k); } });
+    later(2.6, () => { catSet('happy'); c.mood = 'content'; c.out = 0; SFX.purr(c.x); later(1.2, () => catGoSleep('door')); });
+  });
+}
+function catHappy(gs, prefer) {
+  const c = CAT; catSet('happy'); c.mood = 'content'; c.purr = 1; SFX.purr(c.x); S.served = S.served || 0;
+  later(1.2, () => { catSet('want'); c.mood = 'want'; later(0.9, () => catGoSleep(prefer)); });
+}
+function catGoSleep(prefer) {
+  const c = CAT;
+  // 近くの心地よい場所で眠る（寝場所は次の連鎖の出発点になる）
+  const cands = ['cushion'];
+  if (S.curtain > 0.5) cands.push('sill');
+  if (S.shelfOpen) cands.push('cupboard');
+  if (S.doorOpen) cands.push('door');
+  let best = 'cushion', bd = 1e9;
+  for (const k of cands) { const s = SPOTS[k]; const d = hyp(s.x - c.x, s.y - c.y) * (k === prefer ? 0.5 : 1); if (d < bd) { bd = d; best = k; } }
+  catSet('toSleep');
+  const s = SPOTS[best];
+  catGo(s.x, s.y, () => { c.face = s.face; S.catSpot = best; catSet('sleep'); c.mood = 'sleepy'; c.pose = 'loaf'; c.yawnT = rnd(3, 6); saveSoon(); });
+}
+function catStep(dt) {
+  const c = CAT; c.t += dt;
+  catMove(dt); catCatchCheck();
+  // 視線: 指・飛んでいる物・次の対象
+  let tx = c.x + c.face * 120, ty = c.y - 140;
+  if (PTR.down && PTR.wx != null) { tx = PTR.wx; ty = PTR.wy; }
+  else { const fl = BODIES.find((b) => b.alive && !b.carried && b.rest === 0 && (b.food || b.k === 'lid')); if (fl) { tx = fl.x; ty = fl.y; } else if (HINT.target) { const h = hintPos(HINT.target); if (h) { tx = h.x; ty = h.y; } } }
+  const hx = c.x + c.face * 40, hy = c.y - 70;
+  const d = hyp(tx - hx, ty - hy) || 1;
+  c.lookX = lerp(c.lookX, (tx - hx) / d, Math.min(1, dt * 6)); c.lookY = lerp(c.lookY, (ty - hy) / d, Math.min(1, dt * 6));
+  // まばたき・耳・あくび
+  c.blinkT -= dt; if (c.blinkT < 0) { c.blink = 1; c.blinkT = rnd(2.2, 5); }
+  c.blink = Math.max(0, c.blink - dt * 7);
+  c.earFlick = Math.max(0, c.earFlick - dt * 3); c.ear = lerp(c.ear, c.state === 'sleep' ? 0 : 1, Math.min(1, dt * 4));
+  c.shake = Math.max(0, c.shake - dt * 1.5); c.purr = Math.max(0, c.purr - dt * 0.6);
+  if (c.yawn > 0) c.yawn = Math.max(0, c.yawn - dt * 0.8);
+  const near = PTR.down && PTR.wx != null && hyp(PTR.wx - c.x, PTR.wy - (c.y - 50)) < 170;
+  c.eyeOpen = lerp(c.eyeOpen, c.state === 'sleep' ? (near ? 0.45 : 0) : 1, Math.min(1, dt * 5));
+  if (c.state === 'sleep') {
+    c.yawnT -= dt; if (c.yawnT < 0) { c.yawnT = rnd(8, 13); c.yawn = 1; SFX.yawn(c.x); }
+    if (Math.random() < dt * 0.15) c.earFlick = 1;
+  } else if (c.state === 'awake') {
+    c.awakeT += dt;
+    c.retryT = (c.retryT || 0) - dt;
+    if (c.awakeT > 1 && c.retryT <= 0 && !c.jump && !c.walk && !c.fly && !c.hold) { c.retryT = 0.8; if (findFood()) catTryFetch(true); }
+    if (c.awakeT > 9 && !c.jump && !c.walk && !c.fly) { catGoSleep(); }
+  } else if (c.state === 'outside') {
+    c.out = Math.min(1, c.out + dt * 1.6);
+  }
+  if (c.state === 'want') c.wantT += dt; else c.wantT = 0;
+}
+// ===== お客（庭の動物たち）=====
+const GUEST_KINDS = ['rabbit', 'bear', 'duck', 'hedgehog', 'squirrel'];
+const FAV = { rabbit: 'mandarin', bear: 'pancake', duck: 'bread', hedgehog: 'mandarin', squirrel: 'bread' };
+const GUESTS = [];
+const QSLOT = [
+  { x: 440, y: 905, s: 1.12 }, { x: 352, y: 903, s: 1.06 }, { x: 272, y: 901, s: 1.0 },
+  { x: 800, y: 860, s: 0.86 }, { x: 890, y: 850, s: 0.82 }, { x: -80, y: 860, s: 0.86 },
+];
+const LOOSE = [ // 旗が低いとき: ばらばらに庭で待つ
+  { x: 440, y: 905, s: 1.12 }, { x: 600, y: 760, s: 0.72 }, { x: 150, y: 770, s: 0.72 }, { x: 680, y: 790, s: 0.76 }, { x: 40, y: 780, s: 0.74 }, { x: 520, y: 740, s: 0.68 },
+];
+const GT = { spawn: 0.4, idx: 0, n: 0 };
+function guestKindNext() {
+  if (!SES.guestOrder) { const rest = GUEST_KINDS.slice(1).sort(() => Math.random() - 0.5); SES.guestOrder = ['rabbit'].concat(rest); }
+  // 旗が低いと小さくて内気なお客だけ
+  const shy = ['rabbit', 'hedgehog'];
+  let k = SES.guestOrder[GT.idx % SES.guestOrder.length]; GT.idx++;
+  if (S.flag < 0.35 && shy.indexOf(k) < 0) k = shy[GT.idx % 2];
+  return k;
+}
+function spawnGuest(kind) {
+  kind = kind || guestKindNext();
+  const fromRight = Math.random() < 0.6;
+  const gs = { kind, state: 'arrive', t: 0, x: fromRight ? 860 : -140, y: 780, s: 0.6, tx: 0, ty: 0, ts: 1, slot: -1, n: GT.n++,
+    px: 0, py: 0, hop: 0, gesture: null, gT: rnd(2, 4), look: 0, offer: 0, food: null, eatT: 0, excite: 0, face: fromRight ? -1 : 1, plate: true, plateCol: pick([C.white, C.skyL, C.ygL, C.yamL]), fav: false, jump: 0 };
+  GUESTS.push(gs);
+  return gs;
+}
+function frontGuest() {
+  let best = null;
+  for (const gs of GUESTS) if (gs.state === 'wait' && gs.slot >= 0 && (!best || gs.slot < best.slot)) best = gs;
+  return best;
+}
+function guestReceive(gs, food, by) {
+  if (gs.state !== 'wait') return;
+  food.alive = false; food.carried = false;
+  gs.food = food.k; gs.state = 'receive'; gs.t = 0; gs.fav = FAV[gs.kind] === food.k;
+  SFX.success(); sparks(gs.px, gs.py - 10, gs.fav ? 14 : 8, [C.yam, C.white, C.ver, C.sky]);
+  S.served++; markChain('served'); S.found.served = 1; if (by === 'air') S.found.airServe = 1; if (by === 'tray') S.found.trayServe = 1;
+}
+function guestsStep(dt) {
+  if (S.phase !== 'stall') return;
+  const orderly = S.flag >= 0.45;
+  const maxQ = 1 + Math.round(S.flag * 3) + (S.curtain > 0.5 ? 1 : 0);
+  const present = GUESTS.filter((g) => g.state !== 'leave').length;
+  GT.spawn -= dt;
+  if (present < maxQ && GT.spawn <= 0) { spawnGuest(); GT.spawn = lerp(11, 3.2, S.flag) * (S.curtain > 0.5 ? 0.7 : 1); }
+  // 並び順を決める（来た順）
+  const line = GUESTS.filter((g) => g.state === 'arrive' || g.state === 'wait').sort((a, b) => a.n - b.n);
+  line.forEach((g, i) => {
+    const tbl = orderly ? QSLOT : LOOSE; const sl = tbl[Math.min(i, tbl.length - 1)];
+    g.slot = i; g.tx = sl.x + (i >= tbl.length ? (i - tbl.length + 1) * 70 : 0); g.ty = sl.y; g.ts = sl.s;
+  });
+  for (let i = GUESTS.length - 1; i >= 0; i--) {
+    const gs = GUESTS[i]; gs.t += dt;
+    gs.excite = Math.max(0, gs.excite - dt * 0.7);
+    if (gs.state === 'arrive' || gs.state === 'wait') {
+      const dx = gs.tx - gs.x, dy = gs.ty - gs.y; const d = hyp(dx, dy);
+      if (d > 3) {
+        const sp = Math.min(d, 150 * dt); gs.x += dx / d * sp; gs.y += dy / d * sp; gs.s = lerp(gs.s, gs.ts, Math.min(1, dt * 2));
+        gs.hop += dt * 9; gs.face = dx > 0 ? 1 : -1;
+      } else {
+        gs.s = lerp(gs.s, gs.ts, Math.min(1, dt * 3));
+        if (gs.state === 'arrive') { gs.state = 'wait'; gs.t = 0; SFX.hop(gs.x); gs.face = gs.x > CAT.x ? -1 : 1; }
+        gs.hop *= 0.9;
+      }
+      if (gs.state === 'wait') {
+        gs.gT -= dt;
+        if (gs.gT < 0) { gs.gesture = pick(['look', 'offer', 'offer', 'hop']); gs.gT = rnd(2.5, 4.5); gs.gestT = 0; if (gs.gesture === 'hop') SFX.hop(gs.x); }
+        if (gs.gesture) { gs.gestT += dt; if (gs.gestT > 1.4) gs.gesture = null; }
+        const wantOffer = gs.gesture === 'offer' || (gs.slot === 0 && CAT.hold);
+        gs.offer = lerp(gs.offer, wantOffer ? 1 : 0, Math.min(1, dt * 5));
+        gs.look = lerp(gs.look, gs.gesture === 'look' || CAT.hold ? 1 : 0, Math.min(1, dt * 4));
+      }
+    } else if (gs.state === 'receive') {
+      gs.offer = lerp(gs.offer, 1.2, Math.min(1, dt * 6));
+      if (gs.t > 0.5) { gs.state = 'eat'; gs.t = 0; SFX.munch(gs.x); }
+    } else if (gs.state === 'eat') {
+      gs.eatT = gs.t; if (Math.random() < dt * 6) addFX({ k: 'crumb', x: gs.px + rnd(-14, 14), y: gs.py - 10, vx: rnd(-40, 40), vy: -rnd(30, 90), life: 0.5, r: 2.5, col: gs.food === 'mandarin' ? C.yam : C.yamL });
+      if (gs.t > 1.8) { gs.state = 'happy'; gs.t = 0; SFX.hop(gs.x); if (gs.fav) SFX.fanfare(); for (let k = 0; k < (gs.fav ? 4 : 2); k++) addFX({ k: 'heart', x: gs.px + rnd(-20, 20), y: gs.py - 40, vx: rnd(-20, 20), vy: -rnd(50, 90), life: 1.3, r: rnd(7, 10), col: pick([C.ver, C.verL, C.yam]) }); }
+    } else if (gs.state === 'happy') {
+      gs.jump = Math.abs(Math.sin(gs.t * (gs.fav ? 9 : 7))) * (gs.fav ? 34 : 20) * (1 - gs.t / 1.5);
+      if (gs.t > 1.5) { gs.state = 'leave'; gs.t = 0; gs.jump = 0; guestLeavePlate(gs); }
+    } else if (gs.state === 'leave') {
+      gs.x += gs.face * 120 * dt; gs.y -= 30 * dt; gs.s = Math.max(0.5, gs.s - dt * 0.15); gs.hop += dt * 9;
+      if (gs.t > 4) GUESTS.splice(i, 1);
+    }
+    // 皿の位置（胸の前）
+    const k = gs.s; gs.py = gs.y - gs.jump - (gs.kind === 'bear' ? 92 : gs.kind === 'duck' ? 62 : gs.kind === 'hedgehog' ? 48 : 70) * k - gs.offer * 8 * k;
+    gs.px = gs.x + gs.face * (20 + gs.offer * 12) * k;
+  }
+}
+function guestLeavePlate(gs) {
+  // 空いたお皿を置いていく → 新しい踏み台やシーソーに使える
+  gs.plate = false;
+  const nGuestPlates = PLATES.filter((p) => p.from).length;
+  if (nGuestPlates >= 3 || gs.s < 0.9) { gs.face = gs.x > 360 ? 1 : -1; return; }
+  const x = clamp(gs.px, 250, 480);
+  const p = mkPlate({ x, y: YC, hw: 40, from: gs.kind, col: gs.plateCol, rim: pick([C.ver, C.yg, C.sky, C.yam]) });
+  p.wob = 1; SFX.drop(x); S.found.guestPlate = 1;
+  gs.face = gs.x > 360 ? 1 : -1;
+}
+// ===== 配膳棚のトレイ（棚が開いているときの配達経路）=====
+const TRAY = { on: false, t: 0, food: null, gs: null };
+function startTray(f) {
+  TRAY.on = true; TRAY.t = 0; TRAY.food = f.k; f.alive = false; f.carried = false;
+  TRAY.gs = frontGuest(); SFX.whoosh(380);
+}
+function trayStep(dt) {
+  if (!TRAY.on) return;
+  TRAY.t += dt;
+  if (TRAY.t > 1.3) {
+    TRAY.on = false;
+    const gs = TRAY.gs && TRAY.gs.state === 'wait' ? TRAY.gs : frontGuest();
+    if (gs) guestReceive(gs, { k: TRAY.food, alive: true }, 'tray');
+    else { const b = mkBody({ k: TRAY.food, x: 420, y: 760, r: 22, e: 0.2, fr: 3, food: 1 }); b.vy = 0; }
+  }
+}
+function trayPos() {
+  const gs = TRAY.gs && TRAY.gs.state === 'wait' ? TRAY.gs : frontGuest();
+  const x1 = gs ? gs.px : 420, y1 = gs ? gs.py - 6 : 800;
+  const k = ease(TRAY.t / 1.3);
+  return { x: lerp(372, x1, k), y: lerp(480, y1, k) - Math.sin(k * Math.PI) * 30 };
+}
+// ===== 庭のピクニック（庭の扉ルート）=====
+const GARDEN = { party: 0, food: null, t: 0 };
+function gardenFeed(k) { GARDEN.party = 1; GARDEN.food = k; GARDEN.t = 0; SFX.fanfare(); S.served++; markChain('served'); S.found.gardenServe = 1; }
+function gardenStep(dt) { if (GARDEN.party > 0) { GARDEN.t += dt; if (GARDEN.t > 3) GARDEN.party = Math.max(0, GARDEN.party - dt); } }
+// ===== 秘密: 動物の行列パレード =====
+const PARADE = { on: false, t: 0, kinds: [] };
+function startParade() {
+  if (PARADE.on) return;
+  PARADE.on = true; PARADE.t = 0; PARADE.kinds = [];
+  for (let i = 0; i < 8; i++) PARADE.kinds.push(GUEST_KINDS[(i + GT.idx) % GUEST_KINDS.length]);
+  SFX.fanfare(); later(1.2, () => SFX.fanfare());
+  later(5.5, () => { GT.spawn = 0; });
+}
+function paradeStep(dt) { if (!PARADE.on) return; PARADE.t += dt; if (PARADE.t > 9) PARADE.on = false; }
+function openDoor() {
+  if (S.doorOpen) { SFX.kotoN(DOOR.x, 0.5); return; }
+  S.doorOpen = 1; S.found.door = 1; SFX.success(); SFX.flap(DOOR.x); sparks(DOOR.x + 30, 790, 10, [C.yg, C.white, C.yam]); markChain('door');
+}
+// ===== ベルの結果と台所→屋台の大変身 =====
+function onBell(b, by) {
+  if (b.kind === 'main') {
+    S.found.bellMain = 1; markChain('bellMain');
+    if (by === 'lid') S.found.lidBell = 1;
+    if (by !== 'cat' && CAT.state === 'sleep') catWake('bell');
+    if (S.phase === 'kitchen') later(0.35, startMorph);
+    else if (S.phase === 'stall') { for (const gs of GUESTS) gs.excite = 1; GT.spawn = Math.min(GT.spawn, 0.6); }
+  } else if (b.kind === 'small') {
+    S.found.bellSmall = 1; markChain('bellSmall');
+    if (CAT.state === 'sleep') later(0.2, () => catWake('smallBell'));
+  } else if (b.kind === 'other') {
+    S.found.bellOther = 1; markChain('bellOther');
+    if (!S.shelfOpen) { S.shelfOpen = 1; SHELF.v = 0; SFX.success(); sparks(365, 520, 12, [C.yam, C.white, C.sky]); S.found.shelf = 1; }
+    if (by !== 'cat' && CAT.state === 'sleep') catWake('bell');
+  } else if (b.kind === 'big') {
+    S.found.parade = 1; markChain('parade'); startParade();
+  }
+}
+const SHELF = { v: 0 }; // 配膳棚の扉の開き具合（描画用）
+const MORPH_DUR = 5.4;
+// 壁パネル: 左から右へ順にぱたぱた折れる（蝶番は各パネルの外側）
+const PANELS = [];
+(function () {
+  const xs = [-520, -380, -240, -100, 0, 120, 240, 360, 480, 600, 720, 860, 1000, 1140, 1280];
+  for (let i = 0; i < xs.length - 1; i++) PANELS.push({ x0: xs[i], x1: xs[i + 1], i });
+})();
+function startMorph() {
+  if (S.phase !== 'kitchen') return;
+  S.phase = 'morph'; S.morphT = 0; MORPH.flaps = 0;
+  SFX.success(); markChain('morph');
+}
+const MORPH = { flaps: 0 };
+function panelFold(p) { // 0..1 の折れ具合
+  if (S.phase === 'kitchen') return 0;
+  if (S.phase === 'stall') return 1;
+  const mid = 360, order = Math.abs((p.x0 + p.x1) / 2 - mid) / 140; // 中央から外へ
+  return ease((S.morphT - 0.7 - order * 0.32) / 0.55);
+}
+function morphStep(dt) {
+  if (S.phase !== 'morph') return;
+  const before = S.morphT; S.morphT += dt;
+  // ぱたぱた音
+  for (const p of PANELS) {
+    const order = Math.abs((p.x0 + p.x1) / 2 - 360) / 140; const t0 = 0.7 + order * 0.32 + 0.28;
+    if (before < t0 && S.morphT >= t0) { SFX.flap((p.x0 + p.x1) / 2); puff(clamp((p.x0 + p.x1) / 2, 10, 710), 120 + Math.random() * 600, 2, C.cream, 70, 0.4, 5); }
+  }
+  if (before < 0.4 && S.morphT >= 0.4) SFX.whoosh(360);
+  if (before < 3.0 && S.morphT >= 3.0) { SFX.flap(360); SFX.boing(360, 0.5); }
+  if (before < 3.9 && S.morphT >= 3.9) { SFX.fanfare(); sparks(360, 40, 16, [C.ver, C.yam, C.yg, C.sky, C.white]); }
+  if (S.morphT >= MORPH_DUR) {
+    S.phase = 'stall'; S.found.morph = 1; GT.spawn = 0.3; TABLE.release();
+    later(0.2, () => { if (!GUESTS.length) spawnGuest('rabbit'); });
+    saveSoon();
+  }
+}
+// 屋台らしさ（0..1）: 日よけ・調理台の幕・看板
+function stallK(t0, d) { if (S.phase === 'stall') return 1; if (S.phase !== 'morph') return 0; return ease((S.morphT - t0) / d); }
+// ===== 背景キャッシュ（庭・台所の壁・カウンター前面）=====
+let CACHE = { gen: -1, garden: null, wall: null, front: null };
+function mkLayer() { const c = document.createElement('canvas'); c.width = cv.width; c.height = cv.height; return c; }
+function withCtx(ctx, fn) { const old = g; g = ctx; try { worldTf(g); fn(); } finally { g = old; } }
+function buildCaches() {
+  CACHE.gen = layoutGen;
+  CACHE.garden = mkLayer(); CACHE.wall = mkLayer(); CACHE.front = mkLayer();
+  withCtx(CACHE.garden.getContext('2d'), drawGardenStatic);
+  withCtx(CACHE.wall.getContext('2d'), drawWallStatic);
+  withCtx(CACHE.front.getContext('2d'), drawFrontStatic);
+}
+function vx0() { return Math.min(VIS.x0, -600) - 20; }
+function vx1() { return Math.max(VIS.x1, 1320) + 20; }
+function drawGardenStatic() {
+  const X0 = vx0(), X1 = vx1(), Y0 = Math.min(VIS.y0, -400) - 20, Y1 = Math.max(VIS.y1, 1300) + 20;
+  g.fillStyle = C.skyL; g.fillRect(X0, Y0, X1 - X0, Y1 - Y0);
+  // 網点の空のグラデーション帯
+  g.save(); g.globalAlpha = 0.25; g.fillStyle = HTL; g.fillRect(X0, 300, X1 - X0, 260); g.restore();
+  // 朝の太陽
+  circ(560, 150, 70, C.yam, 5, { ht: 0.25 });
+  for (let i = 0; i < 12; i++) { const a = i * TAU / 12; line(560 + Math.cos(a) * 88, 150 + Math.sin(a) * 88, 560 + Math.cos(a) * 112, 150 + Math.sin(a) * 112, 6, C.yam); }
+  // 雲
+  const cloud = (x, y, s) => shape(() => { g.moveTo(x - 60 * s, y + 18 * s); g.arc(x - 34 * s, y + 4 * s, 26 * s, Math.PI * 0.9, Math.PI * 1.9); g.arc(x + 4 * s, y - 10 * s, 34 * s, Math.PI, Math.PI * 1.95); g.arc(x + 44 * s, y + 6 * s, 24 * s, Math.PI * 1.2, Math.PI * 0.1); g.lineTo(x - 60 * s, y + 18 * s); g.closePath(); }, C.white, { lw: 3.5, bb: [x - 60 * s, y - 44 * s, 130 * s, 62 * s], ht: 0.15 });
+  cloud(160, 120, 1.1); cloud(-260, 60, 1.3); cloud(940, 90, 1.2); cloud(380, 300, 0.7); cloud(1180, 250, 0.9);
+  // 遠い丘
+  shape(() => { g.moveTo(X0, 640); g.quadraticCurveTo(-200, 470, 150, 560); g.quadraticCurveTo(420, 430, 760, 560); g.quadraticCurveTo(1050, 470, X1, 600); g.lineTo(X1, Y1); g.lineTo(X0, Y1); g.closePath(); }, C.ygL, { lw: 4, bb: [X0, 450, X1 - X0, 400], ht: 0.2 });
+  shape(() => { g.moveTo(X0, 720); g.quadraticCurveTo(0, 600, 300, 660); g.quadraticCurveTo(600, 720, 900, 640); g.quadraticCurveTo(1100, 600, X1, 680); g.lineTo(X1, Y1); g.lineTo(X0, Y1); g.closePath(); }, C.yg, { lw: 4, bb: [X0, 600, X1 - X0, 400], ht: 0.25 });
+  // 木
+  const tree = (x, y, s, c) => { rrect(x - 7 * s, y - 10 * s, 14 * s, 70 * s, 5, C.yamD, { shade: false, lw: 3.5 }); circ(x, y - 40 * s, 52 * s, c, 4, { ht: 0.35 }); circ(x - 36 * s, y - 10 * s, 30 * s, c, 4, { ht: 0.3 }); circ(x + 38 * s, y - 14 * s, 32 * s, c, 4, { ht: 0.3 }); };
+  tree(-380, 620, 1.2, C.ygD); tree(70, 600, 1, C.ygD); tree(660, 590, 1.1, C.ygD); tree(1060, 610, 1.25, C.ygD); tree(-120, 640, 0.8, C.yg);
+  // 柵
+  for (let x = Math.floor(X0 / 46) * 46; x < X1; x += 46) { rrect(x, 668, 16, 52, 6, C.white, { shade: false, lw: 3 }); }
+  line(X0, 684, X1, 684, 4, C.ink); line(X0, 704, X1, 704, 4, C.ink);
+  // 庭の地面と小道
+  shape(() => { g.rect(X0, 716, X1 - X0, Y1 - 716); }, C.ygL, { lw: 0, shade: false });
+  g.save(); g.globalAlpha = 0.35; g.fillStyle = HT; g.fillRect(X0, 716, X1 - X0, 40); g.restore();
+  shape(() => { g.moveTo(X1, 740); g.quadraticCurveTo(900, 760, 700, 800); g.quadraticCurveTo(520, 840, 360, 880); g.lineTo(360, 960); g.lineTo(560, 960); g.quadraticCurveTo(700, 870, 900, 820); g.quadraticCurveTo(1050, 790, X1, 790); g.closePath(); }, C.cream, { lw: 3.5, shade: false });
+  // 花
+  for (let i = 0; i < 40; i++) { const x = X0 + ((i * 197) % (X1 - X0)), y = 730 + ((i * 53) % 120); dot(x, y, 5, i % 3 ? C.ver : C.yam); dot(x, y, 1.8, C.white); }
+  // 庭のピクニック敷物（扉の向こう）
+  shape(() => { g.ellipse(70, 790, 120, 26, 0, 0, TAU); }, C.verL, { lw: 3.5, shade: false });
+  g.save(); g.globalAlpha = 0.5; g.fillStyle = STRIPE; g.beginPath(); g.ellipse(70, 790, 120, 26, 0, 0, TAU); g.fill(); g.restore();
+}
+function drawWallStatic() {
+  const X0 = vx0(), X1 = vx1();
+  // 天井から天板までの壁（台所）
+  g.fillStyle = C.paper; g.fillRect(X0, -60, X1 - X0, 960 + 60);
+  // 版画の縦じま壁紙
+  g.save(); g.globalAlpha = 0.18; g.fillStyle = PAL.tile;
+  for (let x = Math.floor(X0 / 60) * 60; x < X1; x += 60) g.fillRect(x + 18, -60, 14, 700);
+  g.restore();
+  g.save(); g.globalAlpha = 0.12; g.fillStyle = HT; g.fillRect(X0, -60, X1 - X0, 700); g.restore();
+  // タイルの腰壁
+  for (let y = 640; y < 900; y += 40) for (let x = Math.floor(X0 / 40) * 40; x < X1; x += 40) {
+    const k = ((x / 40) + (y / 40)) % 2 === 0;
+    g.fillStyle = k ? C.white : lt(PAL.tile); g.fillRect(x + MIS.x, y + MIS.y, 40, 40);
+    g.strokeStyle = 'rgba(46,41,51,0.45)'; g.lineWidth = 2; g.strokeRect(x, y, 40, 40);
+  }
+  line(X0, 640, X1, 640, 5, C.ink);
+  // 横に広い画面で見える壁の飾り（文字・数字なし）
+  const clock = (x, y) => { circ(x, y, 46, C.white, 5, { ht: 0.2 }); for (let i = 0; i < 12; i++) { const a = i * TAU / 12; dot(x + Math.cos(a) * 36, y + Math.sin(a) * 36, i % 3 ? 2.5 : 4.5, C.ink); } line(x, y, x, y - 28, 5); line(x, y, x + 20, y + 6, 5); dot(x, y, 5, C.ver); };
+  clock(-200, 160); 
+  const utensil = (x, y, k) => { line(x, y, x, y + 120, 6); if (k === 0) circ(x, y + 136, 20, C.tin, 4, { shade: false }); else if (k === 1) { strokeP(() => { g.ellipse(x, y + 140, 14, 30, 0, 0, TAU); }, 3); strokeP(() => { g.ellipse(x, y + 140, 6, 30, 0, 0, TAU); }, 3); } else rrect(x - 16, y + 118, 32, 46, 6, C.tin, { lw: 4, shade: false }); };
+  line(-420, 330, -140, 330, 6, C.tinD); utensil(-380, 330, 0); utensil(-300, 330, 1); utensil(-220, 330, 2);
+  rrect(860, 90, 170, 130, 8, C.white, { lw: 5, shade: false }); rrect(874, 104, 142, 102, 4, C.skyL, { lw: 3, shade: false });
+  circ(945, 168, 26, C.yam, 3, { shade: false }); shape(() => { g.moveTo(924, 150); g.lineTo(930, 126); g.lineTo(940, 146); g.closePath(); g.moveTo(966, 150); g.lineTo(960, 126); g.lineTo(950, 146); g.closePath(); }, C.yam, { lw: 3, shade: false });
+  for (let i = 0; i < 4; i++) { rrect(820 + i * 70, 400, 50, 66, 8, [C.white, C.skyL, C.ygL, C.yamL][i], { lw: 4, shade: false }); line(820 + i * 70 + 50, 418, 820 + i * 70 + 62, 432, 4); }
+  line(800, 470, 1120, 470, 6, C.yamD);
+  // パネルの継ぎ目と蝶番（変身のときにここで折れる）
+  for (const p of PANELS) {
+    const x = p.x0; if (x < X0 || x > X1) continue;
+    g.save(); g.setLineDash([10, 8]); line(x, -40, x, 900, 2.5, 'rgba(46,41,51,0.45)'); g.restore();
+    for (const hy of [80, 470, 760]) { rrect(x - 7, hy - 22, 14, 44, 4, C.tin, { lw: 3, ht: 0.3 }); dot(x, hy - 12, 2.5, C.ink); dot(x, hy + 12, 2.5, C.ink); }
+  }
+  // 屋根
+  shape(() => { g.moveTo(X0, -140); g.lineTo(X1, -140); g.lineTo(X1, -170); g.lineTo(980, -170); g.lineTo(360, -330); g.lineTo(-260, -170); g.lineTo(X0, -170); g.closePath(); }, C.ver, { lw: 5, shade: false });
+  g.save(); g.globalAlpha = 0.35; g.fillStyle = STRIPE; g.beginPath(); g.moveTo(-260, -170); g.lineTo(360, -330); g.lineTo(980, -170); g.closePath(); g.fill(); g.restore();
+  for (let i = -6; i <= 6; i++) line(360 + i * 100, -170, 360 + i * 32, -318, 3, 'rgba(46,41,51,0.5)');
+  rrect(120, -300, 54, 110, 6, C.paper2, { lw: 4, ht: 0.3 }); rrect(112, -310, 70, 18, 5, C.ink, { lw: 0, shade: false });
+  // 天井
+  g.fillStyle = C.yamL; g.fillRect(X0, -140, X1 - X0, 120);
+  g.save(); g.globalAlpha = 0.3; g.fillStyle = STRIPE; g.fillRect(X0, -140, X1 - X0, 120); g.restore();
+  line(X0, -20, X1, -20, 6, C.ink);
+  // 窓と扉の穴（向こうに庭）
+  g.save(); g.globalCompositeOperation = 'destination-out';
+  g.beginPath(); rrPath(446, 34, 200, 160, 10); g.fill();
+  g.beginPath(); g.moveTo(34, 900); g.lineTo(34, 740); g.arc(87, 740, 53, Math.PI, 0); g.lineTo(140, 900); g.closePath(); g.fill();
+  g.restore();
+}
+function drawFrontStatic() {
+  const X0 = vx0(), X1 = vx1(), Y1 = Math.max(VIS.y1, 1300) + 20;
+  // カウンター天板と戸棚
+  shape(() => g.rect(X0, YC, X1 - X0, 26), C.yam, { lw: 5, shade: false });
+  g.save(); g.globalAlpha = 0.35; g.fillStyle = HTL; g.fillRect(X0, YC + 2, X1 - X0, 8); g.restore();
+  shape(() => g.rect(X0, YC + 26, X1 - X0, Y1 - YC), C.cream, { lw: 5, shade: false });
+  for (let x = Math.floor(X0 / 180) * 180; x < X1; x += 180) {
+    rrect(x + 14, YC + 44, 152, 170, 12, C.paper2, { lw: 4, ht: 0.18 });
+    rrect(x + 70, YC + 70, 40, 12, 6, C.tin, { lw: 3 });
+  }
+  shape(() => g.rect(X0, YC + 232, X1 - X0, Y1), C.yamD, { lw: 5, shade: false });
+  g.save(); g.globalAlpha = 0.3; g.fillStyle = STRIPE; g.fillRect(X0, YC + 232, X1 - X0, Y1 - YC); g.restore();
+}
+// ===== 台所の備品の描画 =====
+function drawWall() {
+  const s = DPR;
+  if (S.phase === 'kitchen') { g.setTransform(1, 0, 0, 1, 0, 0); g.drawImage(CACHE.wall, 0, 0); worldTf(g); return; }
+  // 天井帯は残す
+  const yTop = (-20 * VIS.s + VIS.oy) * s;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.drawImage(CACHE.wall, 0, 0, cv.width, Math.max(1, yTop), 0, 0, cv.width, Math.max(1, yTop));
+  const yb = (900 * VIS.s + VIS.oy) * s;
+  for (const p of PANELS) {
+    const f = panelFold(p); if (f >= 1) continue;
+    const sx0 = (p.x0 * VIS.s + VIS.ox) * s, sx1 = (p.x1 * VIS.s + VIS.ox) * s;
+    if (sx1 < 0 || sx0 > cv.width) continue;
+    const left = (p.x0 + p.x1) / 2 < 360; const hx = left ? sx0 : sx1;
+    const k = Math.cos(f * Math.PI / 2);
+    const w = (sx1 - sx0);
+    g.save();
+    g.translate(hx, 0); g.scale(Math.max(0.001, k), 1); g.translate(-hx, 0);
+    g.drawImage(CACHE.wall, Math.max(0, sx0), Math.max(0, yTop), Math.min(w, cv.width - Math.max(0, sx0)), yb - yTop, Math.max(0, sx0), yTop, Math.min(w, cv.width - Math.max(0, sx0)), yb - yTop);
+    g.fillStyle = 'rgba(46,41,51,' + (f * 0.5) + ')'; g.fillRect(sx0, yTop, w, yb - yTop);
+    g.restore();
+  }
+  worldTf(g);
+  // 折りたたまれた板は両脇の柱になる
+  const st = stallK(2.2, 1.2);
+  if (st > 0) {
+    for (const x of [-26, 720]) {
+      rrect(x, -20 + (1 - st) * 900, 26, 920 * st, 6, PAL.awn, { lw: 4, ht: 0.3 });
+      g.save(); g.globalAlpha = 0.5; g.fillStyle = STRIPE; g.fillRect(x, -20 + (1 - st) * 900, 26, 920 * st); g.restore();
+    }
+  }
+}
+function drawCeiling() {
+  // 天井のレールと滑車・水道管
+  line(240, -6, 720, -6, 7, C.ink); line(240, -6, 720, -6, 3, C.tin);
+  for (const [x, y] of [[270, -2], [440, -2], [690, -2]]) { circ(x, y, 9, C.tin, 3); dot(x, y, 2.5, C.ink); }
+  // 蛇口（鍋用・やかん用）
+  rrect(318, -20, 12, 44, 4, C.tin, { lw: 3 }); rrect(306, 20, 30, 12, 5, C.tin, { lw: 3 }); circ(330, -6, 7, C.ver, 3);
+  rrect(512, -20, 12, 160, 4, C.tin, { lw: 3 }); rrect(500, 136, 30, 12, 5, C.tin, { lw: 3 }); circ(524, 100, 7, C.ver, 3);
+  // 鍋のフック
+  line(352, -20, 352, -8, 6); circ(352, -8, 6, C.tin, 3);
+  // みかんネット
+  line(128, -20, 128, 14, 3);
+  shape(() => { g.moveTo(108, 14); g.quadraticCurveTo(90, 60, 128, 74); g.quadraticCurveTo(166, 60, 148, 14); g.closePath(); }, C.ygL, { lw: 3, shade: false });
+  circ(118, 50, 13, C.yam, 2.5, { shade: false }); circ(138, 54, 13, C.yam, 2.5, { shade: false }); circ(128, 34, 12, C.yam, 2.5, { shade: false });
+  g.save(); g.globalAlpha = 0.6; g.strokeStyle = C.ink; g.lineWidth = 1.5;
+  for (let i = 0; i < 5; i++) { g.beginPath(); g.moveTo(104 + i * 11, 16); g.lineTo(112 + i * 6, 70); g.stroke(); }
+  g.restore();
+}
+function drawWindow() {
+  const k = stallK(1.6, 1.4);
+  // 窓枠（屋台では看板の枠になる）
+  frameRect(436, 24, 220, 180, 10, k > 0.5 ? PAL.awn : C.white);
+  if (k < 0.5) { line(546, 34, 546, 194, 4); line(446, 114, 646, 114, 4); }
+  // 動物の影 / のぞく顔
+  const animals = Math.round(S.flag * 3);
+  CUR.v = lerp(CUR.v, S.curtain, 0.06);
+  const op = CUR.v;
+  if (S.phase === 'kitchen' && animals > 0) {
+    for (let i = 0; i < animals; i++) {
+      const x = 480 + i * 56, bob = Math.sin(T * 2 + i * 1.7) * 5, y = 192 - 30 + bob;
+      if (op > 0.5) drawGuestHead(['rabbit', 'bear', 'duck'][i], x, y, 0.55);
+      else { g.save(); g.globalAlpha = 0.55 - op * 0.4; drawSilhouette(['rabbit', 'bear', 'duck'][i], x, y + 6, 0.6); g.restore(); }
+    }
+  }
+  // カーテン
+  const sh = CUR.shake > 0 ? Math.sin(T * 30) * 3 * CUR.shake : 0; CUR.shake = Math.max(0, CUR.shake - 0.02);
+  const cw = lerp(100, 26, op);
+  for (const side of [-1, 1]) {
+    const xo = side < 0 ? 446 : 646, xi = xo - side * cw;
+    shape(() => {
+      g.moveTo(xo, 30); g.lineTo(xi, 30);
+      for (let i = 0; i <= 6; i++) { const yy = 30 + i * 27.6; const wv = Math.sin(i * 1.3 + T * 1.2) * 3 + sh; g.lineTo(xi + wv * 0.8, yy); }
+      g.lineTo(xo, 196); g.closePath();
+    }, PAL.curtain, { lw: 4, bb: [Math.min(xo, xi), 30, cw, 166], ht: 0.35 });
+    for (let i = 1; i < 4; i++) { const x = lerp(xo, xi, i / 4); line(x, 36, x + sh, 190, 2, 'rgba(46,41,51,0.35)'); }
+    // 留めひも
+    if (op > 0.5) line(xi - side * 2, 120, xo, 118, 4, PAL.accent);
+  }
+  rrect(436, 22, 220, 12, 6, C.tin, { lw: 3.5 });
+  // 窓台
+  rrect(440, 196, 214, 12, 5, C.yam, { lw: 4, shade: false });
+}
+function frameRect(x, y, w, h, t, col) {
+  const f = () => { g.rect(x, y, w, t); g.rect(x, y + h - t, w, t); g.rect(x, y + t, t, h - 2 * t); g.rect(x + w - t, y + t, t, h - 2 * t); };
+  fillMis(f, col); strokeP(() => { g.rect(x, y, w, h); g.rect(x + t, y + t, w - 2 * t, h - 2 * t); }, 4.5);
+}
+function drawSilhouette(kind, x, y, s) {
+  g.fillStyle = 'rgba(46,41,51,0.8)'; g.beginPath(); g.arc(x, y, 22 * s, 0, TAU); g.fill();
+  if (kind === 'rabbit') { g.beginPath(); g.ellipse(x - 8 * s, y - 34 * s, 7 * s, 22 * s, -0.15, 0, TAU); g.ellipse(x + 8 * s, y - 34 * s, 7 * s, 22 * s, 0.15, 0, TAU); g.fill(); }
+  else if (kind === 'bear') { g.beginPath(); g.arc(x - 16 * s, y - 16 * s, 9 * s, 0, TAU); g.arc(x + 16 * s, y - 16 * s, 9 * s, 0, TAU); g.fill(); }
+  else { g.beginPath(); g.ellipse(x + 22 * s, y + 4 * s, 12 * s, 6 * s, 0, 0, TAU); g.fill(); }
+}
+function drawDoor() {
+  // 庭の扉（ねこの出入り口つき）
+  const op = S.doorOpen ? Math.min(1, (DOORV.v += 0.03)) : (DOORV.v = Math.max(0, DOORV.v - 0.05));
+  const frame = () => { g.moveTo(28, 900); g.lineTo(28, 740); g.arc(87, 740, 59, Math.PI, 0); g.lineTo(146, 900); g.lineTo(140, 900); g.lineTo(140, 740); g.arc(87, 740, 53, 0, Math.PI, true); g.lineTo(34, 900); g.closePath(); };
+  shape(frame, S.phase === 'kitchen' ? C.white : C.yg, { lw: 4, shade: false });
+  const k = Math.cos(op * Math.PI * 0.45);
+  g.save(); g.translate(34, 0); g.scale(k, 1); g.translate(-34, 0);
+  const leaf = () => { g.moveTo(34, 900); g.lineTo(34, 740); g.arc(87, 740, 53, Math.PI, 0); g.lineTo(140, 900); g.closePath(); };
+  shape(leaf, C.ygL, { lw: 4, bb: [34, 687, 106, 213], ht: 0.3 });
+  rrect(62, 836, 50, 40, 12, C.yg, { lw: 3, shade: false }); // ねこ扉
+  circ(124, 820, 6, C.yam, 3);
+  g.restore();
+}
+const DOORV = { v: 0 };
+function drawCupboard() {
+  const st = stallK(3.0, 1.0);
+  SHELF.v = S.shelfOpen ? Math.min(1, SHELF.v + 0.025) : 0;
+  // 本体
+  rrect(300, 470, 130, 132, 10, st > 0.5 ? C.yamL : C.cream, { lw: 4, ht: 0.25 });
+  if (st > 0) { // 屋台では小さな屋根と滑車がつく
+    shape(() => { g.moveTo(290, 474); g.lineTo(365, 474 - 26 * st); g.lineTo(440, 474); g.closePath(); }, PAL.awn, { lw: 4, shade: false });
+    line(372, 480, 372, 470, 3);
+  }
+  // 中の棚とカップ
+  rrect(308, 480, 114, 112, 6, C.cream, { lw: 3, shade: false });
+  line(308, 536, 422, 536, 3);
+  for (let i = 0; i < 3; i++) { rrect(318 + i * 34, 504, 22, 28, 5, [C.sky, C.ver, C.yg][i], { lw: 2.5, shade: false }); }
+  for (let i = 0; i < 2; i++) shape(() => g.ellipse(340 + i * 46, 580, 20, 6, 0, 0, TAU), C.white, { lw: 2.5, shade: false });
+  // 扉
+  const op = SHELF.v;
+  for (const side of [-1, 1]) {
+    const hx = side < 0 ? 306 : 424; const kk = Math.cos(op * Math.PI * 0.48);
+    g.save(); g.translate(hx, 0); g.scale(kk, 1); g.translate(-hx, 0);
+    const x0 = side < 0 ? 306 : 365;
+    rrect(x0, 476, 59, 120, 6, st > 0.5 ? lt(PAL.accent) : C.paper2, { lw: 3.5, ht: 0.25 });
+    circ(side < 0 ? x0 + 50 : x0 + 9, 536, 4.5, C.tin, 2.5);
+    g.restore();
+  }
+  // トレイ（配膳）
+  if (S.shelfOpen && !TRAY.on) { rrect(352, 594, 44, 8, 4, C.tin, { lw: 2.5 }); }
+}
+function drawFlag() {
+  // 招き旗（ねこの手としょくパンの絵）
+  line(712, 340, 712, -70, 6); line(712, 340, 712, -70, 2.5, C.tin);
+  circ(712, -72, 7, C.yam, 3);
+  const y = flagY(); const fl = Math.sin(T * 5) * 4 * (0.3 + S.flag);
+  shape(() => { g.moveTo(708, y); g.lineTo(664, y + 6 + fl); g.lineTo(671, y + 26 + fl * 0.5); g.lineTo(664, y + 46 + fl); g.lineTo(708, y + 52); g.closePath(); }, PAL.awn, { lw: 4, bb: [664, y, 44, 52], ht: 0.3 });
+  // ねこの手
+  circ(690, y + 26, 9, C.white, 3, { shade: false }); dot(686, y + 20, 2.6, C.verL); dot(694, y + 20, 2.6, C.verL); dot(690, y + 29, 4, C.verL);
+}
+function drawStrings() {
+  // 引きひも: リング → 滑車 → カーテンレール
+  const ry = CORD.y + CORD.pull * 46;
+  g.save(); g.lineWidth = 3; g.strokeStyle = C.ink; g.beginPath(); g.moveTo(270, -2); g.lineTo(CORD.x, ry - 14); g.stroke();
+  g.beginPath(); g.moveTo(270, -10); g.lineTo(440, -10); g.lineTo(440, 24); g.stroke(); g.restore();
+  circ(CORD.x, ry, 14, C.ver, 4, { shade: false }); circ(CORD.x, ry, 6, C.paper, 3, { shade: false });
+  // 風車のひも → 滑車 → 旗
+  const W0 = TOOLS.windmill;
+  g.save(); g.lineWidth = 2.5; g.strokeStyle = 'rgba(46,41,51,0.85)'; g.setLineDash([7, 5]); g.lineDashOffset = -W0.ang * 8;
+  g.beginPath(); g.moveTo(W0.x, W0.y); g.lineTo(690, -2); g.lineTo(708, flagY()); g.stroke(); g.restore();
+}
+function drawTable() {
+  // 奥の朝食テーブル（変身後は庭の席）
+  rrect(282, 812, 216, 14, 6, C.cream, { lw: 4, shade: false });
+  shape(() => { g.moveTo(282, 824); g.lineTo(498, 824); g.lineTo(492, 862); for (let i = 0; i < 9; i++) g.lineTo(492 - i * 26 - 13, 870 - (i % 2) * 8); g.lineTo(288, 862); g.closePath(); }, PAL.curtain, { lw: 3.5, shade: false });
+  g.save(); g.globalAlpha = 0.45; g.fillStyle = HTL; g.fillRect(286, 826, 208, 34); g.restore();
+  rrect(458, 786, 22, 26, 5, C.sky, { lw: 3, shade: false }); line(480, 794, 488, 802, 3);
+  shape(() => g.ellipse(306, 806, 12, 6, 0, 0, TAU), C.white, { lw: 2.5, shade: false });
+  TABLE.items.forEach((it, i) => drawFoodIcon(it.k, TABLE.px + (i - (TABLE.items.length - 1) / 2) * 34, TABLE.py - 8 - (i % 2) * 4, 0, 0.82));
+}
+function drawShelves() {
+  // スプーン棚（右へみぞ）
+  rrect(50, 245, 188, 16, 6, C.yam, { lw: 4, shade: false });
+  line(70, 261, 90, 295, 5); line(214, 261, 194, 295, 5);
+  shape(() => g.ellipse(128, 246, 20, 4, 0, 0, TAU), C.yamD, { lw: 2, shade: false });
+  // 棚の右はしの小さな止め（みかんが飛び出す口）
+  line(236, 245, 240, 238, 5);
+  // 小鐘の腕
+  line(0, 330, 40, 330, 5); line(36, 330, 36, 384, 3);
+  // ベル棚
+  rrect(116, 630, 124, 14, 6, C.yam, { lw: 4, shade: false }); line(130, 644, 146, 672, 5); line(226, 644, 210, 672, 5);
+  // コンロ棚とコンロ（屋台では調理台）
+  const st = stallK(3.0, 1.0);
+  rrect(398, 300, 206, 16, 6, C.yam, { lw: 4, shade: false });
+  rrect(410, 284, 120, 16, 6, st > 0.5 ? PAL.awn : C.tinD, { lw: 3.5, shade: false });
+  for (let i = 0; i < 3; i++) { const fx = 470 + (i - 1) * 16, fh = 12 + Math.sin(T * 12 + i * 2) * 3; shape(() => { g.moveTo(fx - 6, 286); g.quadraticCurveTo(fx, 286 - fh * 1.6, fx + 6, 286); g.closePath(); }, C.sky, { lw: 2, shade: false }); }
+  if (st > 0) { // 屋台ののれん
+    for (let i = 0; i < 5; i++) { const x = 402 + i * 40; shape(() => rrPath(x, 316, 36, 40 * st, 4), i % 2 ? C.white : PAL.awn, { lw: 3, shade: false }); }
+  }
+  line(420, 316, 440, 360, 5); line(590, 316, 570, 360, 5);
+  // 水車前のブラケット
+  line(560, 560, 640, 524, 5); line(640, 524, 680, 560, 4);
+}
+function drawPot() {
+  const P = POT;
+  line(P.hx, P.hy, P.x - Math.sin(P.a) * 44, P.y - Math.cos(P.a) * 44, 3.5);
+  g.save(); g.translate(P.x, P.y); g.rotate(-P.a);
+  // 取っ手と本体
+  line(-72, -26, -60, -26, 7); line(60, -26, 72, -26, 7);
+  shape(() => { g.moveTo(-62, -40); g.lineTo(62, -40); g.lineTo(56, 30); g.quadraticCurveTo(0, 46, -56, 30); g.closePath(); }, C.ver, { lw: 5, bb: [-62, -40, 124, 80] });
+  line(-60, -28, 60, -28, 3, 'rgba(255,250,238,0.6)');
+  // ひもの輪
+  line(-10, -44, 0, -60, 3); line(10, -44, 0, -60, 3);
+  g.restore();
+  if (LID.on) {
+    const h = LID.home(); const j = LID.jig * Math.sin(T * 40) * 4;
+    g.save(); g.translate(h.x, h.y + j); g.rotate(-P.a + j * 0.02); drawLidShape(); g.restore();
+  }
+}
+function drawLidShape() {
+  shape(() => { g.moveTo(-60, 6); g.quadraticCurveTo(0, -22, 60, 6); g.closePath(); }, C.tin, { lw: 4, bb: [-60, -16, 120, 22] });
+  rrect(-8, -26, 16, 12, 5, C.ink, { lw: 0, shade: false });
+}
+function drawKettle() {
+  const K = KET;
+  g.save(); g.translate(K.px, K.py); g.rotate(K.a);
+  // 注ぎ口
+  shape(() => { g.moveTo(-14, -30); g.quadraticCurveTo(10, -40, 34, -70); g.lineTo(40, -62); g.quadraticCurveTo(20, -26, -6, -14); g.closePath(); }, C.yg, { lw: 4, shade: false });
+  // 本体
+  shape(() => { g.moveTo(-110, 0); g.quadraticCurveTo(-118, -84, -60, -96); g.quadraticCurveTo(-2, -84, -10, 0); g.closePath(); }, C.yg, { lw: 5, bb: [-118, -96, 110, 96] });
+  // ふたと取っ手
+  shape(() => g.ellipse(-60, -96, 26, 7, 0, 0, TAU), C.ygD, { lw: 3.5, shade: false }); circ(-60, -104, 6, C.ink, 0, { shade: false });
+  g.beginPath(); g.moveTo(-96, -76); g.quadraticCurveTo(-60, -150, -24, -76); g.lineWidth = 6; g.strokeStyle = C.ink; g.stroke();
+  // 水の量（窓）
+  rrect(-84, -60, 48, 50, 10, C.white, { lw: 3, shade: false });
+  const wl = K.water * 46; rrect(-82, -12 - wl, 44, wl + 0.01, 8, C.sky, { lw: 0, shade: false });
+  g.restore();
+  // 五徳
+  line(K.px - 116, K.py, K.px + 6, K.py, 4);
+}
+function drawSeesaw() {
+  const E = SEE;
+  // 支点
+  shape(() => { g.moveTo(E.px - 18, E.py + 34); g.lineTo(E.px, E.py + 2); g.lineTo(E.px + 18, E.py + 34); g.closePath(); }, C.tinD, { lw: 4, shade: false });
+  line(E.px - 30, E.py + 34, E.px + 30, E.py + 34, 5);
+  g.save(); g.translate(E.px, E.py); g.rotate(E.a);
+  rrect(-E.la - 8, -8, E.la + E.ra + 16, 12, 5, C.yamD, { lw: 4, shade: false });
+  // ホットケーキ鍋（左端）
+  shape(() => { g.moveTo(-E.la - 30, -10); g.lineTo(-E.la + 24, -10); g.quadraticCurveTo(-E.la + 20, 4, -E.la - 3, 4); g.quadraticCurveTo(-E.la - 26, 4, -E.la - 30, -10); g.closePath(); }, C.ink, { lw: 3, shade: false });
+  if (E.pan) { const ck = E.panCook; shape(() => g.ellipse(-E.la - 3, -14, 22, 6, 0, 0, TAU), ck > 0.6 ? C.yamD : C.yamL, { lw: 3, shade: false }); }
+  g.restore();
+  // 生地のピッチャー（棚の下）
+  const jug = FX.find((f) => f.k === 'batter');
+  const ja = jug ? Math.sin(Math.min(1, jug.t / jug.life) * Math.PI) * 0.7 : 0;
+  line(452, 316, 452, 330, 3);
+  g.save(); g.translate(452, 330); g.rotate(-ja);
+  shape(() => { g.moveTo(-12, 0); g.lineTo(12, 0); g.lineTo(15, 30); g.quadraticCurveTo(0, 36, -15, 30); g.lineTo(-18, 4); g.lineTo(-24, 0); g.closePath(); }, C.white, { lw: 3.5, bb: [-24, 0, 39, 36], ht: 0.3 });
+  rrect(-10, 14, 20, 12, 4, C.yamL, { lw: 0, shade: false });
+  g.restore();
+  if (jug) { g.save(); g.globalAlpha = 0.9; line(432, 336, 466, 404, 5, C.yamL); g.restore(); }
+}
+function drawWheel() {
+  const Wh = WHEEL;
+  // 支柱
+  line(Wh.x, Wh.y, Wh.x + 30, Wh.y + 90, 6); line(Wh.x, Wh.y, Wh.x - 30, Wh.y + 90, 6);
+  g.save(); g.translate(Wh.x, Wh.y); g.rotate(Wh.ang);
+  circ(0, 0, Wh.r - 10, C.yamL, 4, { shade: false });
+  for (let i = 0; i < 8; i++) {
+    const a = i * TAU / 8;
+    g.save(); g.rotate(a); rrect(-6, -Wh.r, 12, 22, 3, i % 2 ? C.sky : C.white, { lw: 3, shade: false }); line(0, -Wh.r + 20, 0, -12, 3.5); g.restore();
+  }
+  circ(0, 0, 13, C.ver, 3.5, { shade: false });
+  g.restore();
+  // ベルト（トースターへ）
+  const off = (Wh.ang * 14) % 16;
+  g.save(); g.lineWidth = 4; g.strokeStyle = C.ink; g.setLineDash([10, 6]); g.lineDashOffset = -off;
+  g.beginPath(); g.moveTo(Wh.x - 8, Wh.y); g.lineTo(616, 828); g.moveTo(Wh.x + 8, Wh.y); g.lineTo(630, 828); g.stroke(); g.restore();
+}
+function drawToaster() {
+  const t = TOAST; const r = t.rattle > 0 ? Math.sin(T * 50) * 2 * t.rattle : 0;
+  g.save(); g.translate(r, 0);
+  // パン（入っているとき）
+  if (t.bread) { const up = 6 + Math.sin(T * 1.5) * 1; shape(() => rrPath(532, 790 - 22 - up, 56, 34, 12), C.yamL, { lw: 3.5, shade: false }); line(536, 790 - 14 - up, 584, 790 - 14 - up, 3, C.yamD); }
+  shape(() => rrPath(498, 790, 124, 110, 26), C.sky, { lw: 5, bb: [498, 790, 124, 110] });
+  rrect(520, 784, 80, 14, 7, C.ink, { lw: 0, shade: false });
+  // 巻きレバー（巻くほど下がる）
+  const ly = 820 + t.lever * 46;
+  line(622, 812, 622, 878, 4); rrect(616, ly - 6, 22, 12, 5, C.ver, { lw: 3 });
+  circ(622, 830, 9, C.yam, 3, { shade: false });
+  // 足
+  rrect(508, 896, 20, 6, 3, C.ink, { lw: 0, shade: false }); rrect(592, 896, 20, 6, 3, C.ink, { lw: 0, shade: false });
+  g.restore();
+}
+function drawBells() {
+  const deskBell = (b, col, s) => {
+    const sh = b.ring > 0 ? Math.sin(T * 60) * 2.5 * b.ring : 0;
+    g.save(); g.translate(b.x + sh, b.y);
+    shape(() => g.ellipse(0, 18 * s, 34 * s, 7 * s, 0, 0, TAU), C.tinD, { lw: 3.5, shade: false });
+    shape(() => { g.moveTo(-28 * s, 14 * s); g.quadraticCurveTo(-28 * s, -24 * s, 0, -24 * s); g.quadraticCurveTo(28 * s, -24 * s, 28 * s, 14 * s); g.closePath(); }, col, { lw: 4, bb: [-28 * s, -24 * s, 56 * s, 38 * s] });
+    rrect(-4 * s, -36 * s, 8 * s, 12 * s, 3, C.ink, { lw: 0, shade: false }); circ(0, -38 * s, 6 * s, C.ink, 0, { shade: false });
+    g.restore();
+  };
+  deskBell(BELLS.main, C.yam, 1);
+  deskBell(BELLS.other, S.phase === 'kitchen' ? C.tin : C.yamL, 0.78);
+  // 小鐘
+  const sb = BELLS.small; const sw = Math.sin(T * 26) * 0.5 * sb.ring;
+  g.save(); g.translate(sb.x, 384); g.rotate(sw);
+  shape(() => { g.moveTo(-14, 26); g.quadraticCurveTo(-14, 2, 0, 0); g.quadraticCurveTo(14, 2, 14, 26); g.closePath(); }, C.yam, { lw: 3.5, shade: false });
+  dot(0, 29, 4, C.ink);
+  g.restore();
+  // 屋台の上の大きな鐘
+  if (S.phase !== 'kitchen') {
+    const bb = BELLS.big; const k = stallK(3.0, 0.8); const sw2 = Math.sin(T * 14) * 0.35 * bb.ring;
+    g.save(); g.translate(bb.x, -60 + k * 6); g.rotate(sw2); g.globalAlpha = k;
+    line(0, -10, 0, 8, 4);
+    shape(() => { g.moveTo(-30, 62); g.quadraticCurveTo(-30, 12, 0, 8); g.quadraticCurveTo(30, 12, 30, 62); g.closePath(); }, C.yam, { lw: 4.5, bb: [-30, 8, 60, 54] });
+    dot(0, 66, 7, C.ink);
+    g.restore();
+  }
+}
+function drawAwning() {
+  const k = stallK(2.6, 0.9); if (k <= 0) return;
+  const X0 = Math.min(VIS.x0, -40), X1 = Math.max(VIS.x1, 760);
+  g.save(); g.translate(0, -20); g.scale(1, k); g.translate(0, 20);
+  const n = Math.ceil((X1 - X0) / 60);
+  for (let i = 0; i < n; i++) {
+    const x = X0 + i * 60;
+    shape(() => { g.moveTo(x, -20); g.lineTo(x + 60, -20); g.lineTo(x + 60, 40); g.arc(x + 30, 40, 30, 0, Math.PI); g.closePath(); }, i % 2 ? C.white : PAL.awn, { lw: 4, shade: false });
+  }
+  g.restore();
+}
+// ===== 動く物・道具の描画 =====
+function drawSpoon() {
+  const sp = SPOON;
+  g.save(); g.translate(sp.x, sp.y); g.rotate(sp.th);
+  if (HINT.bump && HINT.target === 'spoon') g.translate(0, -HINT.bump * 10);
+  // 柄（上）とつぼ（下、丸い背でゆらゆら）
+  shape(() => rrPath(-8, -150, 16, 128, 8), C.tin, { lw: 4, bb: [-8, -150, 16, 128], ht: 0.35 });
+  circ(0, -150, 12, C.tin, 4, { ht: 0.3 });
+  shape(() => g.ellipse(0, -16, 28, 18, 0, 0, TAU), C.tin, { lw: 4.5, bb: [-28, -34, 56, 36], ht: 0.4 });
+  shape(() => g.ellipse(0, -20, 18, 9, 0, 0, TAU), C.tinL, { lw: 2.5, shade: false });
+  line(-3, -140, -3, -40, 3, 'rgba(255,250,238,0.85)');
+  g.restore();
+}
+function drawFoodIcon(k, x, y, ang, s) {
+  g.save(); g.translate(x, y); g.rotate(ang || 0); g.scale(s, s);
+  if (k === 'bread') {
+    shape(() => { g.moveTo(-22, 20); g.lineTo(-22, -6); g.arc(-10, -10, 14, Math.PI, Math.PI * 1.55); g.arc(10, -10, 14, Math.PI * 1.45, 0); g.lineTo(22, 20); g.closePath(); }, C.yamD, { lw: 4, bb: [-24, -26, 48, 46] });
+    shape(() => { g.moveTo(-15, 14); g.lineTo(-15, -4); g.arc(-7, -8, 9, Math.PI, Math.PI * 1.6); g.arc(7, -8, 9, Math.PI * 1.4, 0); g.lineTo(15, 14); g.closePath(); }, C.yamL, { lw: 0, shade: false });
+  } else if (k === 'pancake') {
+    shape(() => g.ellipse(0, 4, 26, 11, 0, 0, TAU), C.yamD, { lw: 4, shade: false });
+    shape(() => g.ellipse(0, 0, 25, 9, 0, 0, TAU), C.yam, { lw: 3, bb: [-25, -9, 50, 18], ht: 0.3 });
+    rrect(-6, -9, 12, 7, 2, C.white, { lw: 2.5, shade: false });
+  } else if (k === 'mandarin') {
+    circ(0, 0, 22, C.yam, 4, { ht: 0.4 });
+    g.save(); g.globalAlpha = 0.5; line(-12, -6, 12, 6, 2, C.yamD); line(-10, 10, 10, -10, 2, C.yamD); g.restore();
+    shape(() => g.ellipse(4, -22, 8, 4, -0.5, 0, TAU), C.yg, { lw: 2.5, shade: false });
+  }
+  g.restore();
+}
+function drawBodies() {
+  for (const b of BODIES) {
+    if (!b.alive) continue;
+    const a = b.fade != null ? clamp(b.fade / 0.6, 0, 1) : 1;
+    if (a < 1) { g.save(); g.globalAlpha = a; }
+    if (b.k === 'lid') {
+      g.save(); g.translate(b.x, b.y);
+      const wob = b.wob > 0 ? Math.sin(b.wobP || 0) * 0.35 * b.wob : 0;
+      g.rotate(b.ang + wob); g.scale(0.85, 0.85 + wob * 0.2); g.translate(0, 8); drawLidShape(); g.restore();
+      if (b.magFelt > 800 && !b.stuck && TOOLS.magnet) { // 引かれている印
+        const M = TOOLS.magnet; g.save(); g.globalAlpha = 0.55; g.setLineDash([4, 6]); line(b.x, b.y, M.x, M.y, 2.5, C.ver); g.restore();
+      }
+    } else if (b.food) {
+      drawFoodIcon(b.k, b.x, b.y, b.ang, b.k === 'mandarin' ? 1.08 : 1);
+      if (b.superB) sparkle(b.x + 24, b.y - 20, 8, C.white, T * 6);
+    }
+    if (a < 1) g.restore();
+  }
+}
+function drawWater() {
+  if (WATER.length) {
+    g.beginPath(); for (const p of WATER) { g.moveTo(p.x + p.r, p.y); g.arc(p.x, p.y, p.r, 0, TAU); }
+    g.fillStyle = C.sky; g.fill(); g.lineWidth = 1.5; g.strokeStyle = 'rgba(46,41,51,0.6)'; g.stroke();
+  }
+  if (STEAM.length) {
+    g.save();
+    for (const p of STEAM) { const k = 1 - p.age / p.life; g.globalAlpha = 0.55 * k; g.beginPath(); g.arc(p.x, p.y, p.r, 0, TAU); g.fillStyle = C.white; g.fill(); g.lineWidth = 1.5; g.strokeStyle = 'rgba(46,41,51,0.35)'; g.stroke(); }
+    g.restore();
+  }
+  for (const q of PUDDLE.list) { g.save(); g.globalAlpha = q.a * 0.7; shape(() => g.ellipse(q.x, YC + 2, 26, 4, 0, 0, TAU), C.skyL, { lw: 1.5, shade: false }); g.restore(); }
+}
+function drawPlate(pl) {
+  g.save(); g.translate(pl.x, pl.y + (pl.drag ? -6 : 0)); g.rotate(pl.tilt);
+  const wob = pl.wob > 0 ? Math.sin(T * 30) * 3 * pl.wob : 0; g.translate(0, wob);
+  if (HINT.bump && HINT.target === pl.id) g.translate(0, -HINT.bump * 10);
+  const hw = pl.hw;
+  shape(() => { g.moveTo(-hw, -8); g.quadraticCurveTo(-hw * 0.7, 6, -hw * 0.45, 6); g.lineTo(hw * 0.45, 6); g.quadraticCurveTo(hw * 0.7, 6, hw, -8); g.closePath(); }, pl.col, { lw: 4, bb: [-hw, -8, hw * 2, 14] });
+  shape(() => g.ellipse(0, -8, hw, 8, 0, 0, TAU), pl.col, { lw: 4, shade: false });
+  strokeP(() => g.ellipse(0, -8, hw - 8, 5, 0, 0, TAU), 2.5, pl.rim);
+  if (pl.water > 0.01) {
+    const w = clamp(pl.water, 0, 1.2);
+    shape(() => g.ellipse(0, -9 - w * 4, (hw - 10) * (0.55 + 0.45 * Math.min(1, w)), 4 + w * 2, 0, 0, TAU), C.sky, { lw: 2, shade: false });
+    if (w > 0.5) { g.save(); g.globalAlpha = 0.7; line(-hw * 0.3, -11 - w * 4, -hw * 0.1, -11 - w * 4, 2, C.white); g.restore(); }
+  }
+  if (pl.big) { dot(-hw * 0.55, -8, 3, C.ver); dot(hw * 0.55, -8, 3, C.ver); }
+  g.restore();
+}
+function drawSpring() {
+  const Sp = TOOLS.spring; const q = Sp.squash;
+  g.save(); g.translate(Sp.x, Sp.y + (Sp.drag ? -6 : 0));
+  if (HINT.bump && HINT.target === 'spring') g.translate(0, -HINT.bump * 10);
+  const h = 22 * (1 - q * 0.55);
+  rrect(-30, -6, 60, 8, 4, C.ink, { lw: 0, shade: false });
+  g.beginPath(); g.moveTo(-18, -6);
+  for (let i = 0; i < 6; i++) g.lineTo(i % 2 ? 18 : -18, -6 - (i + 1) * h / 6);
+  g.lineWidth = 4.5; g.strokeStyle = C.ink; g.stroke(); g.lineWidth = 2; g.strokeStyle = C.tin; g.stroke();
+  g.translate(0, -6 - h);
+  shape(() => { g.moveTo(-50, -6); g.quadraticCurveTo(-40, 4, -26, 4); g.lineTo(26, 4); g.quadraticCurveTo(40, 4, 50, -6); g.closePath(); }, C.ver, { lw: 4, bb: [-50, -6, 100, 10] });
+  shape(() => g.ellipse(0, -6, 50, 7, 0, 0, TAU), C.verL, { lw: 4, shade: false });
+  g.restore();
+}
+function drawMagnet() {
+  const M = TOOLS.magnet;
+  let rot = -0.7;
+  const lid = LID.body; if (lid && lid.alive && !LID.on) { const d = hyp(lid.x - M.x, lid.y - M.y); if (d < 280) rot = lerp(rot, Math.atan2(lid.y - M.y, lid.x - M.x) - Math.PI / 2, clamp((280 - d) / 180, 0, 1)); }
+  M.ang = lerp(M.ang || rot, rot, 0.15);
+  g.save(); g.translate(M.x, M.y + (M.drag ? -6 : 0)); g.rotate(M.ang + Math.sin(T * 30) * 0.08 * M.wob);
+  if (HINT.bump && HINT.target === 'magnet') g.translate(0, -HINT.bump * 10);
+  const u = () => { g.moveTo(-30, 30); g.lineTo(-30, -2); g.arc(0, -2, 30, Math.PI, 0); g.lineTo(30, 30); g.lineTo(14, 30); g.lineTo(14, -2); g.arc(0, -2, 14, 0, Math.PI, true); g.lineTo(-14, 30); g.closePath(); };
+  shape(u, C.ver, { lw: 4.5, bb: [-30, -32, 60, 62] });
+  rrect(-30, 22, 16, 14, 3, C.tinL, { lw: 3.5, shade: false }); rrect(14, 22, 16, 14, 3, C.tinL, { lw: 3.5, shade: false });
+  if (lid && lid.magFelt > 600 && !lid.stuck) { g.save(); g.globalAlpha = 0.6; for (let i = 1; i <= 2; i++) strokeP(() => g.arc(0, 40, 14 * i + (T * 40) % 14, 0.2, Math.PI - 0.2), 2.5, C.ver); g.restore(); }
+  g.restore();
+}
+function drawWindmill() {
+  const Wm = TOOLS.windmill;
+  g.save(); g.translate(Wm.x, Wm.y + (Wm.drag ? -6 : 0));
+  if (HINT.bump && HINT.target === 'windmill') g.translate(0, -HINT.bump * 10);
+  line(0, 0, 0, 56, 5); circ(0, 60, 9, C.sky, 3, { shade: false });
+  g.save(); g.rotate(Wm.ang);
+  const cols = [C.ver, C.yam, C.sky, C.yg];
+  for (let i = 0; i < 4; i++) {
+    g.save(); g.rotate(i * Math.PI / 2);
+    shape(() => { g.moveTo(0, 0); g.lineTo(0, -44); g.quadraticCurveTo(22, -36, 26, -10); g.closePath(); }, cols[(i + SES.pal) % 4], { lw: 3.5, shade: false });
+    g.restore();
+  }
+  g.restore();
+  circ(0, 0, 8, C.white, 3, { shade: false }); circ(0, 0, 3.5, C.ink, 0, { shade: false });
+  g.restore();
+}
+function drawTray() {
+  if (!TRAY.on) return;
+  const p = trayPos();
+  g.save(); g.globalAlpha = 0.85; line(372, 480, p.x, p.y - 30, 2.5); g.restore();
+  rrect(p.x - 26, p.y - 4, 52, 8, 4, C.tin, { lw: 3 });
+  drawFoodIcon(TRAY.food, p.x, p.y - 18, 0, 0.8);
+}
+// ===== ねこの描画 =====
+function catFace(hx, hy, f) {
+  const c = CAT;
+  // 耳
+  const er = c.ear * 0.25 - c.earFlick * 0.4 * Math.sin(T * 30);
+  for (const side of [-1, 1]) {
+    g.save(); g.translate(hx + side * 22, hy - 26); g.rotate(side * (0.25 - er * side * 0.2) + (c.state === 'sleep' ? side * 0.35 : 0));
+    shape(() => { g.moveTo(-14, 6); g.lineTo(0, -26); g.lineTo(14, 6); g.closePath(); }, C.yam, { lw: 4, shade: false });
+    shape(() => { g.moveTo(-7, 3); g.lineTo(0, -14); g.lineTo(7, 3); g.closePath(); }, C.verL, { lw: 0, shade: false });
+    g.restore();
+  }
+  // 頭
+  shape(() => g.ellipse(hx, hy, 40, 34, 0, 0, TAU), C.yam, { lw: 4.5, bb: [hx - 40, hy - 34, 80, 68], ht: 0.4 });
+  // しま
+  line(hx - 8, hy - 32, hx - 6, hy - 20, 3.5, C.yamD); line(hx + 8, hy - 32, hx + 6, hy - 20, 3.5, C.yamD); line(hx, hy - 34, hx, hy - 22, 3.5, C.yamD);
+  // マズル
+  shape(() => g.ellipse(hx + f * 8, hy + 12, 22, 14, 0, 0, TAU), C.cream, { lw: 3, shade: false });
+  dot(hx + f * 8, hy + 5, 4.5, C.ver);
+  // 目
+  const ex = c.lookX * 4, ey = c.lookY * 3;
+  const open = c.eyeOpen * (1 - c.blink);
+  for (const side of [-1, 1]) {
+    const x = hx + f * 8 + side * 16, y = hy - 6;
+    if (c.mood === 'content' || c.state === 'happy') { strokeP(() => { g.arc(x, y + 3, 7, Math.PI * 1.1, Math.PI * 1.9); }, 3.5); continue; }
+    if (open < 0.12) { strokeP(() => { g.arc(x, y - 2, 7, Math.PI * 0.15, Math.PI * 0.85); }, 3.5); continue; }
+    const big = c.mood === 'surprised' ? 1.35 : c.mood === 'focus' ? 1.15 : 1;
+    const ry = 9 * big * open;
+    shape(() => g.ellipse(x, y, 8 * big, Math.max(2, ry), 0, 0, TAU), C.white, { lw: 3, shade: false });
+    dot(x + ex, y + ey, (c.mood === 'surprised' ? 3.2 : 4.6) * Math.min(1, open + 0.3), C.ink);
+    if (c.mood === 'proud') { g.save(); g.fillStyle = C.yam; g.fillRect(x - 10, y - 12, 20, 9 * (1.1 - open * 0.5)); g.restore(); line(x - 9, y - 4, x + 9, y - 4, 3); }
+  }
+  // 口
+  const mx = hx + f * 8, my = hy + 14;
+  if (c.yawn > 0.05 || c.mood === 'surprised') { const r = c.mood === 'surprised' ? 6 : 9 * Math.sin(c.yawn * Math.PI); shape(() => g.ellipse(mx, my + 3, r * 0.8, r, 0, 0, TAU), C.ver, { lw: 3, shade: false }); }
+  else { strokeP(() => { g.moveTo(mx - 7, my); g.quadraticCurveTo(mx - 3, my + 5, mx, my); g.quadraticCurveTo(mx + 3, my + 5, mx + 7, my); }, 2.5); }
+  // ひげ
+  for (const side of [-1, 1]) for (const k of [-1, 1]) line(mx + side * 14, my - 2 + k * 3, mx + side * 34, my - 4 + k * 7, 2, C.ink);
+}
+function drawCat() {
+  const c = CAT; const f = c.face;
+  let alpha = 1;
+  if (c.state === 'outside') alpha = 1 - c.out;
+  if (alpha <= 0.02) return;
+  g.save(); g.globalAlpha = alpha;
+  g.translate(c.x, c.y);
+  const sh = c.shake > 0 ? Math.sin(T * 50) * 4 * c.shake : 0;
+  g.translate(sh, 0);
+  const sq = c.sq; g.scale(1 + sq * 0.12, 1 - sq * 0.12);
+  const pose = c.jump || c.fly ? 'leap' : c.walk ? 'walk' : c.state === 'sleep' ? 'loaf' : 'sit';
+  const breath = Math.sin(T * (c.state === 'sleep' ? 1.8 : 3)) * (c.state === 'sleep' ? 2.5 : 1);
+  const tailSw = Math.sin(T * (c.state === 'sleep' ? 1.2 : c.state === 'want' ? 6 : 2.4)) * (c.state === 'sleep' ? 0.25 : 0.5);
+  g.scale(f, 1);
+  const tail = (bx, by, up) => { g.save(); g.beginPath(); g.moveTo(bx, by); g.bezierCurveTo(bx - 40, by - 10 * up, bx - 56 + tailSw * 20, by - 50 * up, bx - 34 + tailSw * 30, by - 76 * up); g.lineWidth = 15; g.strokeStyle = C.ink; g.lineCap = 'round'; g.stroke(); g.lineWidth = 9; g.strokeStyle = C.yam; g.stroke(); g.restore(); };
+  if (pose === 'loaf') {
+    tail(-46, -10, -0.15);
+    shape(() => g.ellipse(-4, -30 - breath * 0.5, 58, 32 + breath, 0, 0, TAU), C.yam, { lw: 4.5, bb: [-62, -64, 116, 64], ht: 0.45 });
+    line(-30, -58, -24, -40, 3.5, C.yamD); line(-10, -62, -6, -44, 3.5, C.yamD); line(10, -60, 12, -44, 3.5, C.yamD);
+    shape(() => g.ellipse(36, -8, 16, 8, 0, 0, TAU), C.cream, { lw: 3, shade: false });
+    g.save(); g.scale(f, 1); catFace(f * 40, -42 - breath * 0.3, f); g.restore();
+    if (c.state === 'sleep' && c.eyeOpen < 0.2) { const zt = (T * 0.6) % 1; g.save(); g.globalAlpha = (1 - zt) * 0.7; g.scale(f, 1); circ(f * 70 + zt * 20 * f, -90 - zt * 40, 5 + zt * 6, C.white, 2.5, { shade: false }); g.restore(); }
+  } else if (pose === 'leap') {
+    tail(-50, -40, 0.2);
+    shape(() => g.ellipse(0, -46, 62, 26, -0.18, 0, TAU), C.yam, { lw: 4.5, bb: [-62, -72, 124, 52], ht: 0.4 });
+    for (const [x, y, a] of [[40, -30, 0.6], [26, -26, 0.9], [-40, -34, -0.8], [-52, -40, -0.5]]) { g.save(); g.translate(x, y); g.rotate(a); rrect(-6, 0, 12, 30, 6, C.yam, { lw: 3.5, shade: false }); g.restore(); }
+    g.save(); g.scale(f, 1); catFace(f * 46, -74, f); g.restore();
+  } else if (pose === 'walk') {
+    const ph = T * 12;
+    tail(-50, -46, 0.6);
+    for (const [x, o] of [[34, 0], [20, Math.PI], [-30, Math.PI], [-44, 0]]) { const lift = Math.max(0, Math.sin(ph + o)) * 8; rrect(x - 6, -36 - lift, 12, 36, 6, C.yam, { lw: 3.5, shade: false }); }
+    shape(() => g.ellipse(0, -50, 56, 26, 0, 0, TAU), C.yam, { lw: 4.5, bb: [-56, -76, 112, 52], ht: 0.4 });
+    line(-20, -74, -16, -58, 3.5, C.yamD); line(0, -76, 2, -60, 3.5, C.yamD);
+    g.save(); g.scale(f, 1); catFace(f * 46, -84 + Math.sin(ph * 2) * 2, f); g.restore();
+  } else { // すわり
+    const proud = c.mood === 'proud' ? 6 : 0;
+    tail(-30, -8, 0.9);
+    shape(() => { g.moveTo(-36, 0); g.quadraticCurveTo(-46, -60, -8, -86 - proud); g.quadraticCurveTo(30, -84 - proud, 34, -40); g.quadraticCurveTo(38, -8, 30, 0); g.closePath(); }, C.yam, { lw: 4.5, bb: [-46, -90, 84, 90], ht: 0.4 });
+    shape(() => g.ellipse(14, -36, 14, 26, 0.1, 0, TAU), C.cream, { lw: 3, shade: false });
+    rrect(8, -26, 14, 26, 7, C.yam, { lw: 3.5, shade: false }); rrect(20, -24, 14, 24, 7, C.yam, { lw: 3.5, shade: false });
+    // 首輪
+    strokeP(() => { g.moveTo(-14, -80 - proud); g.quadraticCurveTo(10, -72 - proud, 32, -80 - proud); }, 7, PAL.collar); circ(12, -72 - proud, 6, C.yam, 3, { shade: false });
+    g.save(); g.scale(f, 1); catFace(f * 14, -112 - proud, f); g.restore();
+  }
+  if (c.purr > 0.05) { g.save(); g.globalAlpha = c.purr; for (let i = 0; i < 2; i++) { const a = (T * 2 + i * 0.5) % 1; strokeP(() => g.arc(0, -60, 70 + a * 30, -0.6, 0.6), 2.5, C.verL); } g.restore(); }
+  g.restore();
+  if (c.hold && !c.hold.alive) c.hold = null;
+}
+// ===== お客の描画 =====
+function drawGuestHead(kind, x, y, s) {
+  g.save(); g.translate(x, y); g.scale(s, s);
+  const col = { rabbit: C.white, bear: C.yamD, duck: C.yamL, hedgehog: C.ygL, squirrel: C.verL }[kind];
+  if (kind === 'rabbit') { for (const sd of [-1, 1]) { shape(() => g.ellipse(sd * 12, -46, 10, 30, sd * 0.15, 0, TAU), col, { lw: 4, shade: false }); shape(() => g.ellipse(sd * 12, -44, 4, 20, sd * 0.15, 0, TAU), C.verL, { lw: 0, shade: false }); } }
+  if (kind === 'bear') { circ(-24, -22, 12, col, 4, { shade: false }); circ(24, -22, 12, col, 4, { shade: false }); }
+  if (kind === 'squirrel') { shape(() => { g.moveTo(-18, -18); g.lineTo(-12, -40); g.lineTo(-2, -22); g.closePath(); g.moveTo(18, -18); g.lineTo(12, -40); g.lineTo(2, -22); g.closePath(); }, col, { lw: 3.5, shade: false }); }
+  if (kind === 'hedgehog') { for (let i = 0; i < 7; i++) { const a = Math.PI + i * Math.PI / 6; shape(() => { g.moveTo(Math.cos(a - 0.2) * 26, Math.sin(a - 0.2) * 24); g.lineTo(Math.cos(a) * 42, Math.sin(a) * 40); g.lineTo(Math.cos(a + 0.2) * 26, Math.sin(a + 0.2) * 24); g.closePath(); }, C.ygD, { lw: 3, shade: false }); } }
+  shape(() => g.ellipse(0, 0, 30, 26, 0, 0, TAU), col, { lw: 4, bb: [-30, -26, 60, 52], ht: 0.3 });
+  if (kind === 'duck') shape(() => g.ellipse(0, 10, 16, 7, 0, 0, TAU), C.yam, { lw: 3, shade: false });
+  else dot(0, 6, 4, kind === 'bear' ? C.ink : C.ver);
+  dot(-11, -4, 4, C.ink); dot(11, -4, 4, C.ink); dot(-10, -6, 1.4, C.white); dot(12, -6, 1.4, C.white);
+  dot(-20, 8, 5, 'rgba(227,83,46,0.35)'); dot(20, 8, 5, 'rgba(227,83,46,0.35)');
+  g.restore();
+}
+function drawGuest(gs) {
+  const s = gs.s; const hop = Math.abs(Math.sin(gs.hop)) * 10 * (gs.state === 'arrive' || gs.state === 'leave' ? 1 : 0) + (gs.gesture === 'hop' ? Math.abs(Math.sin(gs.gestT * 8)) * 10 : 0) + gs.excite * Math.abs(Math.sin(T * 10)) * 8;
+  const a = gs.state === 'leave' ? clamp(1 - gs.t / 3.5, 0, 1) : 1;
+  if (a <= 0) return;
+  g.save(); g.globalAlpha = a;
+  g.translate(gs.x, gs.y - hop - gs.jump);
+  const col = { rabbit: C.white, bear: C.yamD, duck: C.yamL, hedgehog: C.ygL, squirrel: C.verL }[gs.kind];
+  const bh = gs.kind === 'bear' ? 96 : gs.kind === 'hedgehog' ? 54 : 74;
+  g.save(); g.scale(s, s);
+  if (gs.kind === 'squirrel') { g.save(); g.scale(-gs.face, 1); shape(() => { g.moveTo(20, -20); g.bezierCurveTo(70, -20, 70, -110, 30, -110); g.bezierCurveTo(50, -80, 40, -50, 18, -46); g.closePath(); }, C.ver, { lw: 4, shade: false }); g.restore(); }
+  shape(() => g.ellipse(0, -bh * 0.5, 34, bh * 0.5, 0, 0, TAU), col, { lw: 4.5, bb: [-34, -bh, 68, bh], ht: 0.35 });
+  shape(() => g.ellipse(0, -bh * 0.42, 20, bh * 0.3, 0, 0, TAU), C.cream, { lw: 0, shade: false });
+  g.restore();
+  // 頭（猫を見る）
+  const lk = gs.look * (CAT.x > gs.x ? 1 : -1) * 6;
+  const eatBob = gs.state === 'eat' ? Math.sin(gs.t * 16) * 3 : 0;
+  drawGuestHead(gs.kind, lk * s, -(bh + 18) * s + eatBob, s);
+  g.restore();
+  // 皿（両手で持つ）
+  if (gs.plate && gs.state !== 'leave') {
+    g.save(); g.globalAlpha = a;
+    const px = gs.px, py = gs.py;
+    shape(() => g.ellipse(px, py, 30 * s, 7 * s, 0, 0, TAU), gs.plateCol, { lw: 3.5, shade: false });
+    strokeP(() => g.ellipse(px, py - 1, 22 * s, 4 * s, 0, 0, TAU), 2, C.sky);
+    for (const sd of [-1, 1]) circ(px + sd * 26 * s, py + 4 * s, 7 * s, col, 3, { shade: false });
+    if (gs.food && (gs.state === 'receive' || gs.state === 'eat')) {
+      const k = gs.state === 'eat' ? 1 - clamp(gs.t / 1.8, 0, 1) * 0.8 : 1;
+      drawFoodIcon(gs.food, px, py - 10 * s, 0, 0.8 * s * k);
+    }
+    g.restore();
+  }
+}
+function drawGuests(back) {
+  for (const gs of GUESTS) { if ((gs.s < 0.9) === back) drawGuest(gs); }
+}
+function drawGardenLife() {
+  if (S.phase === 'kitchen' && !S.doorOpen) return;
+  // 庭のピクニック（扉ルートの相手）
+  if (S.phase !== 'kitchen') {
+    const p = GARDEN.party, j = p > 0 ? Math.abs(Math.sin(T * 9)) * 14 * p : 0;
+    drawGuestHead('bear', 30, 760 - j, 0.62); drawGuestHead('duck', 110, 768 - j * 0.7, 0.55);
+    if (GARDEN.party > 0 && GARDEN.food) drawFoodIcon(GARDEN.food, 70, 782, 0, 0.6);
+  }
+  if (PARADE.on) {
+    PARADE.kinds.forEach((k, i) => {
+      const x = -200 + PARADE.t * 150 - i * 90, y = 720 - Math.abs(Math.sin(PARADE.t * 8 + i)) * 16;
+      if (x > -260 && x < 1000) { drawGuestHead(k, x, y, 0.55); sparkle(x, y - 40, 5, pick([C.yam, C.white]), T * 4 + i); }
+    });
+  }
+}
+// ===== 一本指の入力（Pointer Events）=====
+const PTR = { down: false, id: null, wx: null, wy: null, sx: 0, sy: 0, t0: 0, mode: null, obj: null, offx: 0, offy: 0, moved: 0, vx: 0, vy: 0, lx: 0, ly: 0, lt: 0, dir0: 1, firstDone: false };
+let lastInputT = 0;
+const BOUND = { x0: 16, x1: 704, y0: -30, y1: 896 };
+function hitTest(x, y) {
+  // 道具（上に描かれる順）
+  const Wm = TOOLS.windmill, M = TOOLS.magnet, Sp = TOOLS.spring;
+  if (hyp(x - Wm.x, y - Wm.y) < 54 || (Math.abs(x - Wm.x) < 22 && y > Wm.y && y < Wm.y + 72)) return { k: 'tool', o: Wm };
+  if (hyp(x - M.x, y - M.y) < 54) return { k: 'tool', o: M };
+  for (let i = PLATES.length - 1; i >= 0; i--) { const p = PLATES[i]; if (Math.abs(x - p.x) < p.hw + 14 && y > p.y - 40 && y < p.y + 22) return { k: 'plate', o: p }; }
+  if (Math.abs(x - Sp.x) < 60 && y > Sp.y - 60 && y < Sp.y + 16) return { k: 'tool', o: Sp };
+  // 食べ物・ふた（止まっているもの）
+  for (const b of BODIES) { if (!b.alive || b.carried || b.fade != null) continue; if ((b.food || b.k === 'lid') && hyp(x - b.x, y - b.y) < b.r + 26) { if (b === ROLL.mandarin && b.x < 240 && b.y < 250 && SPOON.state === 'stand') continue; return { k: 'body', o: b }; } }
+  // スプーン
+  const sp = SPOON;
+  if (sp.state === 'stand' || sp.state === 'rise') { const q = segDist(x, y, sp.x, sp.y, sp.tip().x, sp.tip().y); if (q.d < 46) return { k: 'spoon', o: sp }; }
+  if (sp.state === 'down') { const q = segDist(x, y, sp.x, sp.y - 10, sp.tip().x, sp.tip().y - 10); if (q.d < 48) return { k: 'spoonDown', o: sp }; }
+  // ねこ
+  if (hyp(x - CAT.x, y - (CAT.y - 50)) < 70) return { k: 'cat', o: CAT };
+  // カーテン
+  if (x > 440 && x < 652 && y > 26 && y < 200) return { k: 'curtain' };
+  // 仕掛け（さわると小さく反応するだけ）
+  if (hyp(x - POT.x, y - POT.y) < 80) return { k: 'fix', o: 'pot' };
+  if (x > 440 && x < 600 && y > 180 && y < 305) return { k: 'fix', o: 'kettle' };
+  if (hyp(x - WHEEL.x, y - WHEEL.y) < 80) return { k: 'fix', o: 'wheel' };
+  if (x > 494 && x < 640 && y > 770 && y < 905) return { k: 'fix', o: 'toaster' };
+  for (const k in BELLS) { const b = BELLS[k]; if (k === 'big' && S.phase !== 'stall') continue; if (hyp(x - b.x, y - b.y) < b.r + 30) return { k: 'fix', o: 'bell', b }; }
+  if (Math.abs(x - SEE.px) < 110 && Math.abs(y - SEE.py) < 40) return { k: 'fix', o: 'seesaw' };
+  if (x > 300 && x < 430 && y > 470 && y < 600) return { k: 'fix', o: 'cupboard' };
+  if (x > 28 && x < 146 && y > 690 && y < 900) return { k: 'fix', o: 'door' };
+  return null;
+}
+function onDown(e) {
+  e.preventDefault();
+  AU.unlock();
+  if (PTR.down) return; // 2本目以降の指は無視（状態を守る）
+  const p = toWorld(e.clientX, e.clientY);
+  PTR.down = true; PTR.id = e.pointerId; PTR.wx = p.x; PTR.wy = p.y; PTR.sx = p.x; PTR.sy = p.y; PTR.lx = p.x; PTR.ly = p.y;
+  PTR.t0 = performance.now(); PTR.lt = PTR.t0; PTR.moved = 0; PTR.vx = PTR.vy = 0; PTR.mode = null; PTR.obj = null;
+  try { cv.setPointerCapture(e.pointerId); } catch (er) {}
+  lastInputT = T; HINT.idle = 0; HINT.demo = null; HINT.stage = 0;
+  const h = hitTest(p.x, p.y);
+  if (!h) { emptyTap(p.x, p.y); PTR.mode = 'none'; return; }
+  if (h.k === 'spoon') {
+    const sp = SPOON; if (sp.state === 'rise') { sp.state = 'stand'; sp.th = 0; }
+    const dx = p.x - sp.x;
+    const m = ROLL.mandarin; const towardM = m && m.alive && m.x < 240 && m.y < 250 ? sgn(m.x - sp.x) : (sp.slot === 'L' ? 1 : -1);
+    PTR.dir0 = Math.abs(dx) < 14 ? towardM : -sgn(dx);
+    sp.w += PTR.dir0 * 1.35; sp.th += PTR.dir0 * 0.04; // 触れた瞬間に傾く
+    SFX.tink(sp.x); PTR.mode = 'spoonTilt'; PTR.obj = sp;
+    S.found.touchSpoon = 1;
+  } else if (h.k === 'spoonDown') {
+    PTR.mode = 'spoonCarry'; SPOON.state = 'held'; PTR.offx = 0; PTR.offy = 0; SFX.pick();
+  } else if (h.k === 'tool' || h.k === 'plate') {
+    const o = h.o; o.drag = true; o.fall = null; PTR.mode = 'drag'; PTR.obj = o; PTR.offx = p.x - o.x; PTR.offy = p.y - o.y; SFX.pick();
+    if (h.k === 'plate') { o.slot = null; }
+    if (o.kind === 'magnet' && LID.body && LID.body.stuck) { /* ふたもついてくる */ }
+  } else if (h.k === 'body') {
+    const b = h.o; b.held = true; b.stuck = false; PTR.mode = 'dragBody'; PTR.obj = b; PTR.offx = p.x - b.x; PTR.offy = p.y - b.y; SFX.pick();
+    if (b.k === 'lid') LID.stuck = false;
+  } else if (h.k === 'cat') {
+    const c = CAT; PTR.mode = 'none';
+    if (c.state === 'sleep') { c.earFlick = 1; c.eyeOpen = 0.6; SFX.purr(c.x); } else if (!c.busy()) { SFX.meow(c.x, 2); c.sq = 0.3; } else SFX.tap(c.x);
+  } else if (h.k === 'curtain') {
+    PTR.mode = 'none';
+    if (S.curtain > 0.5) { S.curtain = 0; SFX.whoosh(546); saveSoon(); } else { CUR.shake = 1; SFX.tap(546); }
+  } else if (h.k === 'fix') {
+    PTR.mode = 'none'; fixTap(h, p.x, p.y);
+  }
+}
+function fixTap(h, x, y) {
+  // 未到達の仕掛け: 小さく揺れて音が出るだけ（大連鎖は始まらない）
+  if (h.o === 'pot') { if (Math.abs(POT.w) < 0.3) POT.w += 0.16 * sgn(x - POT.x || 1) * -1; SFX.garan(POT.x, 0.25); }
+  else if (h.o === 'kettle') { if (KET.state === 'rest') KET.w += 0.4; SFX.kan(KET.px, 0.4); }
+  else if (h.o === 'wheel') { WHEEL.jig = 1; SFX.click(WHEEL.x, 0.8); }
+  else if (h.o === 'toaster') { TOAST.rattle = 1; SFX.kotoN(TOAST.x, 0.35); }
+  else if (h.o === 'bell') { h.b.ring = Math.max(h.b.ring, 0.25); SFX.tap(h.b.x); AU.tone(1568, 0.08, { g: 0.04 }); }
+  else if (h.o === 'seesaw') { if (SEE.state === 'rest') SEE.a -= 0.03; SFX.kotoN(SEE.px, 0.3); }
+  else if (h.o === 'cupboard') { SFX.kotoN(365, 0.3); SHELF.jig = 1; }
+  else if (h.o === 'door') { SFX.kotoN(85, 0.3); DOORV.jig = 1; }
+  CAT.earFlick = 1;
+}
+function emptyTap(x, y) {
+  // 何もない所は小さな反応だけ
+  puff(x, y, 3, C.white, 40, 0.35, 4); SFX.tap(x); CAT.earFlick = 1;
+}
+function onMove(e) {
+  if (!PTR.down || e.pointerId !== PTR.id) return;
+  e.preventDefault();
+  const p = toWorld(e.clientX, e.clientY);
+  const now = performance.now(); const dtt = Math.max(1, now - PTR.lt) / 1000;
+  PTR.vx = lerp(PTR.vx, (p.x - PTR.lx) / dtt, 0.4); PTR.vy = lerp(PTR.vy, (p.y - PTR.ly) / dtt, 0.4);
+  PTR.lx = p.x; PTR.ly = p.y; PTR.lt = now;
+  PTR.wx = p.x; PTR.wy = p.y; PTR.moved = Math.max(PTR.moved, hyp(p.x - PTR.sx, p.y - PTR.sy));
+  lastInputT = T; HINT.idle = 0;
+  const cx = clamp(p.x, BOUND.x0, BOUND.x1), cy = clamp(p.y, BOUND.y0, BOUND.y1);
+  if (PTR.mode === 'spoonTilt') {
+    const sp = SPOON; const dx = p.x - PTR.sx, dy = p.y - PTR.sy;
+    if (sp.state === 'stand' && dy < -70 && Math.abs(dy) > Math.abs(dx) * 1.3) { PTR.mode = 'spoonCarry'; sp.state = 'held'; SFX.pick(); return; }
+    if (sp.state === 'stand') { const tgt = clamp(dx / 150, -0.7, 0.7) + PTR.dir0 * 0.06; sp.push = (tgt - sp.th) * 70; }
+  } else if (PTR.mode === 'spoonCarry') {
+    SPOON.x = cx; SPOON.y = cy + 70; SPOON.hvx = PTR.vx;
+  } else if (PTR.mode === 'drag') {
+    const o = PTR.obj; o.x = clamp(p.x - PTR.offx, BOUND.x0, BOUND.x1); o.y = clamp(p.y - PTR.offy, BOUND.y0, BOUND.y1);
+    if (o.kind === 'plate') o.tilt = clamp(PTR.vx * 0.0007, -0.55, 0.55);
+  } else if (PTR.mode === 'dragBody') {
+    const b = PTR.obj; b.x = clamp(p.x - PTR.offx, BOUND.x0, BOUND.x1); b.y = clamp(p.y - PTR.offy, BOUND.y0, BOUND.y1); b.vx = b.vy = 0;
+  }
+}
+function onUp(e) {
+  if (!PTR.down || e.pointerId !== PTR.id) return;
+  e.preventDefault && e.preventDefault();
+  releasePointer(e.type === 'pointercancel');
+}
+function releasePointer(cancel) {
+  const mode = PTR.mode, o = PTR.obj;
+  const dur = (performance.now() - PTR.t0) / 1000;
+  PTR.down = false; PTR.id = null; PTR.mode = null; PTR.obj = null; PTR.wx = null; PTR.wy = null;
+  try { SPOON.push = 0; } catch (er) {}
+  if (mode === 'spoonTilt') {
+    const sp = SPOON;
+    if (sp.state === 'stand') {
+      // タップ = 押して倒す。ドラッグ途中で離しても傾いた方へ倒れる
+      if (cancel) { sp.w *= 0.3; }
+      else if (PTR.moved < 10 && dur < 0.45) sp.w += PTR.dir0 * 3.4;
+      else if (Math.abs(sp.th) > 0.1 || Math.abs(PTR.vx) > 260) sp.w += sgn(Math.abs(sp.th) > 0.1 ? sp.th : PTR.vx) * 3.4;
+    }
+  } else if (mode === 'spoonCarry') {
+    const sp = SPOON; const slot = sp.x < 130 ? 'L' : 'R';
+    sp.slot = slot; S.spoonSlot = slot; sp.x = sp.slotX(slot); sp.y = 245;
+    sp.state = 'rise'; sp.riseT = 0; sp.riseFrom = clamp(sp.th + 0.3 * (slot === 'L' ? -1 : 1), -0.8, 0.8); SFX.drop(sp.x);
+    S.found.spoonMoved = 1; saveSoon();
+  } else if (mode === 'drag') {
+    o.drag = false; dropTool(o);
+  } else if (mode === 'dragBody') {
+    o.held = false; o.vx = clamp(PTR.vx, -900, 900) * 0.6; o.vy = clamp(PTR.vy, -900, 900) * 0.6; o.rest = 0;
+    if (o.food && S.phase === 'stall') { for (const gs of GUESTS) if (gs.state === 'wait' && hyp(o.x - gs.px, o.y - gs.py) < 60) { guestReceive(gs, o, 'hand'); break; } }
+    if (o.food && o.alive && S.phase === 'kitchen' && TABLE.free() && hyp(o.x - TABLE.px, o.y - TABLE.py) < 60) TABLE.put(o);
+    if (o.k === 'lid' && hyp(o.x - POT.x, o.y - (POT.y - 40)) < 70) { o.alive = false; LID.on = true; LID.body = null; SFX.clink(POT.x); }
+  }
+  saveSoon();
+}
+function dropTool(o) {
+  SFX.drop(o.x);
+  if (o.kind === 'plate') {
+    const e = seeLocal(72 + o.hw - 16, -10);
+    if (hyp(o.x - e.x, o.y - e.y) < 75) { o.slot = 'seesaw'; o.wob = 1; S.found.plateSeesaw = 1; return; }
+    if (hyp(o.x - BRACKET.x, o.y - BRACKET.y) < 64) { o.slot = 'bracket'; o.wob = 1; S.found.plateBracket = 1; return; }
+    o.slot = null; const sy = surfaceBelow(o.x, o.y - 4, true); o.fall = { v: 0, y: sy }; return;
+  }
+  if (o.kind === 'spring') { const sy = surfaceBelow(o.x, o.y - 4, true); o.fall = { v: 0, y: sy }; S.found.springMoved = 1; return; }
+  // 磁石・風車はその場にくっつく
+  o.wob = 1;
+  if (o.kind === 'magnet') S.found.magnetMoved = 1;
+  if (o.kind === 'windmill') S.found.windmillMoved = 1;
+}
+cv.addEventListener('pointerdown', onDown, { passive: false });
+cv.addEventListener('pointermove', onMove, { passive: false });
+cv.addEventListener('pointerup', onUp, { passive: false });
+cv.addEventListener('pointercancel', onUp, { passive: false });
+cv.addEventListener('lostpointercapture', (e) => { if (PTR.down && e.pointerId === PTR.id) releasePointer(true); });
+['contextmenu', 'selectstart', 'dragstart', 'gesturestart', 'gesturechange', 'dblclick'].forEach((k) => document.addEventListener(k, (e) => e.preventDefault(), { passive: false }));
+document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+document.addEventListener('wheel', (e) => e.preventDefault(), { passive: false });
+
+// ===== ことばのない誘導 =====
+const HINT = { target: null, idle: 0, stage: 0, demo: null, bump: 0, bumpT: 0, shown: {} };
+function hintPick() {
+  if (S.phase === 'morph' || ROUND.active || SPOON.state !== 'stand') return null;
+  const f = S.found;
+  if (!f.pot) return 'spoon';
+  if (!f.bellSmall) return 'spoon';
+  if (!f.springB) return 'spring';
+  if (!f.lidBell) return 'magnet';
+  if (!f.seesaw) { const bp = PLATES.find((p) => p.big); return bp ? bp.id : 'spoon'; }
+  if (!f.flag && S.flag < 0.5) return 'windmill';
+  if (S.phase === 'stall') { const gp = PLATES.find((p) => p.from && !p.slot); if (gp && (!f.step || !f.door)) return gp.id; }
+  return 'spoon';
+}
+function hintObj(t) { if (t === 'spoon') return SPOON; if (TOOLS[t]) return TOOLS[t]; return PLATES.find((p) => p.id === t) || null; }
+function hintPos(t) { const o = hintObj(t); if (!o) return null; if (o === SPOON) { const tp = SPOON.tip(); return { x: (SPOON.x + tp.x) / 2, y: (SPOON.y + tp.y) / 2 }; } return { x: o.x, y: o.y - 10 }; }
+function hintDest(t) { // お手本で指を動かす先
+  const f = S.found;
+  if (t === 'spoon') { if (f.pot && !f.bellSmall) return { lift: true, x: SPOON.slot === 'L' ? 188 : 84, y: 175 }; return { x: SPOON.x + (ROLL.mandarin && ROLL.mandarin.x > SPOON.x ? 70 : -70), y: 140 }; }
+  if (t === 'spring') return { x: 330, y: 880 };
+  if (t === 'magnet') return { x: 250, y: 440 };
+  if (t === 'windmill') return { x: 590, y: 110 };
+  const o = hintObj(t); if (o && o.big) return { x: 650, y: 405 };
+  if (o && o.from) return f.step ? { x: 110, y: 890 } : { x: 226, y: 622 };
+  return null;
+}
+function hintStep(dt) {
+  HINT.bump = Math.max(0, HINT.bump - dt * 3);
+  const busy = worldBusy() || PTR.down;
+  if (busy) { HINT.idle = 0; HINT.demo = null; HINT.stage = 0; return; }
+  HINT.idle += dt;
+  HINT.target = hintPick();
+  if (!HINT.target) return;
+  // 6秒まで介入しない → 小さな仕草（ねこの視線・跳ねる）→ 10秒で一度だけ手のお手本
+  const hp = hintPos(HINT.target); if (!hp) return;
+  if (HINT.idle > 6) { HINT.bumpT -= dt; if (HINT.bumpT <= 0) { HINT.bump = 1; HINT.bumpT = 2.6; SFX.tap(hp.x); } HINT.stage = 1; }
+  if (HINT.idle > 10 && !HINT.demo && !HINT.shown[HINT.target + ':' + ROUND.n]) {
+    const a = hintPos(HINT.target), b = hintDest(HINT.target);
+    if (a && b) { HINT.demo = { a, b, t: 0, lift: !!b.lift }; HINT.shown[HINT.target + ':' + ROUND.n] = 1; HINT.stage = 2; }
+  }
+  if (HINT.demo) { HINT.demo.t += dt; if (HINT.demo.t > 3) HINT.demo = null; }
+}
+function drawHint() {
+  const d = HINT.demo; if (!d) return;
+  const t = d.t; let x, y, press = 0, al = 0.85;
+  if (t < 0.5) { x = d.a.x + 30; y = d.a.y + 60 - t * 80; al = t / 0.5 * 0.85; }
+  else if (t < 0.8) { x = d.a.x; y = d.a.y + 20; press = (t - 0.5) / 0.3; }
+  else if (t < 2.3) {
+    const k = ease((t - 0.8) / 1.5); press = 1;
+    if (d.lift) { const mx = lerp(d.a.x, d.b.x, k), my = lerp(d.a.y, d.b.y, k) - Math.sin(k * Math.PI) * 80; x = mx; y = my + 20; }
+    else { x = lerp(d.a.x, d.b.x, k); y = lerp(d.a.y, d.b.y, k) + 20 - Math.sin(k * Math.PI) * 30; }
+  } else { x = d.b.x; y = d.b.y + 20 + (t - 2.3) * 40; press = Math.max(0, 1 - (t - 2.3) / 0.3); al = Math.max(0, 0.85 * (1 - (t - 2.3) / 0.7)); }
+  drawHand(x, y + 40, press, al);
+}
+// ===== 端末内の保存（初回・復元・破損・拒否）=====
+const SAVE_KEY = 'nekoasa24_v1';
+let saveOK = true, saveT = -1, saveStatus = 'none';
+function saveSoon() { saveT = T + 0.8; }
+function saveNow() {
+  if (!saveOK) return;
+  const bp = PLATES.find((p) => p.big);
+  const d = {
+    v: 1, phase: S.phase === 'kitchen' ? 'kitchen' : 'stall', spoonSlot: S.spoonSlot,
+    magnet: [TOOLS.magnet.x, TOOLS.magnet.y], spring: [TOOLS.spring.x, TOOLS.spring.y], windmill: [TOOLS.windmill.x, TOOLS.windmill.y],
+    plates: PLATES.map((p) => ({ x: p.x, y: p.y, slot: p.slot, water: +p.water.toFixed(3), big: !!p.big, from: p.from || null, col: p.col, rim: p.rim, hw: p.hw })),
+    curtain: S.curtain, flag: +S.flag.toFixed(3), shelfOpen: S.shelfOpen, doorOpen: S.doorOpen, catSpot: S.catSpot,
+    served: S.served, rounds: S.rounds, kettle: +KET.water.toFixed(3), found: S.found, pal: SES.pal, bp: !!bp,
+  };
+  try { localStorage.setItem(SAVE_KEY, JSON.stringify(d)); } catch (e) { saveOK = false; saveStatus = saveStatus === 'restored' ? 'restored-nosave' : 'denied'; }
+}
+const num = (v, a, b) => typeof v === 'number' && isFinite(v) && v >= a && v <= b;
+const pt = (v) => Array.isArray(v) && v.length === 2 && num(v[0], -100, 820) && num(v[1], -200, 1000);
+function validSave(d) {
+  if (!d || typeof d !== 'object' || d.v !== 1) return false;
+  if (['kitchen', 'stall'].indexOf(d.phase) < 0 || ['L', 'R'].indexOf(d.spoonSlot) < 0) return false;
+  if (!pt(d.magnet) || !pt(d.spring) || !pt(d.windmill)) return false;
+  if (!Array.isArray(d.plates) || d.plates.length > 6) return false;
+  for (const p of d.plates) { if (!p || !num(p.x, -100, 820) || !num(p.y, -200, 1000) || !num(p.water, 0, 2) || [null, 'seesaw', 'bracket'].indexOf(p.slot) < 0) return false; }
+  if (!num(d.curtain, 0, 1) || !num(d.flag, 0, 1) || !num(d.kettle, 0, 1)) return false;
+  if (Object.keys(SPOTS).indexOf(d.catSpot) < 0) return false;
+  return true;
+}
+function loadSave() {
+  let raw = null;
+  try { raw = localStorage.getItem(SAVE_KEY); } catch (e) { saveOK = false; return 'denied'; }
+  if (!raw) return 'first';
+  let d = null;
+  try { d = JSON.parse(raw); } catch (e) { d = null; }
+  if (!validSave(d)) { try { localStorage.removeItem(SAVE_KEY); } catch (e) {} return 'corrupt'; }
+  S.phase = d.phase; S.spoonSlot = d.spoonSlot;
+  const cl = (v, a, b) => clamp(v, a, b);
+  TOOLS.magnet.x = cl(d.magnet[0], 16, 704); TOOLS.magnet.y = cl(d.magnet[1], -30, 896);
+  TOOLS.spring.x = cl(d.spring[0], 16, 704); TOOLS.spring.y = surfaceBelow(TOOLS.spring.x, cl(d.spring[1], -30, 896) - 4, true);
+  TOOLS.windmill.x = cl(d.windmill[0], 16, 704); TOOLS.windmill.y = cl(d.windmill[1], -30, 896);
+  PLATES.length = 0;
+  const cols = [C.white, C.skyL, C.ygL, C.yamL, C.verL], rims = [C.ver, C.yg, C.sky, C.yam];
+  for (const p of d.plates) {
+    const pl = mkPlate({ x: cl(p.x, 16, 704), y: cl(p.y, -30, 900), slot: p.slot, water: cl(p.water, 0, 1.2), big: !!p.big, from: typeof p.from === 'string' ? p.from : null,
+      col: cols.indexOf(p.col) >= 0 ? p.col : C.white, rim: rims.indexOf(p.rim) >= 0 ? p.rim : C.sky, hw: p.big ? 54 : 40 });
+    if (!pl.slot) pl.y = surfaceBelow(pl.x, pl.y - 4, true);
+  }
+  if (!PLATES.some((p) => p.big)) mkPlate({ x: 392, y: 812, big: true, hw: 54, col: C.white, rim: C.sky });
+  S.curtain = d.curtain > 0.5 ? 1 : 0; S.flag = d.flag; S.shelfOpen = d.shelfOpen ? 1 : 0; S.doorOpen = d.doorOpen ? 1 : 0;
+  S.catSpot = d.catSpot; S.served = num(d.served, 0, 1e6) ? d.served : 0; S.rounds = num(d.rounds, 0, 1e6) ? d.rounds : 0;
+  KET.water = Math.max(0.5, d.kettle); // 再訪時は少し補充されている
+  if (d.found && typeof d.found === 'object') for (const k in d.found) if (d.found[k] === 1) S.found[k] = 1;
+  if (num(d.pal, 0, 3)) SES.pal = d.pal | 0;
+  return 'restored';
+}
+function sessionDefaults() {
+  // 毎回少しだけ違う（因果は変えない安全な位置だけ）
+  const mg = pick([[672, 770], [676, 758], [668, 782]]); TOOLS.magnet.x = mg[0]; TOOLS.magnet.y = mg[1];
+  const wm = pick([[300, 92], [246, 96], [292, 120]]); TOOLS.windmill.x = wm[0]; TOOLS.windmill.y = wm[1];
+  const sp = pick([[596, 198], [482, 198], [560, 198]]); TOOLS.spring.x = sp[0]; TOOLS.spring.y = sp[1];
+  mkPlate({ x: 392 + rnd(-14, 14), y: 812, big: true, hw: 54, col: C.white, rim: pick([C.sky, C.ver, C.yg]) });
+  KET.water = SES.kettle0;
+}
+
+// ===== 効果（粒）=====
+function fxStep(dt) {
+  for (let i = FX.length - 1; i >= 0; i--) {
+    const f = FX[i]; f.t += dt;
+    if (f.k === 'puff' || f.k === 'spark' || f.k === 'heart') { f.x += f.vx * dt; f.y += f.vy * dt; f.vx *= 1 - dt * 2.5; f.vy = f.k === 'spark' ? f.vy + 500 * dt : f.vy * (1 - dt * 2); }
+    else if (f.k === 'drip' || f.k === 'crumb') { f.x += f.vx * dt; f.y += f.vy * dt; f.vy += 1400 * dt; }
+    else if (f.k === 'drop') { f.vy += 1200 * dt; f.y += f.vy * dt; if (f.y >= f.y1) { FX.splice(i, 1); continue; } }
+    else if (f.k === 'lidFly') { if (f.t >= f.life) { LID.on = true; SFX.clink(POT.x); } }
+    if (f.t >= f.life) FX.splice(i, 1);
+  }
+}
+function drawFX() {
+  for (const f of FX) {
+    const k = clamp(f.t / f.life, 0, 1);
+    if (f.k === 'puff') { g.save(); g.globalAlpha = 0.85 * (1 - k); circ(f.x, f.y, f.r * (1 + k), f.col, 2.5, { shade: false }); g.restore(); }
+    else if (f.k === 'spark') { g.save(); g.globalAlpha = 1 - k * 0.7; sparkle(f.x, f.y, f.r * (1 - k * 0.4), f.col, f.rot + f.t * 6); g.restore(); }
+    else if (f.k === 'ring') { g.save(); g.globalAlpha = 1 - k; strokeP(() => g.arc(f.x, f.y, lerp(f.r0, f.r1, easeOut(k)), 0, TAU), 4 * (1 - k) + 1, f.col === C.white ? C.ink : f.col); g.restore(); }
+    else if (f.k === 'drip' || f.k === 'drop') { dot(f.x, f.y, f.r || 4, C.sky); }
+    else if (f.k === 'crumb') { dot(f.x, f.y, f.r, f.col); }
+    else if (f.k === 'heart') { g.save(); g.globalAlpha = 1 - k * k; heart(f.x, f.y, f.r, f.col); g.restore(); }
+    else if (f.k === 'slide') { g.save(); g.globalAlpha = 1 - k; drawFoodIcon('bread', TOAST.x, TOAST.y - 30 - (1 - k) * 30, 0, 0.8); g.restore(); }
+    else if (f.k === 'lidFly') { const e = ease(k), h = LID.home(); const x = lerp(f.x0, h.x, e), y = lerp(f.y0, h.y, e) - Math.sin(e * Math.PI) * 120; g.save(); g.translate(x, y); g.rotate(e * TAU); drawLidShape(); g.restore(); }
+  }
+}
+
+// ===== 描画 =====
+function render() {
+  if (CACHE.gen !== layoutGen) buildCaches();
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.drawImage(CACHE.garden, 0, 0);
+  worldTf(g);
+  drawGardenLife();
+  drawGuests(true);
+  drawWall();
+  drawWindow(); drawDoor(); drawCupboard(); drawCeiling(); drawFlag(); drawStrings();
+  drawTable(); drawGuests(false);
+  g.setTransform(1, 0, 0, 1, 0, 0); g.drawImage(CACHE.front, 0, 0); worldTf(g);
+  drawShelves(); drawBells(); drawPot(); drawKettle(); drawSeesaw(); drawWheel(); drawToaster();
+  drawAwning();
+  drawSpoon(); drawBodies(); drawWater();
+  for (const pl of PLATES) drawPlate(pl);
+  drawSpring(); drawWindmill(); drawMagnet(); drawTray();
+  drawCat();
+  drawFX();
+  drawHint();
+  g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.fillStyle = GRAIN_PAT; g.fillRect(0, 0, cv.width, cv.height);
+}
+// ===== 更新 =====
+function update(h) {
+  T += h;
+  timersStep();
+  spoonStep(h); potStep(h); kettleStep(h); steamStep(h); waterStep(h); wheelStep(h); toasterStep(h); seesawStep(h);
+  for (const pl of PLATES) plateStep(pl, h);
+  toolsStep(h);
+  for (const b of BODIES) stepBody(b, h);
+  foodStep(h); bellsStep(h); cordStep(h);
+  catStep(h); guestsStep(h); trayStep(h); gardenStep(h); paradeStep(h); morphStep(h);
+  fxStep(h); PUDDLE.step(h);
+  if (WHEEL.jig > 0) WHEEL.jig = Math.max(0, WHEEL.jig - h * 3);
+  roundStep(h); hintStep(h);
+  if (saveT > 0 && T >= saveT) { saveT = -1; saveNow(); }
+}
+let lastTS = 0, loopOn = false, rafId = 0, frames = 0;
+function frame(ts) {
+  if (!loopOn) return;
+  rafId = requestAnimationFrame(frame);
+  let dt = (ts - lastTS) / 1000; lastTS = ts;
+  if (!(dt > 0)) dt = 1 / 60;
+  dt = Math.min(dt, 1 / 20) * timeScale;
+  const n = Math.max(1, Math.ceil(dt / (1 / 120)));
+  for (let i = 0; i < n; i++) update(dt / n);
+  render(); frames++;
+}
+function startLoop() { if (loopOn) return; loopOn = true; lastTS = performance.now(); rafId = requestAnimationFrame(frame); }
+function stopLoop() { loopOn = false; try { cancelAnimationFrame(rafId); } catch (e) {} }
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { stopLoop(); if (PTR.down) releasePointer(true); AU.setLoop('pour', 0); AU.suspend(); saveNow(); }
+  else { AU.resume(); startLoop(); }
+});
+window.addEventListener('pagehide', () => saveNow());
+window.addEventListener('resize', () => { resize(); });
+window.addEventListener('orientationchange', () => { setTimeout(resize, 120); });
+// ===== 起動 =====
+function init() {
+  resize(); makePatterns();
+  saveStatus = loadSave();
+  if (saveStatus !== 'restored') sessionDefaults();
+  PAL = palette();
+  SPOON.slot = S.spoonSlot; SPOON.x = SPOON.slotX(SPOON.slot); SPOON.y = 245;
+  newMandarin(false);
+  const sp = SPOTS[S.catSpot] || SPOTS.cushion; CAT.x = sp.x; CAT.y = sp.y; CAT.face = sp.face;
+  if (S.phase === 'stall') { GT.spawn = 1.5; }
+  SHELF.v = S.shelfOpen ? 1 : 0; DOORV.v = S.doorOpen ? 1 : 0; CUR.v = S.curtain;
+  startLoop();
+  if (saveOK) saveSoon();
+}
+window.__NK = { S, CAT, SPOON, TOOLS, PLATES, POT, KET, WHEEL, TOAST, SEE, BELLS, GUESTS, ROUND, BODIES, HINT, CORD, LID, SES, VIS: () => VIS,
+  get T() { return T; }, get frames() { return frames; }, get saveStatus() { return saveStatus; }, get saveOK() { return saveOK; },
+  setTimeScale(v) { timeScale = v; }, forceSuper() { FORCE_SUPER = true; }, saveNow, w2s(x, y) { return { x: x * VIS.s + VIS.ox, y: y * VIS.s + VIS.oy }; } };
+init();
+</script>
+</body>
+</html>

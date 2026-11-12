@@ -1,0 +1,1065 @@
+/* ============================================================================
+ * room.js — the nursery
+ * ----------------------------------------------------------------------------
+ * A 5.4 × 5.0 × 2.78 m room with three walls; the fourth is open to the camera.
+ * Everything is metres, the floor is y = 0, and the baby is 0.62 m tall, so
+ * every piece of furniture here is at real nursery scale.
+ *
+ * Two decisions worth knowing about:
+ *
+ *  - The architecture receives shadows but never casts them. A sealed box that
+ *    casts would black out the whole room, because the key light lives outside
+ *    it; the window light is *drawn* instead (window.js), which is both cheaper
+ *    and far more controllable than relying on a shadow map.
+ *  - Draw calls are spent per material, not per prop. Walls, trim, ceiling and
+ *    floor are four calls between them; spindles, books, bunting, toys, leaves,
+ *    basket staves and every contact shadow in the room are instanced.
+ *
+ * Budget check at the bottom of build().
+ * ========================================================================== */
+
+import * as THREE from 'three';
+import * as P from './props.js';
+import * as TEX from '../engine/textures.js';
+import { WindowUnit } from './window.js';
+import { RoomRenderBudget } from './room-budget.js';
+import { SessionPrintMemento } from './session-mementos.js';
+
+/* ------------------------------------------------------------ dimensions -- */
+
+const RW = 5.4;          // width  (x: -2.7 .. 2.7)
+const RD = 5.0;          // depth  (z: -2.8 .. 2.2)
+const RH = 2.78;         // wall height
+const WALL = 0.14;       // wall thickness
+const X0 = -RW / 2, X1 = RW / 2;
+const Z0 = -2.8, Z1 = Z0 + RD;
+
+const DOOR = { x: 1.78, w: 0.88, h: 2.06 };
+const WIN = { z: -0.5, w: 1.46, h: 1.36, sill: 0.96 };
+
+/* --------------------------------------------------------------- profiles -- */
+
+// Skirting: a modern ogee board sitting on a quarter-round shoe moulding.
+// The shoe is the whole point — a board that meets the floor at a hard 90°
+// reads as a extruded rectangle, a shoe reads as joinery, and the reflex
+// curve between them catches a soft line instead of a hard one.
+// x = projection from the wall, y = height.
+const SKIRTING = [
+  [0, 0],
+  [0.0340, 0.0000], [0.0338, 0.0055], [0.0326, 0.0107], [0.0303, 0.0154],
+  [0.0272, 0.0193], [0.0243, 0.0216], [0.0224, 0.0232],   // quarter-round shoe
+  [0.0220, 0.0270],                                        // shoe meets the board
+  [0.022, 0.062], [0.013, 0.078], [0.017, 0.090],
+  [0.009, 0.104], [0.009, 0.116], [0, 0.116]
+];
+// Picture rail, at 1.98 m — the height that makes a room feel designed.
+const RAIL = [
+  [0, 0], [0.026, 0.005], [0.026, 0.018], [0.013, 0.032], [0.011, 0.044], [0, 0.044]
+];
+// Chair rail (dado) at 0.90 m. Breaks the largest, emptiest surface in the
+// frame into two bands and gives the wall a horizontal to read against.
+const DADO = [
+  [0, 0], [0.014, 0.004], [0.020, 0.013], [0.021, 0.026],
+  [0.014, 0.038], [0.010, 0.046], [0.010, 0.055], [0, 0.058]
+];
+const DADO_Y = 0.90;
+
+/* scratch, for the per-frame subject contact shadow */
+const _sv = new THREE.Vector3();
+const _sq = new THREE.Quaternion();
+const _ss = new THREE.Vector3();
+const _sm = new THREE.Matrix4();
+const _sc = new THREE.Color();
+
+export class Room {
+  constructor({ tier = 2, fx = null } = {}) {
+    this.tier = tier;
+    this.fx = fx;
+    this.group = new THREE.Group();
+    this.group.name = 'Room';
+    this.time = 0;
+    this.mood = 'day';
+    this.weather = 'clear';
+    this.lampOn = false;
+    this._anchors = new Map();
+    this._pick = [];
+    this._shadowField = new P.ShadowField();
+  }
+
+  /* ============================================================== build === */
+
+  build(ctx) {
+    this.ctx = ctx;
+    this.M = P.palette();
+
+    this._buildArchitecture();
+    this._buildWindow(ctx);
+    this._buildFurniture();
+    this._buildDressing();
+    this.printMemento = new SessionPrintMemento(this.group);
+    this._buildClutter();
+    this._buildLights();
+    this._buildAnchors();
+
+    this._trimShadowCasters();
+
+    this.shadows = this._shadowField.build();
+    this.group.add(this.shadows);
+
+    this.setWeather('clear');
+    this.setCurtains(1);
+    this.setLamp(false, true);
+    this.setMood('day');
+    this.renderBudget = new RoomRenderBudget(this);
+    return this.group;
+  }
+
+  /* ----------------------------------------------------- architecture --- */
+
+  _buildArchitecture() {
+    const M = this.M;
+
+    /* --- floor ---------------------------------------------------------- */
+    const floorGeo = new THREE.PlaneGeometry(RW, RD, 1, 1);
+    floorGeo.rotateX(-Math.PI / 2);
+    floorGeo.translate(0, 0, Z0 + RD / 2);
+    const floor = new THREE.Mesh(floorGeo, M.floor);
+    floor.receiveShadow = true;
+    floor.name = 'floor';
+    this.group.add(floor);
+    this.floor = floor;
+
+    /* --- walls ----------------------------------------------------------
+     * Each wall is an extruded Shape, so the window and the door are real
+     * holes with real reveals rather than boxes butted together.            */
+    const wallShape = (len, holes) => {
+      const s = new THREE.Shape();
+      s.moveTo(-len / 2, 0);
+      s.lineTo(len / 2, 0);
+      s.lineTo(len / 2, RH);
+      s.lineTo(-len / 2, RH);
+      s.closePath();
+      for (const h of holes || []) {
+        const p = new THREE.Path();
+        p.moveTo(h.a, h.b);
+        p.lineTo(h.a + h.w, h.b);
+        p.lineTo(h.a + h.w, h.b + h.h);
+        p.lineTo(h.a, h.b + h.h);
+        p.closePath();
+        s.holes.push(p);
+      }
+      return new THREE.ExtrudeGeometry(s, {
+        depth: WALL, bevelEnabled: true, bevelSize: 0.004, bevelThickness: 0.004,
+        bevelSegments: 1, steps: 1, curveSegments: 1
+      });
+    };
+
+    // back wall: extrudes toward -z once pushed back, so the front cap is the
+    // room-side face at z = Z0
+    const back = wallShape(RW, [{
+      a: DOOR.x - DOOR.w / 2 - 0, b: 0.001, w: DOOR.w, h: DOOR.h
+    }]);
+    back.translate(0, 0, Z0 - WALL);
+
+    // left wall: authored along world z, then yawed so its back cap faces +x
+    const left = wallShape(RD, [{
+      a: WIN.z - (Z0 + RD / 2) - WIN.w / 2, b: WIN.sill, w: WIN.w, h: WIN.h
+    }]);
+    left.rotateY(-Math.PI / 2);
+    left.translate(X0, 0, Z0 + RD / 2);
+
+    const right = wallShape(RD, []);
+    right.rotateY(Math.PI / 2);
+    right.translate(X1, 0, Z0 + RD / 2);
+
+    const walls = new THREE.Mesh(P.mergeAll([back, left, right]), M.wall);
+    walls.receiveShadow = true;
+    walls.castShadow = false;      // see the header note
+    walls.name = 'walls';
+    this.group.add(walls);
+    this.walls = walls;
+
+    /* --- ceiling with a cove and a shallow tray -------------------------- */
+    const inset = 0.55;
+    const ring = new THREE.Shape();
+    ring.moveTo(X0, Z0); ring.lineTo(X1, Z0); ring.lineTo(X1, Z1); ring.lineTo(X0, Z1); ring.closePath();
+    const hole = new THREE.Path();
+    hole.moveTo(X0 + inset, Z0 + inset);
+    hole.lineTo(X1 - inset, Z0 + inset);
+    hole.lineTo(X1 - inset, Z1 - inset);
+    hole.lineTo(X0 + inset, Z1 - inset);
+    hole.closePath();
+    ring.holes.push(hole);
+    const soffit = new THREE.ShapeGeometry(ring);
+    soffit.rotateX(Math.PI / 2);          // face down
+    soffit.translate(0, RH, 0);
+
+    const tray = new THREE.PlaneGeometry(RW - inset * 2, RD - inset * 2);
+    tray.rotateX(Math.PI / 2);
+    tray.translate(0, RH + 0.10, Z0 + RD / 2);
+
+    // cove: a concave sweep from the soffit up into the tray
+    const coveShape = new THREE.Shape();
+    coveShape.moveTo(0, 0);
+    coveShape.lineTo(0, 0.10);
+    coveShape.quadraticCurveTo(0.03, 0.03, 0.085, 0);
+    coveShape.closePath();
+    // each basis is (profile-out, up, run) and is kept right-handed so the
+    // extrusion's normals stay outward
+    const coveRuns = [
+      { len: RW, basis: [[0, 0, 1], [0, 1, 0], [-1, 0, 0]], pos: [X1, RH, Z0 + inset] },
+      { len: RW, basis: [[0, 0, -1], [0, 1, 0], [1, 0, 0]], pos: [X0, RH, Z1 - inset] },
+      { len: RD, basis: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], pos: [X0 + inset, RH, Z0] },
+      { len: RD, basis: [[-1, 0, 0], [0, 1, 0], [0, 0, -1]], pos: [X1 - inset, RH, Z1] }
+    ];
+    const coves = [];
+    for (const r of coveRuns) {
+      const g = new THREE.ExtrudeGeometry(coveShape, {
+        depth: r.len, bevelEnabled: false, steps: 1, curveSegments: 5
+      });
+      // the profile is authored (x = into the room, y = up) and extruded along
+      // its own +z; makeBasis drops each run onto the right edge of the tray
+      const m = new THREE.Matrix4().makeBasis(
+        new THREE.Vector3(...r.basis[0]), new THREE.Vector3(...r.basis[1]), new THREE.Vector3(...r.basis[2]));
+      m.setPosition(r.pos[0], r.pos[1], r.pos[2]);
+      g.applyMatrix4(m);
+      coves.push(g);
+    }
+
+    const ceiling = new THREE.Mesh(P.mergeAll([soffit, tray, ...coves]), M.ceiling);
+    ceiling.receiveShadow = true;
+    ceiling.name = 'ceiling';
+    this.group.add(ceiling);
+    this.ceiling = ceiling;
+
+    /* --- skirting, picture rail, door casing ----------------------------- */
+    const trim = [];
+    const run = (profile, len, basis, pos) => {
+      const g = P.extrudeProfile(profile, len, { bevel: 0.0012, curve: 2 });
+      const m = new THREE.Matrix4().makeBasis(
+        new THREE.Vector3(...basis[0]), new THREE.Vector3(...basis[1]), new THREE.Vector3(...basis[2]));
+      m.setPosition(pos[0], pos[1], pos[2]);
+      g.applyMatrix4(m);
+      return g;
+    };
+    // profile x = projection into the room, y = height, extruded along +z;
+    // every basis is right-handed, so the back-wall runs travel -x
+    const B_BACK = [[0, 0, 1], [0, 1, 0], [-1, 0, 0]];   // faces +z, runs -x
+    const B_LEFT = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];    // faces +x, runs +z
+    const B_RIGHT = [[-1, 0, 0], [0, 1, 0], [0, 0, -1]]; // faces -x, runs -z
+
+    // skirting is interrupted by the doorway, so the back wall gets two runs
+    const doorL = DOOR.x - DOOR.w / 2, doorR = DOOR.x + DOOR.w / 2;
+    trim.push(run(SKIRTING, doorL - X0, B_BACK, [doorL, 0, Z0]));
+    trim.push(run(SKIRTING, X1 - doorR, B_BACK, [X1, 0, Z0]));
+    trim.push(run(SKIRTING, RD, B_LEFT, [X0, 0, Z0]));
+    trim.push(run(SKIRTING, RD, B_RIGHT, [X1, 0, Z1]));
+    trim.push(run(RAIL, RW, B_BACK, [X1, 1.98, Z0]));
+    trim.push(run(RAIL, RD, B_LEFT, [X0, 1.98, Z0]));
+    trim.push(run(RAIL, RD, B_RIGHT, [X1, 1.98, Z1]));
+
+    // Chair rail. It runs the back wall (broken by the doorway) and the left
+    // wall up to the window reveal; the right wall is skipped because the
+    // wardrobe backs onto it and the rail would pass straight through.
+    trim.push(run(DADO, doorL - X0, B_BACK, [doorL, DADO_Y, Z0]));
+    trim.push(run(DADO, X1 - doorR, B_BACK, [X1, DADO_Y, Z0]));
+    // …and dies into the window reveal rather than running through the sill
+    trim.push(run(DADO, (WIN.z - 0.86) - Z0, B_LEFT, [X0, DADO_Y, Z0]));
+    trim.push(run(DADO, Z1 - (WIN.z + 0.86), B_LEFT, [X0, DADO_Y, WIN.z + 0.86]));
+
+    // door architrave
+    const CASE = [[0, 0], [0.024, 0.006], [0.026, 0.030], [0.016, 0.048], [0.014, 0.070], [0, 0.074]];
+    const band = 0.074;
+    const cm = (len, basis, pos) => {
+      const g = P.extrudeProfile(CASE, len, { bevel: 0.0012, curve: 2 });
+      const m = new THREE.Matrix4().makeBasis(
+        new THREE.Vector3(...basis[0]), new THREE.Vector3(...basis[1]), new THREE.Vector3(...basis[2]));
+      m.setPosition(pos[0], pos[1], pos[2]);
+      g.applyMatrix4(m);
+      return g;
+    };
+    // (x = band away from the opening, y = projection into the room, z = run)
+    trim.push(cm(DOOR.h + band, [[-1, 0, 0], [0, 0, 1], [0, 1, 0]], [doorL, 0, Z0]));
+    trim.push(cm(DOOR.h + band, [[1, 0, 0], [0, 0, 1], [0, -1, 0]], [doorR, DOOR.h + band, Z0]));
+    trim.push(cm(DOOR.w + band * 2, [[0, 1, 0], [0, 0, 1], [1, 0, 0]], [doorL - band, DOOR.h, Z0]));
+
+    /* --- electrics -------------------------------------------------------
+     * The wall is the largest surface in the frame; a switch and an outlet are
+     * the two marks that stop it reading as a backdrop. Both are authored
+     * facing +Z and split into a white part and a dark part so they merge into
+     * the trim and hall meshes that already exist — zero extra draw calls. */
+    const darkBits = [];
+    const sw = P.switchGeo();
+    // beside the door, at the height a grown-up's hand falls
+    trim.push(P.xf(sw.plate, [1.21, 1.06, Z0 + 0.0005]));
+    darkBits.push(P.xf(sw.dark, [1.21, 1.06, Z0 + 0.0005]));
+
+    const so = P.outletGeo();
+    // on the left wall just above the skirting, under the window
+    so.plate.rotateY(Math.PI / 2);
+    so.dark.rotateY(Math.PI / 2);
+    trim.push(P.xf(so.plate, [X0 + 0.0005, 0.245, -1.86]));
+    darkBits.push(P.xf(so.dark, [X0 + 0.0005, 0.245, -1.86]));
+
+    const trimMesh = new THREE.Mesh(P.mergeAll(trim), M.trim);
+    trimMesh.receiveShadow = true;
+    trimMesh.castShadow = true;
+    trimMesh.name = 'trim';
+    this.group.add(trimMesh);
+
+    /* --- what you see through the doorway -------------------------------- */
+    const hallD = 1.1;
+    const hall = [];
+    hall.push(P.rbox(DOOR.w + 0.3, DOOR.h + 0.3, 0.04, [DOOR.x, (DOOR.h + 0.3) / 2, Z0 - WALL - hallD], [0, 0, 0], 0.004, 1));
+    for (const sx of [-1, 1]) {
+      hall.push(P.rbox(0.04, DOOR.h + 0.3, hallD, [DOOR.x + sx * (DOOR.w / 2 + 0.13), (DOOR.h + 0.3) / 2, Z0 - WALL - hallD / 2], [0, 0, 0], 0.004, 1));
+    }
+    hall.push(P.rbox(DOOR.w + 0.3, 0.04, hallD, [DOOR.x, DOOR.h + 0.28, Z0 - WALL - hallD / 2], [0, 0, 0], 0.004, 1));
+    hall.push(P.rbox(DOOR.w + 0.3, 0.02, hallD, [DOOR.x, 0.005, Z0 - WALL - hallD / 2], [0, 0, 0], 0.004, 1));
+    hall.push(...darkBits);
+    const hallMesh = new THREE.Mesh(P.mergeAll(hall), M.dark);
+    hallMesh.receiveShadow = true;
+    hallMesh.name = 'hall';
+    this.group.add(hallMesh);
+
+    const door = P.buildDoorLeaf(M, { w: DOOR.w - 0.02, h: DOOR.h - 0.03 });
+    door.position.set(doorL + 0.01, 0.012, Z0 - WALL + 0.01);
+    door.rotation.y = 0.62;        // stood open, because a nursery door always is
+    this.group.add(door);
+    this.door = door;
+    this._pick.push(door.children[0]);
+  }
+
+  /* ---------------------------------------------------------- window --- */
+
+  _buildWindow(ctx) {
+    const unit = new WindowUnit({
+      tier: this.tier, palette: this.M, width: WIN.w, height: WIN.h, wall: WALL
+    });
+    unit.build(ctx);
+    unit.group.position.set(X0, WIN.sill + WIN.h / 2, WIN.z);
+    unit.group.rotation.y = Math.PI / 2;    // local +z (room side) -> world +x
+    this.group.add(unit.group);
+    this.window = unit;
+    this._buildRainFX();
+  }
+
+  /* --------------------------------------------------------- weather FX -- */
+
+  /**
+   * Rain you can actually see.
+   *
+   * `60-weather-rain` arrived with a correct overcast *grade* and no
+   * precipitation at all — dry glass, a dry tree, a dry house. The plumbing
+   * was never the problem and is verified working end to end: the harness
+   * patch reaches `State.setWeather` → `Room.setWeather` → `WindowUnit
+   * .setWeather`, which sets `rain.visible = true` and hands the rig its
+   * overcast table. The reason nothing renders is a **sizing** one, measured:
+   * `window.js:_buildWeatherFX` scatters its 90 streaks through a 6 × 5.2 ×
+   * 4.5 m slab hung off the exterior group, while the aperture the camera can
+   * actually see through is 1.46 × 1.36 m. Projecting all 90 drops against the
+   * wide camera puts **one** of them inside the frustum, and that one is a
+   * 6 mm quad at 42 % alpha, four metres out, inside the depth-of-field
+   * circle — i.e. sub-pixel and invisible even where it is on screen. That
+   * file belongs to the grade pass right now, so it is reported rather than
+   * edited (see the handoff note), and the rain the frame needs is built here.
+   *
+   * Two layers, because they fail differently:
+   *
+   *  · **Falling streaks**, confined to a slab that is *aimed at the opening*
+   *    — a bit wider and taller than the glazing and only 1.3 m deep — so
+   *    every drop spawned is a drop that can be seen. Yaw-billboarded at the
+   *    camera (rain is vertical; a full billboard would tumble it), leaned
+   *    with the wind, and wide enough to survive the defocus the wide shot
+   *    puts on the window.
+   *  · **Water on the pane**, which is what actually sells rain in a frame
+   *    where the sky behind it is a bright flat overcast: a streak of rain in
+   *    front of a white sky has almost no contrast, but a runnel on the glass
+   *    has a dark body and a bright refracting rim and reads at any blur.
+   *    Two copies at different scales and speeds give it parallax.
+   */
+  _buildRainFX() {
+    const g = new THREE.Group();
+    g.name = 'rain';
+    g.visible = false;
+    this.group.add(g);
+    this.rainFX = g;
+
+    /* --- falling streaks, aimed at the opening ------------------------- */
+    const n = this.tier >= 2 ? 150 : 60;
+    // Wide enough to survive the wide shot's defocus: at 5.5 m through a
+    // 26 mm-equivalent frame the glazing measures ~270 px/m, so a 6 mm quad
+    // (window.js's) is 1.6 px and a 14 mm one is nearly 4.
+    const streak = new THREE.PlaneGeometry(0.014, 0.30);
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0xdcebfa, transparent: true, opacity: 0.55,
+      depthWrite: false, fog: false, side: THREE.DoubleSide, toneMapped: true
+    });
+    const mesh = new THREE.InstancedMesh(streak, mat, n);
+    mesh.frustumCulled = false;
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    mesh.renderOrder = 1;
+    g.add(mesh);
+    this.rainStreaks = mesh;
+
+    const R = P.rng ? P.rng(61) : (() => Math.random());
+    this.rainDrops = [];
+    const zHalf = WIN.w * 0.72;
+    for (let i = 0; i < n; i++) {
+      this.rainDrops.push({
+        // just outside the pane, a metre deep at most: everything here is in
+        // front of something the camera can see
+        x: X0 - 0.10 - R() * 1.25,
+        y: WIN.sill - 0.30 + R() * (WIN.h + 0.95),
+        z: WIN.z + (R() - 0.5) * 2 * zHalf,
+        v: 3.4 + R() * 2.6,
+        len: 0.55 + R() * 0.85,
+        w: 0.75 + R() * 0.8
+      });
+    }
+    this._rainTop = WIN.sill + WIN.h + 0.65;
+    this._rainBottom = WIN.sill - 0.30;
+    this._rainQ = new THREE.Quaternion();
+    this._rainE = new THREE.Euler(0, 0, 0, 'YXZ');
+    this._rainM = new THREE.Matrix4();
+    this._rainP = new THREE.Vector3();
+    this._rainS = new THREE.Vector3();
+
+    /* --- water on the pane --------------------------------------------- */
+    const tex = TEX.painted('room-rain-glass', 512, (c, s) => {
+      c.clearRect(0, 0, s, s);
+      let seed = 0x9e37;
+      const rnd = () => {
+        seed = (seed * 1664525 + 1013904223) >>> 0;
+        return seed / 4294967296;
+      };
+      // runnels: a wobbling vertical channel with a dark body and two bright
+      // refracting rims — the read that survives a heavy defocus
+      for (let i = 0; i < 26; i++) {
+        const x0 = rnd() * s;
+        const w = 2.5 + rnd() * 6.5;
+        const yTop = rnd() * s * 0.5;
+        const yBot = yTop + s * (0.35 + rnd() * 0.65);
+        let x = x0;
+        c.lineCap = 'round';
+        for (let y = yTop; y < yBot; y += 6) {
+          x += (rnd() - 0.5) * 2.2;
+          const k = 1 - Math.abs((y - (yTop + yBot) / 2) / ((yBot - yTop) / 2));
+          const ww = w * (0.35 + 0.65 * Math.max(0, k));
+          c.strokeStyle = 'rgba(88,104,124,0.42)';
+          c.lineWidth = ww;
+          c.beginPath(); c.moveTo(x, y); c.lineTo(x, y + 7); c.stroke();
+          c.strokeStyle = 'rgba(255,255,255,0.55)';
+          c.lineWidth = Math.max(1, ww * 0.30);
+          c.beginPath();
+          c.moveTo(x - ww * 0.30, y); c.lineTo(x - ww * 0.30, y + 7); c.stroke();
+        }
+        // the bead at the head of the runnel
+        c.fillStyle = 'rgba(96,112,132,0.45)';
+        c.beginPath(); c.arc(x, yBot, w * 0.8, 0, Math.PI * 2); c.fill();
+        c.fillStyle = 'rgba(255,255,255,0.6)';
+        c.beginPath(); c.arc(x - w * 0.25, yBot - w * 0.25, w * 0.26, 0, Math.PI * 2); c.fill();
+      }
+      // stationary beads between the runnels
+      for (let i = 0; i < 320; i++) {
+        const x = rnd() * s, y = rnd() * s, r = 1.2 + rnd() * 3.4;
+        c.fillStyle = 'rgba(92,108,128,0.34)';
+        c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fill();
+        c.fillStyle = 'rgba(255,255,255,0.5)';
+        c.beginPath(); c.arc(x - r * 0.3, y - r * 0.3, r * 0.34, 0, Math.PI * 2); c.fill();
+      }
+    }, { repeat: 1 });
+
+    this.rainPanes = [];
+    const paneGeo = new THREE.PlaneGeometry(WIN.w - 0.075, WIN.h - 0.075);
+    for (let i = 0; i < 2; i++) {
+      const t = tex.clone();
+      t.needsUpdate = true;
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      t.repeat.set(i ? 1.6 : 1.0, i ? 1.6 : 1.0);
+      const pm = new THREE.MeshBasicMaterial({
+        map: t, transparent: true, depthWrite: false, fog: false,
+        opacity: i ? 0.55 : 0.8, side: THREE.DoubleSide, toneMapped: true
+      });
+      const pane = new THREE.Mesh(paneGeo, pm);
+      // the outside face of the glazing, a few millimetres proud of it
+      pane.position.set(X0 - 0.018 - i * 0.006, WIN.sill + WIN.h / 2, WIN.z);
+      pane.rotation.y = -Math.PI / 2;
+      pane.castShadow = false;
+      pane.receiveShadow = false;
+      pane.renderOrder = 4;
+      g.add(pane);
+      this.rainPanes.push({ mesh: pane, tex: t, speed: i ? 0.16 : 0.085 });
+    }
+  }
+
+  /** Advance the streaks and run the water down the glass. */
+  _rainUpdate(dt, ctx) {
+    const g = this.rainFX;
+    if (!g?.visible) return;
+
+    for (const p of this.rainPanes) {
+      p.tex.offset.y = (p.tex.offset.y - dt * p.speed) % 1;
+    }
+
+    const mesh = this.rainStreaks;
+    // Yaw-only billboard. Rain falls vertically, so it must turn to face the
+    // eye about Y and about nothing else — a full camera-facing billboard
+    // tumbles every streak off the vertical as soon as the camera tips down.
+    const cam = ctx?.camera;
+    const yaw = cam
+      ? Math.atan2(cam.position.x - X0, cam.position.z - WIN.z)
+      : Math.PI / 2;
+    for (let i = 0; i < this.rainDrops.length; i++) {
+      const d = this.rainDrops[i];
+      d.y -= d.v * dt;
+      d.z += dt * 0.42;                       // the wind that leans them
+      if (d.y < this._rainBottom) {
+        d.y = this._rainTop;
+        d.z -= WIN.w * 1.44 * Math.random();
+      }
+      this._rainE.set(0, yaw, 0.13);
+      this._rainQ.setFromEuler(this._rainE);
+      this._rainM.compose(
+        this._rainP.set(d.x, d.y, d.z), this._rainQ,
+        this._rainS.set(d.w, d.len, 1));
+      mesh.setMatrixAt(i, this._rainM);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  /* -------------------------------------------------------- furniture --- */
+
+  /**
+   * Nothing in a real room is square to the wall. Every non-architectural prop
+   * gets a small *seeded* nudge — a centimetre of position, a degree or two of
+   * yaw, and for anything hung or free-standing a fraction of a degree of
+   * lean. It is the cheapest single change in this file and it is the one that
+   * stops the room reading as a showroom.
+   */
+  _jitter(obj, { pos = 0.014, yaw = 0.030, lean = 0.0038 } = {}) {
+    const R = this._jrng || (this._jrng = P.rng(9137));
+    obj.position.x += (R() - 0.5) * 2 * pos;
+    obj.position.z += (R() - 0.5) * 2 * pos;
+    obj.rotation.y += (R() - 0.5) * 2 * yaw;
+    if (lean) {
+      obj.rotation.x += (R() - 0.5) * 2 * lean;
+      obj.rotation.z += (R() - 0.5) * 2 * lean;
+    }
+    return obj;
+  }
+
+  /**
+   * Tight dark cores under the feet of a piece of furniture. Offsets are in
+   * the object's *local* frame and are rotated by whatever yaw it ended up
+   * with, jitter included — otherwise the cores slide out from under the legs
+   * as soon as anything is turned off-axis.
+   */
+  _feet(obj, offsets, r = 0.045, opts = { opacity: 0.78, softness: 3.0 }) {
+    const ry = obj.rotation.y;
+    const c = Math.cos(ry), sn = Math.sin(ry);
+    for (const [lx, lz] of offsets) {
+      this._shadowField.add(
+        obj.position.x + lx * c + lz * sn,
+        obj.position.z + -lx * sn + lz * c,
+        r, r, opts);
+    }
+    return obj;
+  }
+
+  _place(obj, x, y, z, ry = 0, jitter = {}) {
+    obj.position.set(x, y, z);
+    obj.rotation.y = ry;
+    if (jitter !== false) this._jitter(obj, jitter);
+    this.group.add(obj);
+    if (obj.userData.pick) this._pick.push(...obj.userData.pick);
+    return obj;
+  }
+
+  _buildFurniture() {
+    const M = this.M;
+    const S = this._shadowField;
+
+    /* --- cot, with the mobile clamped to its far post -------------------- */
+    this.crib = this._place(P.buildCrib(M), -1.45, 0, -2.28, 0, { pos: 0.016, yaw: 0.026 });
+    S.pair(-1.45, -2.28, 0.70, 0.40, { opacity: 0.60, softness: 0.75, core: 0.5 });
+    // four feet: the dark cores that say the cot is standing, not floating
+    this._feet(this.crib, [[-0.596, -0.316], [0.596, -0.316], [-0.596, 0.316], [0.596, 0.316]],
+      0.055, { opacity: 0.8, softness: 2.6 });
+    this.mobile = this._place(P.buildMobile(M), -2.02, 0.78, -2.56, 0.35, { pos: 0.006, yaw: 0.05, lean: 0 });
+
+    /* --- changing dresser ------------------------------------------------ */
+    /* Nothing heavy ever goes back flush. A chest of drawers is walked back
+     * into a corner one end at a time and it stops when it stops: one corner
+     * touching the skirting, the other 40 mm off it. At 0.022 rad the yaw
+     * jitter was 1.2° — under the threshold at which a straight vertical edge
+     * visibly disagrees with the wall behind it, which is why the critique
+     * still read this as "dead square to the wall" (D30). 4.0° reads, and the
+     * gap it opens at the far end is what sells it. */
+    this.dresser = this._place(P.buildDresser(M), 0.15, 0.0, -2.494, 0.069, { pos: 0.008, yaw: 0 });
+    S.pair(0.15, -2.50, 0.56, 0.30, { opacity: 0.62, softness: 0.9, core: 0.55, rot: 0.069 });
+    S.band(0.15, -2.28, 0.55, 0.045, { opacity: 0.5, softness: 1.6, rot: 0.069 });   // toe line
+
+    this.nightlight = this._place(P.buildNightlight(M), 0.56, 0.905, -2.40, 0.4, { pos: 0.01, yaw: 0.3, lean: 0 });
+    S.add(0.56, -2.40, 0.055, 0.055, { opacity: 0.5, softness: 2.2, y: 0.885 });
+
+    /* --- wardrobe -------------------------------------------------------- */
+    this.wardrobe = this._place(P.buildWardrobe(M), 2.398, 0, -1.55, -Math.PI / 2, { pos: 0.009, yaw: 0.018 });
+    S.pair(2.41, -1.55, 0.32, 0.56, { opacity: 0.64, softness: 0.95, core: 0.5 });
+
+    /* --- shelf (with its books, teddy, rings and lamp) ------------------- */
+    // hung by hand: a shade under a degree out of true, which is exactly what
+    // a spirit level would have caught and nobody did
+    this.shelf = this._place(P.buildShelf(M), 0.10, 1.24, -2.66, 0, { pos: 0, yaw: 0, lean: 0 });
+    this.shelf.position.x += 0.012;
+    // 0.53° is a rounding error, not a mistake anyone made. A shelf hung on
+    // two hooks by eye is out by 1.5–2°, and that is the amount at which the
+    // books stop looking like they were placed by a grid (D30).
+    this.shelf.rotation.z = -0.0295;
+    this.lamp = this.shelf.userData.lamp;
+    // shelf-top contact: the props on it are grounded too
+    for (const [x, z, r, o] of [[-0.16, -2.66, 0.15, 0.42], [0.40, -2.66, 0.10, 0.40], [-0.20, -2.66, 0.11, 0.38]]) {
+      S.add(x, z, r, r * 0.7, { opacity: o, softness: 1.8, y: 1.258 });
+    }
+    S.add(-0.20, -2.66, 0.12, 0.09, { opacity: 0.42, softness: 1.9, y: 1.588 });
+
+    /* --- toy box --------------------------------------------------------- */
+    this.toybox = this._place(P.buildToyBox(M), -2.30, 0, 1.05, Math.PI / 2, { pos: 0.015, yaw: 0.035 });
+    S.pair(-2.30, 1.05, 0.26, 0.40, { opacity: 0.56, softness: 0.8, core: 0.62 });
+
+    /* --- high chair and play table --------------------------------------- */
+    this.highchair = this._place(P.buildHighchair(M), 1.72, 0, -0.35, 2.35, { pos: 0.018, yaw: 0.045 });
+    S.add(1.72, -0.35, 0.26, 0.26, { opacity: 0.34, softness: 0.55 });
+    this._feet(this.highchair, [[-0.19, -0.18], [0.19, -0.18], [-0.19, 0.18], [0.19, 0.18]]);
+
+    this.table = this._place(P.buildPlayTable(M), 1.45, 0, 0.78, 0.4, { pos: 0.02, yaw: 0.05 });
+    S.add(1.45, 0.78, 0.33, 0.33, { opacity: 0.34, softness: 0.6 });
+    const legs = [];
+    for (let i = 0; i < 4; i++) {
+      const a = (i / 4) * Math.PI * 2 + Math.PI / 4;
+      legs.push([Math.cos(a) * 0.21, Math.sin(a) * 0.21]);
+    }
+    this._feet(this.table, legs, 0.04, { opacity: 0.75, softness: 3.2 });
+    // the two stools, in the table's own local frame
+    for (const [lx, lz] of [[-0.46, 0.12], [0.42, -0.20]]) {
+      const c = Math.cos(this.table.rotation.y), sn = Math.sin(this.table.rotation.y);
+      const wx = this.table.position.x + lx * c + lz * sn;
+      const wz = this.table.position.z + -lx * sn + lz * c;
+      S.pair(wx, wz, 0.15, 0.15, { opacity: 0.46, softness: 0.5, core: 0.55 });
+    }
+
+    /* --- laundry basket, plant, pouffe ----------------------------------- */
+    this.basket = this._place(P.buildBasket(M), 1.02, 0, -2.36, 0.5, { pos: 0.02, yaw: 0.12 });
+    S.pair(1.02, -2.36, 0.235, 0.235, { opacity: 0.62, softness: 0.7, core: 0.86 });
+
+    this.plant = this._place(P.buildPlant(M), 2.25, 0, 1.42, 0.9, { pos: 0.02, yaw: 0.2 });
+    S.pair(2.25, 1.42, 0.19, 0.19, { opacity: 0.6, softness: 0.6, core: 0.8 });
+
+    this.pouffe = this._place(P.buildPouffe(M), -1.62, 0, 0.62, 0.3, { pos: 0.025, yaw: 0.25 });
+    S.pair(-1.62, 0.62, 0.30, 0.30, { opacity: 0.5, softness: 1.1, core: 0.82 });
+
+    /* --- rug ------------------------------------------------------------- */
+    this.rug = P.buildRug(M, { radius: 1.18 });
+    // a rug is dropped, not laid out: it sits a few degrees off the room grid
+    this.rug.position.set(0.05, 0, 0.35);
+    this.rug.rotation.y = 0.14;
+    this.group.add(this.rug);
+    // the rug's own soft occlusion, wider and much fainter than a prop's …
+    S.add(0.05, 0.35, 1.34, 1.34, { opacity: 0.14, softness: 2.4, y: 0.002 });
+    /* … plus the dark halo at its bound edge, which is what makes a rug sit
+     * *on* a floor instead of being printed on it. The ring has to peak just
+     * OUTSIDE the rug's own silhouette — peaked under it, the rug hides the one
+     * thing it is there to do, and that is exactly what was happening: the
+     * binding now rolls out to 1.066 R ≈ 1.26 m, and both rings were peaking at
+     * 1.21–1.23 m, i.e. underneath it. Moved out, widened and darkened. */
+    S.ring(0.05, 0.35, 1.46, 1.46, 0.895, { opacity: 0.62, softness: 1.4, y: 0.0022 });
+    S.ring(0.05, 0.35, 1.66, 1.66, 0.815, { opacity: 0.30, softness: 0.9, y: 0.0024 });
+
+    /* --- where the walls meet the floor ----------------------------------- */
+    // A skirting board with no shadow line at its foot is the tell. One soft
+    // band per wall run, riding in the same instanced sheet as everything else.
+    S.band(0, Z0 + 0.055, RW / 2 - 0.05, 0.075, { opacity: 0.42, softness: 1.3 });
+    S.band(X0 + 0.055, Z0 + RD / 2, RD / 2 - 0.05, 0.075, { opacity: 0.42, softness: 1.3, rot: Math.PI / 2 });
+    S.band(X1 - 0.055, Z0 + RD / 2, RD / 2 - 0.05, 0.075, { opacity: 0.42, softness: 1.3, rot: Math.PI / 2 });
+
+    /* --- the subject ------------------------------------------------------
+     * The baby is the one thing on this floor that moves, and he was the one
+     * thing with nothing under him: "in 05 and 07 the seated baby has no dark
+     * core where he meets the floor". The shadow map is far too soft at this
+     * penumbra to harden a contact, so he gets the same haze-plus-core pair
+     * every prop has — two instances reserved in the same sheet, rewritten
+     * from his world position in update(), for zero extra draw calls. */
+    this._subjectIdx = S.items.length;
+    S.pair(0, 0.40, 0.30, 0.30, { opacity: 0, softness: 1.0, core: 0.58 });
+  }
+
+  /* --------------------------------------------------------- dressing --- */
+
+  _buildDressing() {
+    const M = this.M;
+    const wallZ = Z0 + 0.022;
+
+    // Pictures over the cot plus the one on the right-hand wall, all in one
+    // group so the frames, the canvases and the glazing are three draw calls
+    // for the whole room rather than three per wall. The whole point of this
+    // group is that it is *not* level: the big one hangs 3.2° down to the left
+    // (the nail has turned), the small ones a degree either way, and the
+    // spacing between them is uneven because they were hung one at a time by
+    // eye.
+    const overCot = { pos: [-1.42, 1.52, wallZ], ry: 0 };
+    const onRight = { pos: [X1 - 0.022, 1.603, 0.362], ry: -Math.PI / 2 };
+    this.pictures = P.buildPictures(M, [
+      { x: -0.405, y: 0.055, w: 0.44, h: 0.34, art: 0, tilt: 0.031, place: overCot },
+      { x: 0.115, y: 0.212, w: 0.30, h: 0.38, art: 3, tilt: -0.056, place: overCot },
+      { x: 0.098, y: -0.232, w: 0.34, h: 0.26, art: 2, tilt: 0.017, place: overCot },
+      { x: 0, y: 0, w: 0.34, h: 0.42, art: 1, tilt: -0.038, place: onRight }
+    ]);
+    this.group.add(this.pictures);
+    this._pick.push(...(this.pictures.userData.pick || []));
+
+    this.clock = P.buildClock(M, { r: 0.125 });
+    this.clock.position.set(1.026, 1.658, wallZ + 0.01);
+    this.clock.rotation.z = 0.062;      // knocked when the battery was changed
+    this.group.add(this.clock);
+
+    // bunting slung across the back-left corner
+    this.bunting = P.buildBunting(M, [X0 + 0.05, 2.32, -1.60], [0.62, 2.14, wallZ + 0.02], {
+      n: 12, sag: 0.26
+    });
+    this.group.add(this.bunting);
+  }
+
+  /* ---------------------------------------------------------- clutter --- */
+
+  _buildClutter() {
+    /* Hand-placed clump centres, so nothing ever lands inside a piece of
+       furniture — but each one seeds a *cluster*, not a single toy. Real
+       clutter has density: two or three things together where a child was
+       sitting, one lone block drifted to a wall, a pile someone started
+       stacking and abandoned, and a couple half-on the rug's bound edge. */
+    const spots = [
+      [-0.72, 0.95, { n: 3, spread: 0.16 }],       // where somebody was playing
+      [-0.50, 1.12, { n: 3, pile: true }],         // an abandoned stack of three
+      [0.86, 1.28, { n: 2, spread: 0.13 }],        // half on, half off the rug rim
+      [-1.06, -0.05, { n: 1 }],                    // one that rolled to the edge
+      [0.34, -0.62, { n: 2, spread: 0.12 }],
+      [1.06, 0.10, { n: 1 }],
+      [-1.62, 1.34, { n: 2, spread: 0.20 }],       // drifted out onto bare floor
+      [0.50, -1.34, { n: 2, spread: 0.17 }],
+      [-0.88, -1.06, { n: 1 }]
+    ];
+    this._clutterRig = P.buildClutter(this.M, spots, { seed: 77, surfaceY: (x, z) => this.surfaceY(x, z) });
+    this._clutterRig.group.position.set(0, 0, 0);
+    this.group.add(this._clutterRig.group);
+    this._pick.push(...this._clutterRig.meshes);
+  }
+
+  /* ----------------------------------------------------------- lights --- */
+
+  _buildLights() {
+    // A soft bounce sitting just inside the window. The global rig owns the
+    // key; this only fills the reveal and the wall beside it, which is what
+    // makes the opening read as a hole rather than a poster.
+    this.windowBounce = new THREE.PointLight(0xdfeeff, 1.6, 4.6, 2);
+    this.windowBounce.position.set(X0 + 0.45, WIN.sill + WIN.h * 0.55, WIN.z);
+    this.windowBounce.castShadow = false;
+    this.group.add(this.windowBounce);
+
+    this.nightGlow = new THREE.PointLight(0xffb877, 0, 1.6, 2);
+    this.nightGlow.position.set(0.56, 0.96, -2.40);
+    this.group.add(this.nightGlow);
+
+    // the shelf lamp drives the rig's own "practical" so it lights the baby
+    const p = this.ctx?.lighting?.practical;
+    if (p) {
+      this.group.updateMatrixWorld(true);
+      this.lamp.getWorldPosition(p.position);
+      p.position.y += 0.20;
+      p.distance = 3.4;
+      p.decay = 2;
+    }
+  }
+
+  /* ---------------------------------------------------------- anchors --- */
+
+  _buildAnchors() {
+    const A = (name, x, y, z, ry = 0) => {
+      const o = new THREE.Object3D();
+      o.name = 'anchor:' + name;
+      o.position.set(x, y, z);
+      o.rotation.y = ry;
+      this.group.add(o);
+      this._anchors.set(name, o);
+      return o;
+    };
+    A('crib', -1.45, 0.52, -2.28);                  // mattress top
+    // Derive the changing locator from the authored mat itself. The dresser
+    // and mat both carry deliberate yaw/position imperfections; parenting the
+    // anchor to the rendered pad preserves those transforms automatically.
+    const changingMat = this.dresser?.getObjectByName?.('changingMat');
+    if (changingMat?.isObject3D && changingMat.geometry) {
+      changingMat.geometry.computeBoundingBox();
+      const top = changingMat.geometry.boundingBox?.max?.y;
+      if (Number.isFinite(top)) {
+        const changing = new THREE.Object3D();
+        changing.name = 'anchor:changing';
+        changing.position.y = top + 0.006;
+        changingMat.add(changing);
+        this._anchors.set('changing', changing);
+      }
+    }
+    A('tub', -0.92, 0.0, 0.98, 0.25);               // sits in the window light
+    A('highchair', 1.72, 0.0, -0.35, 2.35);
+    A('playmat', 0.05, 0.02, 0.40);
+    A('wardrobe', 2.41, 0.0, -1.55, -Math.PI / 2);
+    A('window', X0 + 0.10, WIN.sill + WIN.h / 2, WIN.z, Math.PI / 2);
+    A('shelf', 0.10, 1.26, -2.60);
+    A('toybox', -2.30, 0.45, 1.05, Math.PI / 2);
+    A('rug', 0.05, 0.015, 0.35);
+    A('table', 1.45, 0.44, 0.78, 0.4);
+  }
+
+  /**
+   * Every shadow caster is a second draw call, in a VSM map soft enough that a
+   * teddy on a shelf contributes nothing but noise. Anything small, high up or
+   * already grounded by a contact blob is dropped from the shadow pass; GTAO
+   * in the post stack supplies the small-scale contact darkening instead.
+   * This is worth ~30 draw calls a frame.
+   */
+  _trimShadowCasters() {
+    const NO_CAST = new Set([
+      'doorKnob', 'mobileArm', 'mobileHub', 'mobileCharms', 'dresserKnobs',
+      'changingBolsters', 'changingMat', 'nightlightFoot', 'wardrobeHandle', 'wardrobeClothes',
+      'books', 'bookPages', 'teddyBody', 'ringBase', 'rings', 'lampBase',
+      'lampStem', 'toyboxPull', 'stools', 'basketStaves', 'basketHoops',
+      'basketLiner', 'plantSoil', 'plantLeaves', 'pouffeSeams', 'pictureFrames',
+      'pictureArt', 'clockCase', 'clockHand', 'cribPiping', 'highchairPad',
+      'curtainRings', 'buntingFlags', 'buntingCord', 'snowLedge',
+      'clutterBlockMarks', 'clutterShadows', 'pictureGlass', 'basketLiner'
+    ]);
+    this.group.traverse(o => {
+      if ((o.isMesh || o.isPoints) && NO_CAST.has(o.name)) o.castShadow = false;
+    });
+  }
+
+  /* ================================================================ api === */
+
+  /**
+   * Height of whatever is underfoot at a world (x, z): 0 on the boards, the
+   * pile height on the rug. Anything that stands on the floor — a toy, a block
+   * tower, and above all a *contact shadow* — needs this, because the rug is
+   * 26 mm thick and a shadow blob laid at y = 0.004 inside the rug's footprint
+   * is 22 mm below the surface it is meant to be darkening, i.e. invisible.
+   * That was the whole of defect D18 on the rug, which is where every toy, the
+   * block tower and the baby all sit.
+   */
+  surfaceY(x, z) {
+    const h = this.rug?.userData.height;
+    if (!h) return 0;
+    const p = this.rug.position, ry = this.rug.rotation.y;
+    const dx = x - p.x, dz = z - p.z;
+    const c = Math.cos(ry), s = Math.sin(ry);
+    const y = h(dx * c - dz * s, dx * s + dz * c);
+    return y > 0 ? y : 0;
+  }
+
+  anchor(name) {
+    return this._anchors.get(name) || null;
+  }
+
+  pickables() {
+    // meshes only: a Group in the list is silently ignored by a non-recursive
+    // raycast, which is exactly the kind of bug that eats an afternoon
+    return [...this._pick, ...(this.window ? this.window.pickables() : []), this.rug, this.floor]
+      .filter(o => o && (o.isMesh || o.isPoints) && this._hierarchyVisible(o));
+  }
+
+  _hierarchyVisible(object) {
+    for (let node = object; node; node = node.parent) {
+      if (!node.visible) return false;
+      if (node === this.group) break;
+    }
+    return true;
+  }
+
+  setRenderBudget(options) {
+    this.renderBudget?.apply(options);
+  }
+
+  /** Replace the one session-only print card; no save/schema path is touched. */
+  setPrintMemento(recipe) {
+    this.printMemento?.set(recipe);
+  }
+
+  /** 'day' | 'golden' | 'evening' | 'night' — room-side dressing only; the
+   *  global light rig is the app's business. */
+  setMood(name) {
+    if (!['day', 'golden', 'evening', 'night'].includes(name)) return;
+    this.mood = name;
+    this.window?.setMood(name);
+    const night = name === 'night';
+    const evening = name === 'evening';
+    // contact shadows have to soften as the key light does, or props start to
+    // look stuck-on at night
+    this.shadows?.userData.setGlobal(night ? 0.45 : evening ? 0.78 : 1);
+    this._bounceBase = { day: 1.75, golden: 1.55, evening: 0.75, night: 0.30 }[name];
+    // nobody leaves a nursery dark: the lamps come on by themselves after dark
+    if (!this._lampForced) this.setLamp(night || evening, true);
+  }
+
+  setWeather(name) {
+    if (!['clear', 'rain', 'snow'].includes(name)) return;
+    this.weather = name;
+    this.window?.setWeather(name);
+    if (this.rainFX) this.rainFX.visible = name === 'rain';
+    // an overcast sky is a bigger, softer, cooler source: dimmer bounce, but
+    // spread wider so the room still reads as daylit
+    this._bounceScale = name === 'rain' ? 0.55 : name === 'snow' ? 0.8 : 1;
+    this._bounceRange = name === 'clear' ? 4.6 : 5.6;
+  }
+
+  /** 0 = curtains drawn across, 1 = pulled fully back. */
+  setCurtains(open) {
+    this.curtains = THREE.MathUtils.clamp(open, 0, 1);
+    this.window?.setCurtains(this.curtains);
+  }
+
+  setLamp(on, auto = false) {
+    this.lampOn = !!on;
+    if (!auto) this._lampForced = true;
+    this.lamp?.userData.setOn(this.lampOn);
+    this.nightlight?.userData.setOn(this.lampOn);
+    this.nightGlow.intensity = this.lampOn ? 0.55 : 0;
+    const p = this.ctx?.lighting?.practical;
+    if (p) {
+      this._practicalBase = this.lampOn ? 3.2 : 0;
+      p.intensity = this._practicalBase;
+    }
+  }
+
+  /**
+   * Scatter toys on the floor, or tidy them away.
+   *   clutter(true)  — everything out      clutter(false) — everything away
+   *   clutter(n)     — exactly n toys out
+   */
+  clutter(add) {
+    const n = this._clutterRig.set(add);
+    return n;
+  }
+
+  onState(patch = {}) {
+    if (patch.weather) this.setWeather(patch.weather);
+    if (patch.timeOfDay && ['day', 'golden', 'evening', 'night'].includes(patch.timeOfDay)) {
+      this.setMood(patch.timeOfDay);
+      // an explicit state change should move the whole rig, not just the room
+      this.ctx?.lighting?.transitionTo?.(patch.timeOfDay, 1.4);
+    }
+    if (patch.mess !== undefined) this.clutter(patch.mess);
+    if (patch.curtains !== undefined) this.setCurtains(patch.curtains);
+    if (patch.lamp !== undefined) this.setLamp(patch.lamp);
+  }
+
+  reset() {
+    this._lampForced = false;
+    this.printMemento?.clear();
+    this.clutter(false);
+    this.setCurtains(1);
+    this.setWeather('clear');
+    this.setMood('day');
+    this.setLamp(false, true);
+    this.window?.setWeather('clear', true);
+    this.window?.setMood('day', true);
+    this.window?.setCurtains(1, true);
+  }
+
+  /* =============================================================== tick === */
+
+  update(dt, ctx) {
+    this.time += dt;
+    const t = this.time;
+
+    this.window?.update(dt, ctx);
+    this._rainUpdate(dt, ctx);
+
+    // mobile: a slow spin with a touch of bob, never a constant rate — the eye
+    // reads perfectly linear motion as machinery
+    const spin = this.mobile.userData.spin;
+    spin.rotation.y = t * 0.30 + Math.sin(t * 0.7) * 0.10;
+    spin.position.y = 0.60 + Math.sin(t * 0.85) * 0.006;
+    spin.rotation.z = Math.sin(t * 0.6) * 0.02;
+
+    this.bunting.userData.update(t);
+
+    // clock: starts at ten past ten and runs 30× so it is visibly alive
+    const mins = 610 + t * 0.5;
+    this.clock.userData.minute.rotation.z = -(mins % 60) / 60 * Math.PI * 2;
+    this.clock.userData.hour.rotation.z = -((mins % 720) / 720) * Math.PI * 2;
+
+    // toys settling in or being tidied away — each one carries its own
+    // contact shadow now, written inside the rig's update()
+    this._clutterRig.update(dt);
+    this._updateSubjectShadow(ctx);
+
+    /* --- the window's bounce light tracks the sky it is bouncing --------- */
+    const k = 1 - Math.exp(-dt * 2.2);
+    const target = (this._bounceBase ?? 1.6) * (this._bounceScale ?? 1)
+      * (this.window ? 0.55 + 0.55 * this.window.shaftStrength() : 1);
+    this.windowBounce.intensity += (target - this.windowBounce.intensity) * k;
+    this.windowBounce.distance += ((this._bounceRange ?? 4.6) - this.windowBounce.distance) * k;
+    if (this.window) this.windowBounce.color.lerp(this.window.skyTint(), k * 0.6);
+
+    // a practical lamp that sits at one exact intensity looks like a uniform
+    const p = ctx?.lighting?.practical;
+    if (p && this._practicalBase) {
+      p.intensity = this._practicalBase * (1 + Math.sin(t * 6.3) * 0.012 + Math.sin(t * 11.7) * 0.008);
+    }
+  }
+
+  /**
+   * Rewrite the two instances reserved for the subject so a dark core follows
+   * the baby across the floor and fades out as he is picked up. Two matrices
+   * and two colours a frame; no extra draw call, no extra material.
+   */
+  _updateSubjectShadow(ctx) {
+    const im = this.shadows;
+    const i = this._subjectIdx;
+    if (!im || i === undefined) return;
+    const b = ctx?.baby?.group;
+    let op = 0, x = 0.05, z = 0.40, gy = 0;
+    if (b) {
+      b.getWorldPosition(_sv);
+      x = _sv.x; z = _sv.z;
+      gy = this.surfaceY(x, z);
+      // he is only *in contact* while he is on the floor; in the cot, the tub
+      // or the high chair the core has to be gone, not merely faint
+      op = THREE.MathUtils.clamp(1 - Math.max(0, _sv.y - gy) * 9, 0, 1);
+    }
+    _sq.identity();
+    // wide haze, then the tight core — same two-lobe shape ShadowField.pair()
+    // gives every prop, so the baby grounds exactly the way the furniture does
+    for (const [k, r, o, soft] of [[0, 0.34, 0.30, 0.60], [1, 0.17, 0.88, 2.4]]) {
+      _sv.set(x, gy + 0.005 + k * 0.0008, z);
+      _ss.set(r * 2, 1, r * 2);
+      im.setMatrixAt(i + k, _sm.compose(_sv, _sq, _ss));
+      _sc.setRGB(o * op, soft, 1);
+      im.setColorAt(i + k, _sc);
+    }
+    im.instanceMatrix.needsUpdate = true;
+    if (im.instanceColor) im.instanceColor.needsUpdate = true;
+  }
+
+  dispose() {
+    this.renderBudget?.dispose();
+    this.renderBudget = null;
+    this.printMemento?.dispose();
+    this.printMemento = null;
+    this.window?.dispose();
+    this.group.traverse(o => {
+      o.geometry?.dispose?.();
+      if (Array.isArray(o.material)) o.material.forEach(m => m.dispose?.());
+      else o.material?.dispose?.();
+    });
+    this.group.clear();
+  }
+}

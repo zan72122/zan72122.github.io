@@ -1,0 +1,2239 @@
+<!doctype html>
+<html lang="ja"><head>
+<meta name="robots" content="noindex,nofollow"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#f9dccb">
+<title>しぼると育つ！おかしのレースペン</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#f9dccb;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;overscroll-behavior:none;position:fixed;inset:0}
+canvas{position:fixed;left:0;top:0;width:100%;height:100%;display:block;touch-action:none}
+</style>
+<script src="/gf-nav.js" defer></script>
+</head><body><canvas id="c"></canvas><script>
+(function(){
+'use strict';
+// ================= core =================
+const cv = document.getElementById('c');
+const mainCtx = cv.getContext('2d');
+let ctx = mainCtx;
+let W = 1, H = 1, DPR = 1;
+let T = 0, lastNow = 0, rafId = 0, running = true;
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+const easeOut = t => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
+const easeInOut = t => { t = clamp(t, 0, 1); return t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; };
+const backOut = t => { t = clamp(t, 0, 1); const c = 1.9; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+const elastic = t => { t = clamp(t, 0, 1); if (t === 0 || t === 1) return t; return Math.pow(2, -9 * t) * Math.sin((t * 9 - 0.75) * TAU / 3) + 1; };
+const rand = (a = 1, b) => b === undefined ? Math.random() * a : a + Math.random() * (b - a);
+const pick = a => a[Math.floor(Math.random() * a.length)];
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+const gauss = (x, s) => Math.exp(-(x * x) / (2 * s * s));
+function mulberry(seed) { return function () { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function mkCanvas(w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, w | 0); c.height = Math.max(1, h | 0); return c; }
+function hexRGB(h) { h = h.replace('#', ''); return [parseInt(h.substr(0, 2), 16), parseInt(h.substr(2, 2), 16), parseInt(h.substr(4, 2), 16)]; }
+function rgbS(c, a) { return a === undefined || a >= 1 ? `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})` : `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a.toFixed(3)})`; }
+function mix(a, b, t) { return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]; }
+const WHITE = [255, 255, 255];
+function palAt(pal, u) { u = ((u % 1) + 1) % 1; const n = pal.length; const f = u * n; const i = Math.floor(f); return mix(pal[i % n], pal[(i + 1) % n], ease(f - i)); }
+function ell(x, y, rx, ry) { ctx.beginPath(); ctx.ellipse(x, y, Math.max(.01, rx), Math.max(.01, ry), 0, 0, TAU); }
+function circ(x, y, r) { ctx.beginPath(); ctx.arc(x, y, Math.max(.01, r), 0, TAU); }
+function radG(x, y, r0, r1, stops, x1, y1) { const g = ctx.createRadialGradient(x, y, r0, x1 === undefined ? x : x1, y1 === undefined ? y : y1, Math.max(r0 + .01, r1)); for (const s of stops) g.addColorStop(s[0], s[1]); return g; }
+function linG(x0, y0, x1, y1, stops) { const g = ctx.createLinearGradient(x0, y0, x1, y1); for (const s of stops) g.addColorStop(s[0], s[1]); return g; }
+function heartPath(x, y, s) { ctx.beginPath(); ctx.moveTo(x, y + s * .35); ctx.bezierCurveTo(x - s * 1.1, y - s * .35, x - s * .45, y - s * 1.05, x, y - s * .45); ctx.bezierCurveTo(x + s * .45, y - s * 1.05, x + s * 1.1, y - s * .35, x, y + s * .35); ctx.closePath(); }
+function starPath(x, y, r, n, inner, rot) { ctx.beginPath(); for (let i = 0; i < n * 2; i++) { const a = rot + i * Math.PI / n; const rr = i % 2 ? r * inner : r; ctx.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr); } ctx.closePath(); }
+
+// ================= particles =================
+const PMAX = 240; const parts = []; for (let i = 0; i < PMAX; i++) parts.push({ on: false }); let pIdx = 0, pCount = 0;
+function spawn(type, x, y, vx, vy, life, size, col, floor) {
+  for (let k = 0; k < PMAX; k++) {
+    pIdx = (pIdx + 1) % PMAX; const p = parts[pIdx];
+    if (!p.on) { p.on = true; p.type = type; p.x = x; p.y = y; p.vx = vx; p.vy = vy; p.life = life; p.max = life; p.size = size; p.col = col; p.floor = floor === undefined ? 1e9 : floor; p.rot = rand(TAU); p.vr = rand(-7, 7); return p; }
+  }
+  return null;
+}
+const SUGAR_COLS = ['#ffffff', '#fff6fb', '#ffe3ef', '#e9fff6', '#fff8d6', '#efe6ff'];
+function sugarBurst(x, y, n, cols, spd = 140, floorOff = 26) { cols = cols || SUGAR_COLS; for (let i = 0; i < n; i++) spawn('grain', x, y, rand(-1, 1) * spd, -rand(.35, 1) * spd * 1.3, rand(.6, 1.1), rand(1.6, 3.2), pick(cols), y + rand(4, floorOff)); }
+function sparkle(x, y, n, col, spread = 20) { for (let i = 0; i < n; i++) spawn('spark', x + rand(-spread, spread), y + rand(-spread, spread), rand(-20, 20), rand(-45, 0), rand(.45, .9), rand(3, 7.5), col || '#fff'); }
+function ripple(x, y, r, col) { spawn('ring', x, y, 0, 0, .5, r, col || 'rgba(255,255,255,.9)'); }
+function updParts(dt) {
+  pCount = 0;
+  for (const p of parts) {
+    if (!p.on) continue; p.life -= dt; if (p.life <= 0) { p.on = false; continue; } pCount++;
+    switch (p.type) {
+      case 'grain': case 'crumb':
+        p.vy += 700 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.vr * dt;
+        if (p.y > p.floor) { p.y = p.floor; p.vy *= -0.35; p.vx *= 0.6; p.vr *= .5; } break;
+      case 'spark': p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= .95; p.vy *= .95; break;
+      case 'heart': p.y += p.vy * dt; p.x += Math.sin((p.max - p.life) * 3.5 + p.rot) * 16 * dt; break;
+      case 'fw': { const f = Math.pow(.2, dt); p.vx *= f; p.vy *= f; p.vy += 26 * dt; p.x += p.vx * dt; p.y += p.vy * dt; break; }
+      case 'note': p.y += p.vy * dt; p.x += Math.sin((p.max - p.life) * 5) * 20 * dt; break;
+    }
+  }
+}
+function drawParts() {
+  const c = ctx;
+  for (const p of parts) {
+    if (!p.on) continue; const a = clamp(p.life / p.max, 0, 1);
+    switch (p.type) {
+      case 'grain': case 'crumb': {
+        c.globalAlpha = Math.min(1, a * 2.2); const co = Math.cos(p.rot) * DPR, si = Math.sin(p.rot) * DPR;
+        c.setTransform(co, si, -si, co, p.x * DPR, p.y * DPR); c.fillStyle = p.col; const s = p.size; c.fillRect(-s / 2, -s / 2, s, s);
+        if (p.type === 'grain') { c.fillStyle = 'rgba(255,255,255,.9)'; c.fillRect(-s / 2, -s / 2, s * .45, s * .45); }
+        break;
+      }
+      case 'spark': {
+        c.setTransform(DPR, 0, 0, DPR, 0, 0); c.globalAlpha = Math.min(1, a * 1.6);
+        const s = p.size * (0.5 + 0.5 * Math.sin(a * Math.PI)); c.fillStyle = p.col;
+        c.beginPath(); c.moveTo(p.x, p.y - s); c.quadraticCurveTo(p.x, p.y, p.x + s, p.y); c.quadraticCurveTo(p.x, p.y, p.x, p.y + s); c.quadraticCurveTo(p.x, p.y, p.x - s, p.y); c.quadraticCurveTo(p.x, p.y, p.x, p.y - s); c.fill();
+        break;
+      }
+      case 'heart': {
+        c.setTransform(DPR, 0, 0, DPR, 0, 0); c.globalAlpha = Math.min(1, a * 1.5) * .9;
+        const s = p.size * (0.6 + 0.4 * (1 - a)); heartPath(p.x, p.y, s); c.fillStyle = p.col; c.fill();
+        c.globalAlpha *= .7; c.fillStyle = '#fff'; circ(p.x - s * .35, p.y - s * .45, s * .16); c.fill();
+        break;
+      }
+      case 'fw': {
+        c.setTransform(DPR, 0, 0, DPR, 0, 0); c.globalAlpha = Math.min(1, a * 1.8);
+        const s = p.size * (0.7 + 0.3 * a);
+        c.fillStyle = p.col; circ(p.x, p.y, s); c.fill();
+        c.globalAlpha *= .8; c.fillStyle = '#fff'; circ(p.x - s * .3, p.y - s * .3, s * .38); c.fill();
+        break;
+      }
+      case 'ring': {
+        c.setTransform(DPR, 0, 0, DPR, 0, 0); c.globalAlpha = a * .8; c.strokeStyle = p.col; c.lineWidth = 2 + 3 * a;
+        c.beginPath(); c.ellipse(p.x, p.y, p.size * (1.2 - a), p.size * (1.2 - a) * .6, 0, 0, TAU); c.stroke();
+        break;
+      }
+      case 'note': {
+        c.setTransform(DPR, 0, 0, DPR, 0, 0); c.globalAlpha = Math.min(1, a * 2) * .85; c.fillStyle = p.col;
+        const s = p.size; ell(p.x, p.y, s * .55, s * .42); c.fill(); c.fillRect(p.x + s * .4, p.y - s * 1.5, s * .16, s * 1.5);
+        break;
+      }
+    }
+  }
+  c.globalAlpha = 1; c.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+
+// ================= audio =================
+const AU = { c: null, m: null, fx: null, nz: null, last: Object.create(null), sq: null };
+function audioInit() {
+  try {
+    if (AU.c) { if (AU.c.state !== 'running') AU.c.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    const a = new AC(); AU.c = a;
+    const comp = a.createDynamicsCompressor(); comp.threshold.value = -20; comp.knee.value = 18; comp.ratio.value = 5; comp.attack.value = 0.003; comp.release.value = 0.25;
+    const lp = a.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 7000;
+    const m = a.createGain(); m.gain.value = 0.5; m.connect(lp); lp.connect(comp); comp.connect(a.destination); AU.m = m;
+    const d = a.createDelay(1); d.delayTime.value = 0.23; const fb = a.createGain(); fb.gain.value = 0.32; const wet = a.createGain(); wet.gain.value = 0.24;
+    const dl = a.createBiquadFilter(); dl.type = 'lowpass'; dl.frequency.value = 2800;
+    d.connect(dl); dl.connect(fb); fb.connect(d); dl.connect(wet); wet.connect(m); AU.fx = d;
+    const nb = a.createBuffer(1, a.sampleRate, a.sampleRate); const ch = nb.getChannelData(0); for (let i = 0; i < ch.length; i++) ch[i] = Math.random() * 2 - 1; AU.nz = nb;
+    const src = a.createBufferSource(); src.buffer = nb; src.loop = true;
+    const bp = a.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 500; bp.Q.value = 2.2;
+    const g = a.createGain(); g.gain.value = 0; src.connect(bp); bp.connect(g); g.connect(m); src.start();
+    const o = a.createOscillator(); o.type = 'sine'; o.frequency.value = 130; const og = a.createGain(); og.gain.value = 0;
+    const lfo = a.createOscillator(); lfo.frequency.value = 9; const lg = a.createGain(); lg.gain.value = 18; lfo.connect(lg); lg.connect(o.frequency); lfo.start();
+    o.connect(og); og.connect(m); o.start();
+    AU.sq = { bp, g, o, og };
+    if (a.state !== 'running') a.resume();
+  } catch (e) { AU.c = null; }
+}
+function aOK(name, gap) {
+  if (!AU.c || AU.c.state !== 'running') return false;
+  if (name) { const n = AU.c.currentTime; if (AU.last[name] !== undefined && n - AU.last[name] < gap) return false; AU.last[name] = n; }
+  return true;
+}
+function tone(f, dur, o) {
+  o = o || {}; const a = AU.c; if (!a || !(f > 20) || f > 9000) return; if (o.f2) o.f2 = Math.min(o.f2, 9000);
+  const t0 = a.currentTime + (o.when || 0); const vol = o.vol === undefined ? .15 : o.vol;
+  const osc = a.createOscillator(); osc.type = o.type || 'sine'; osc.frequency.setValueAtTime(f, t0);
+  if (o.f2) osc.frequency.exponentialRampToValueAtTime(o.f2, t0 + (o.glide || dur));
+  if (o.det) osc.detune.value = o.det;
+  const g = a.createGain(); const at = o.at || 0.006;
+  g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vol, t0 + at); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(g); g.connect(AU.m);
+  const fx = o.fx === undefined ? .3 : o.fx; if (fx > 0) { const s = a.createGain(); s.gain.value = fx; g.connect(s); s.connect(AU.fx); }
+  osc.start(t0); osc.stop(t0 + dur + 0.05);
+}
+function bell(f, vol, dur, when) { vol = vol || .1; dur = dur || .9; when = when || 0; while (f > 2600) f /= 2; tone(f, dur, { vol, when, fx: .55 }); tone(f * 2.76, dur * .45, { vol: vol * .3, when, fx: .5 }); if (f < 1400) tone(f * 5.4, dur * .22, { vol: vol * .1, when, fx: .4 }); }
+function noise(dur, o) {
+  o = o || {}; const a = AU.c; if (!a) return; const t0 = a.currentTime + (o.when || 0);
+  const s = a.createBufferSource(); s.buffer = AU.nz; const f = a.createBiquadFilter(); f.type = o.ft || 'bandpass'; f.frequency.setValueAtTime(o.freq || 1200, t0); if (o.f2) f.frequency.exponentialRampToValueAtTime(o.f2, t0 + dur); f.Q.value = o.q || 1;
+  const g = a.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(o.vol || .08, t0 + (o.at || .01)); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  s.connect(f); f.connect(g); g.connect(AU.m); s.start(t0, rand(.5)); s.stop(t0 + dur + .05);
+}
+let ROOT = 523.25;
+const PENTA = [0, 2, 4, 7, 9];
+function scaleF(i) { i = Math.round(i); const o = Math.floor(i / 5); return ROOT * Math.pow(2, (PENTA[((i % 5) + 5) % 5] + 12 * o) / 12); }
+const S = {
+  squish(on, sp) {
+    if (!AU.sq || !AU.c) return; const t = AU.c.currentTime; sp = clamp(sp, 0, 3);
+    AU.sq.g.gain.setTargetAtTime(on ? 0.035 + sp * 0.04 : 0, t, 0.05);
+    AU.sq.bp.frequency.setTargetAtTime(330 + sp * 380, t, 0.06);
+    AU.sq.og.gain.setTargetAtTime(on ? 0.035 + sp * .015 : 0, t, 0.06);
+    AU.sq.o.frequency.setTargetAtTime(105 + sp * 55, t, 0.06);
+  },
+  puni() { if (!aOK('puni', .06)) return; tone(330, .2, { vol: .2, f2: 165, glide: .16, fx: .1 }); tone(660, .09, { type: 'triangle', vol: .05, f2: 420, fx: 0 }); },
+  crystal(level) { if (!aOK('cry', .045)) return; bell(scaleF(6 + (level % 9)), .03, .45); },
+  branch(level) { if (!aOK('br', .07)) return; bell(scaleF(8 + (level % 7)), .02, .35); },
+  flower() { if (!aOK('flw', .15)) return; const b = Math.floor(rand(3)); [0, 2, 4, 7].forEach((d, i) => bell(scaleF(5 + b + d), .07, 1.1, i * .06)); },
+  berry(i) { if (!aOK('ber', .05)) return; const f = scaleF(7 + (i % 6)); tone(f, .14, { vol: .1, f2: f * 1.5, glide: .06, fx: .2 }); },
+  pick() { if (!aOK('pk', .05)) return; tone(380, .12, { vol: .14, f2: 760, glide: .08, fx: .1 }); noise(.04, { freq: 3000, vol: .03 }); },
+  drop() { if (!aOK('dr', .05)) return; tone(600, .14, { vol: .1, f2: 300, glide: .1, fx: .1 }); },
+  jiggle(f) { if (!aOK('jg', .06)) return; bell(f || scaleF(rand(8, 14)), .07, .6); tone(scaleF(5), .12, { type: 'triangle', vol: .04 }); },
+  joy() { if (!aOK('joy', .3)) return; [0, 2, 4, 5].forEach((d, i) => tone(scaleF(7 + d), .16, { type: 'triangle', vol: .07, when: i * .09, det: rand(-8, 8) })); },
+  giggle() { if (!aOK('gig', .3)) return; for (let i = 0; i < 3; i++) tone(scaleF(9 - i), .1, { type: 'triangle', vol: .05, when: i * .1, f2: scaleF(10 - i), glide: .05 }); },
+  hmm() { if (!aOK('hmm', .4)) return; tone(scaleF(6), .25, { type: 'triangle', vol: .05, f2: scaleF(8), glide: .2 }); },
+  wow() { if (!aOK('wow', .4)) return; tone(scaleF(5), .35, { type: 'triangle', vol: .06, f2: scaleF(9), glide: .25 }); },
+  chirp() { if (!aOK('chp', .15)) return; const b = rand(2300, 3000); tone(b, .07, { vol: .045, f2: b * 1.35, glide: .05, fx: .2 }); tone(b * 1.1, .07, { vol: .04, f2: b * .85, glide: .05, when: .09, fx: .2 }); },
+  eat() { if (!aOK('eat', .18)) return; tone(220, .08, { type: 'triangle', vol: .07, f2: 180 }); },
+  clap() { if (!aOK('clap', .12)) return; noise(.05, { freq: 1800, q: .8, vol: .07 }); },
+  tapCookie() { if (!aOK('tc', .08)) return; noise(.06, { freq: 900, q: 1.4, vol: .06 }); tone(scaleF(rand(2, 6)), .08, { type: 'triangle', vol: .03 }); },
+  tapBg() { if (!aOK('tb', .1)) return; tone(scaleF(rand(0, 4)), .1, { vol: .035, fx: .2 }); },
+  crack() { if (!aOK('crk', .1)) return; for (let i = 0; i < 6; i++) noise(.05, { freq: rand(1500, 3000), q: 2, vol: .04, when: i * .18 + rand(.05) }); },
+  munyu() { if (!aOK('mny', .3)) return; tone(160, .7, { vol: .15, f2: 320, glide: .6, fx: .2 }); tone(240, .7, { type: 'triangle', vol: .04, f2: 480, glide: .6 }); },
+  paka() { if (!aOK('pak', .3)) return; tone(260, .35, { vol: .2, f2: 120, glide: .2, fx: .3 }); noise(.25, { freq: 700, ft: 'lowpass', vol: .1 }); [0, 4, 7, 12].forEach((d, i) => bell(ROOT * Math.pow(2, d / 12), .06, 1, .15 + i * .05)); },
+  arp() { for (let i = 0; i < 14; i++) bell(scaleF(i + 2), .055, .8, i * .17); },
+  bigBell() { if (!aOK('bb', .5)) return; bell(ROOT * .75, .14, 2.4); bell(ROOT * 1.5, .06, 1.8, .02); },
+  firework() { if (!aOK('fw', .12)) return; noise(.5, { freq: 400, f2: 2400, q: .7, vol: .05 }); for (let i = 0; i < 5; i++) bell(scaleF(10 + Math.floor(rand(8))), .03, .5, .25 + i * .06); },
+  step(i) { if (!aOK('stp', .05)) return; const f = scaleF(4 + i); tone(f, .2, { type: 'triangle', vol: .08, f2: f * 1.02 }); bell(f * 2, .03, .4); },
+  pour() { if (!aOK('pour', .5)) return; noise(1.2, { freq: 1200, q: 3, vol: .035, at: .2 }); },
+  footstep() { if (!aOK('ft', .1)) return; tone(rand(300, 360), .06, { vol: .025, f2: 200, fx: 0 }); },
+};
+// tea party waltz
+const music = { on: false, next: 0, beat: 0, prog: [[0, 4, 7], [5, 9, 12], [7, 11, 14], [0, 4, 7], [9, 12, 16], [5, 9, 12], [7, 11, 14], [0, 4, 7]], mel: 0 };
+function musicUpdate() {
+  if (!music.on || !AU.c || AU.c.state !== 'running') return;
+  const a = AU.c; const bt = 60 / 92;
+  if (music.next < a.currentTime) music.next = a.currentTime + .05;
+  while (music.next < a.currentTime + .25) {
+    const when = music.next - a.currentTime; const b = music.beat % 3; const bar = Math.floor(music.beat / 3) % music.prog.length; const ch = music.prog[bar];
+    const base = ROOT / 4;
+    if (b === 0) { tone(base * Math.pow(2, ch[0] / 12), .6, { vol: .07, when, fx: .1 }); }
+    else { ch.forEach(d => tone(base * 2 * Math.pow(2, d / 12), .22, { type: 'triangle', vol: .022, when, fx: .2 })); }
+    if (b === 0 || (b === 2 && Math.random() < .5)) {
+      music.mel = clamp(music.mel + Math.floor(rand(-2, 3)), -2, 7);
+      const d = ch[((music.mel % 3) + 3) % 3] + 12 * (music.mel > 3 ? 1 : 0);
+      bell(base * 4 * Math.pow(2, d / 12), .035, .8, when);
+    }
+    music.beat++; music.next += bt;
+  }
+}
+// ================= palettes / state =================
+const CREAM_PALS = [
+  ['#ffb3c7', '#ffd0a6', '#fff0a0', '#b8f0d0', '#b5dcff', '#d9c2ff'],
+  ['#ffc2d6', '#ffe0b3', '#d4f5c4', '#c4e8ff', '#e6ccff'],
+  ['#ff9fbf', '#ffd6e6', '#fff5b8', '#c8f7e8', '#cfd8ff'],
+  ['#ffb8a8', '#ffe5a8', '#e8ffb0', '#a8f0f0', '#e0b8ff'],
+  ['#ffc8dd', '#ffafcc', '#bde0fe', '#a2d2ff', '#cdb4db', '#fff1a8'],
+].map(p => p.map(hexRGB));
+const FLAVORS = [
+  { c0: '#f9dba0', c1: '#efc078', c2: '#d99a52', c3: '#b9773a', s0: '#cf8f4f', s1: '#8e5526', dk: [138, 74, 28] },
+  { c0: '#fbd6d8', c1: '#f2b2b9', c2: '#de8f99', c3: '#c06f7c', s0: '#d18a92', s1: '#9a5560', dk: [160, 74, 92] },
+  { c0: '#a6724e', c1: '#8a5a3b', c2: '#6b4128', c3: '#55301c', s0: '#744a2e', s1: '#40220f', dk: [46, 22, 8] },
+  { c0: '#e6eebb', c1: '#cddc93', c2: '#adc070', c3: '#8ea253', s0: '#9db361', s1: '#6a7f37', dk: [86, 105, 42] },
+];
+const HAIRS = [['#f6c47c', '#d99a48'], ['#f3a6b4', '#d77890'], ['#9a6644', '#6e4229'], ['#f7e3a6', '#d8b866']];
+const BIRD_COLS = [[255, 190, 210], [190, 236, 214], [255, 236, 160], [214, 200, 255], [180, 220, 255], [255, 210, 180]];
+const G = {
+  act: 1, actT: 0, cycle: 0, score: 0, feeds: 0, arches: 0, flowers: 0, paths: 0,
+  pal: CREAM_PALS[0], flavor: FLAVORS[0], cookieSeed: 1234, lastInput: 0, firstInput: false,
+  act1Evt: 0, demoDone: Object.create(null), demo: null, focus: null, tea: null, dough: null, trans: null,
+  hair: HAIRS[0], sweetKinds: ['petit', 'macaron'], flash: 0, lastAction: 0,
+};
+let strokes = [], branches = [], sweets = [], arches = [], footprints = [], butterflies = [];
+let castle = null; let camK = 0; const minis = [];
+let SID = 1;
+
+// ================= layout / camera =================
+const L = { top: {}, castle: {} };
+const cam = { cx: 0, cy: 0, R: 100, sq: .8, hz: .6 };
+let PX = 0, PY = 0;
+function proj(x, y, z) { PX = cam.cx + x * cam.R; PY = cam.cy + (y * cam.sq - z * cam.hz) * cam.R; }
+function unproj(sx, sy, z) { const x = (sx - cam.cx) / cam.R; const y = ((sy - cam.cy) / cam.R + z * cam.hz) / cam.sq; return { x, y }; }
+function updCam() {
+  const e = easeInOut(camK); const a = L.top, b = L.castle;
+  cam.R = lerp(a.R, b.R, e); cam.cx = lerp(a.cx, b.cx, e); cam.cy = lerp(a.cy, b.cy, e);
+  cam.sq = lerp(.80, .52, e); cam.hz = lerp(.58, .84, e);
+}
+let BS = 1; // bag scale
+function layout() {
+  W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight); DPR = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  const portrait = W / H < 0.9; L.portrait = portrait;
+  if (portrait) {
+    L.top = { R: Math.min(W * 0.44, H * 0.25), cx: W * .5, cy: H * .47 };
+    L.castle = { R: Math.min(W * 0.48, H * 0.27), cx: W * .5, cy: H * .6 };
+    L.prAng = -1.78; L.bagHome = { x: .05, y: .8 }; L.bagHomeC = { x: -.4, y: 1.02 }; L.birdAng = Math.PI + .38;
+    L.watch = { x: .74, y: .5 };
+  } else {
+    L.top = { R: Math.min(H * 0.39, W * 0.29), cx: W * .46, cy: H * .52 };
+    L.castle = { R: Math.min(H * 0.33, W * 0.26), cx: W * .48, cy: H * .64 };
+    L.prAng = -0.3; L.bagHome = { x: -.52, y: .66 }; L.bagHomeC = { x: -.86, y: .78 }; L.birdAng = Math.PI + .95;
+    L.watch = { x: .8, y: .45 };
+  }
+  BS = clamp(Math.min(W, H) / 430, .9, 1.45);
+  updCam(); buildBG(); buildTextures();
+  for (const s of sweets) s.spr = null;
+  if (typeof pr !== 'undefined' && pr.where === 'ground' && (!castle || castle.built) && !pr.path) { const h = prHome(); if (castle || Math.hypot(pr.x, pr.y) > 1.02) { pr.x = h.x; pr.y = h.y; pr.z = 0; } }
+  if (typeof birds !== 'undefined') birds.forEach((b, i) => { if (b.st === 'peek') { const a = L.birdAng + i * .45; b.x = Math.cos(a); b.y = Math.sin(a); } });
+  if (typeof bag !== 'undefined') bag.goHome = true;
+}
+function prHome() { if (castle && castle.built) return { x: 0, y: .82, z: 0 }; return { x: Math.cos(L.prAng) * 1.1, y: Math.sin(L.prAng) * 1.1, z: 0 }; }
+function bagHomeW() { return (castle && castle.built) ? L.bagHomeC : L.bagHome; }
+
+// ================= background =================
+let bgCan = null;
+function buildBG() {
+  const sc = .5; const w = Math.ceil(W * DPR * sc), h = Math.ceil(H * DPR * sc);
+  bgCan = mkCanvas(w, h); const old = ctx; ctx = bgCan.getContext('2d'); const c = ctx;
+  c.setTransform(w / W, 0, 0, h / H, 0, 0);
+  c.fillStyle = linG(0, 0, 0, H, [[0, '#fde8dc'], [.45, '#f9dccb'], [1, '#efc7a6']]); c.fillRect(0, 0, W, H);
+  // shelf glow (far wall) & jars
+  const r = mulberry(77);
+  c.fillStyle = linG(0, 0, 0, H * .3, [[0, 'rgba(255,255,255,.35)'], [1, 'rgba(255,255,255,0)']]); c.fillRect(0, 0, W, H * .3);
+  for (let i = 0; i < 7; i++) {
+    const x = (i + .3 + r() * .4) / 7 * W, jh = H * (.07 + r() * .05), jw = jh * (.6 + r() * .3), y = H * (.05 + r() * .05);
+    const col = pick([[255, 200, 220], [200, 240, 220], [255, 240, 190], [220, 210, 255]]);
+    c.globalAlpha = .16; c.fillStyle = rgbS(col); c.beginPath(); c.roundRect ? c.roundRect(x - jw / 2, y, jw, jh, jw * .3) : c.rect(x - jw / 2, y, jw, jh); c.fill();
+    c.globalAlpha = .35; c.fillStyle = '#fff'; c.fillRect(x - jw * .32, y + jh * .15, jw * .12, jh * .6);
+  }
+  c.globalAlpha = 1;
+  // light rays from upper left
+  for (let i = 0; i < 4; i++) {
+    const x0 = W * (-.1 + i * .22), w0 = W * (.08 + r() * .08);
+    c.fillStyle = linG(x0, 0, x0 + W * .5, H, [[0, 'rgba(255,255,240,.20)'], [1, 'rgba(255,255,240,0)']]);
+    c.beginPath(); c.moveTo(x0, 0); c.lineTo(x0 + w0, 0); c.lineTo(x0 + w0 + W * .6, H); c.lineTo(x0 + W * .55, H); c.closePath(); c.fill();
+  }
+  // bokeh
+  for (let i = 0; i < 22; i++) {
+    const x = r() * W, y = r() * H * .7, rr = Math.min(W, H) * (.02 + r() * .06);
+    const col = pick([[255, 200, 220], [255, 240, 200], [210, 240, 255], [230, 220, 255], [255, 255, 255]]);
+    c.fillStyle = radG(x, y, 0, rr, [[0, rgbS(col, .35)], [.7, rgbS(col, .18)], [1, rgbS(col, 0)]]); circ(x, y, rr); c.fill();
+  }
+  // table light pool
+  const tp = L.top; c.fillStyle = radG(tp.cx, tp.cy + tp.R * .2, 0, tp.R * 1.9, [[0, 'rgba(255,255,255,.4)'], [1, 'rgba(255,255,255,0)']]); c.fillRect(0, 0, W, H);
+  // vignette
+  c.fillStyle = radG(W / 2, H / 2, Math.min(W, H) * .4, Math.max(W, H) * .78, [[0, 'rgba(150,80,60,0)'], [1, 'rgba(150,80,60,.22)']]); c.fillRect(0, 0, W, H);
+  ctx = old;
+}
+
+// ================= cookie textures (cookie-local space) =================
+let texR = 0, TC = 0, cookieTex = null, decoTex = null, decoCtx = null;
+function buildTextures(force) {
+  const want = Math.min(860, Math.ceil(L.top.R * DPR));
+  if (!force && cookieTex && Math.abs(want - texR) < 30) return;
+  texR = want; TC = texR + 6; const S = TC * 2;
+  cookieTex = mkCanvas(S, S); drawCookieTex(cookieTex.getContext('2d'));
+  decoTex = mkCanvas(S, S); decoCtx = decoTex.getContext('2d');
+  rebakeAll();
+}
+function drawCookieTex(c) {
+  const old = ctx; ctx = c; const r = mulberry(G.cookieSeed); const F = G.flavor; const R = texR;
+  c.save(); c.translate(TC, TC);
+  const N = 140, p1 = r() * 6, p2 = r() * 6; const rim = [];
+  for (let i = 0; i < N; i++) { const a = i / N * TAU; rim.push(R * (.975 + .012 * Math.sin(a * 7 + p1) + .008 * Math.sin(a * 17 + p2) + (r() - .5) * .01)); }
+  const rimPath = () => { c.beginPath(); for (let i = 0; i < N; i++) { const a = i / N * TAU; c.lineTo(Math.cos(a) * rim[i], Math.sin(a) * rim[i]); } c.closePath(); };
+  rimPath(); c.fillStyle = radG(0, 0, R * .05, R, [[0, F.c0], [.55, F.c1], [.86, F.c2], [1, F.c3]]); c.fill();
+  c.save(); rimPath(); c.clip();
+  for (let i = 0; i < 80; i++) { const a = r() * TAU, d = Math.sqrt(r()) * R, x = Math.cos(a) * d, y = Math.sin(a) * d, rr = R * (.03 + r() * .1); c.fillStyle = radG(x, y, 0, rr, [[0, rgbS(F.dk, .1 + r() * .06)], [1, rgbS(F.dk, 0)]]); circ(x, y, rr); c.fill(); }
+  for (let i = 0; i < 50; i++) { const a = r() * TAU, d = Math.sqrt(r()) * R * .85, x = Math.cos(a) * d, y = Math.sin(a) * d, rr = R * (.03 + r() * .07); c.fillStyle = radG(x, y, 0, rr, [[0, 'rgba(255,240,200,.14)'], [1, 'rgba(255,240,200,0)']]); circ(x, y, rr); c.fill(); }
+  for (let i = 0; i < 240; i++) { const a = r() * TAU, d = Math.sqrt(r()) * R * .97, x = Math.cos(a) * d, y = Math.sin(a) * d, rr = R * (.003 + r() * .006); c.fillStyle = rgbS(F.dk, .22 + r() * .2); ell(x, y, rr * 1.4, rr); c.fill(); c.fillStyle = 'rgba(255,240,210,.25)'; ell(x - rr * .4, y - rr * .6, rr, rr * .5); c.fill(); }
+  // raised baked rim
+  c.lineWidth = R * .07; c.strokeStyle = rgbS(F.dk, .18); circ(0, 0, R * .955); c.stroke();
+  c.lineWidth = R * .025; c.strokeStyle = 'rgba(255,235,200,.22)'; circ(-R * .006, -R * .01, R * .9); c.stroke();
+  // sugar grains
+  for (let i = 0; i < 300; i++) {
+    const a = r() * TAU, d = Math.sqrt(r()) * R * .96, x = Math.cos(a) * d, y = Math.sin(a) * d, s = R * (.005 + r() * .008);
+    c.save(); c.translate(x, y); c.rotate(r() * TAU);
+    c.fillStyle = 'rgba(90,40,10,.22)'; c.fillRect(-s / 2 + s * .25, -s / 2 + s * .35, s, s);
+    c.fillStyle = r() < .8 ? 'rgba(255,255,255,.92)' : rgbS(pick([[255, 210, 230], [210, 255, 235], [255, 245, 190]]), .95); c.fillRect(-s / 2, -s / 2, s, s);
+    c.fillStyle = 'rgba(255,255,255,1)'; c.fillRect(-s / 2, -s / 2, s * .4, s * .4);
+    c.restore();
+  }
+  // light
+  c.fillStyle = radG(-R * .35, -R * .45, 0, R * 1.1, [[0, 'rgba(255,255,235,.24)'], [.6, 'rgba(255,255,235,.06)'], [1, 'rgba(255,255,235,0)']]); c.fillRect(-R, -R, R * 2, R * 2);
+  c.restore();
+  // crumbly edge
+  rimPath(); c.lineWidth = R * .012; c.strokeStyle = rgbS(F.dk, .45); c.stroke();
+  for (let i = 0; i < 90; i++) { const a = r() * TAU, rr = R * (.97 + r() * .03); c.fillStyle = r() < .5 ? F.c3 : F.c2; ell(Math.cos(a) * rr, Math.sin(a) * rr, R * (.006 + r() * .01), R * (.005 + r() * .008)); c.fill(); }
+  c.restore(); ctx = old;
+}
+function drawCookie(holeOpen) {
+  const F = G.flavor; const th = .1; const cx = cam.cx, rx = cam.R * .985, ry = cam.R * cam.sq * .985;
+  const top = cam.cy, bot = cam.cy + th * cam.hz * cam.R;
+  ctx.fillStyle = radG(cx, bot + ry * .08, rx * .5, rx * 1.15, [[0, 'rgba(110,50,25,.3)'], [1, 'rgba(110,50,25,0)']]);
+  ctx.save(); ctx.translate(0, bot + ry * .08); ctx.scale(1, cam.sq * 1.05); circ(cx, 0, rx * 1.15); ctx.restore(); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(cx, bot, rx, ry, 0, 0, Math.PI); ctx.lineTo(cx - rx, top); ctx.ellipse(cx, top, rx, ry, 0, Math.PI, 0, true); ctx.closePath();
+  ctx.fillStyle = linG(cx - rx, 0, cx + rx, 0, [[0, F.s1], [.3, F.s0], [.6, F.s0], [1, F.s1]]); ctx.fill();
+  ctx.fillStyle = linG(0, top + ry * .5, 0, bot + ry, [[0, 'rgba(255,230,190,.12)'], [1, 'rgba(60,20,0,.25)']]); ctx.fill();
+  const s = cam.R / texR;
+  ctx.setTransform(DPR * s, 0, 0, DPR * s * cam.sq, DPR * (cam.cx - TC * s), DPR * (cam.cy - TC * s * cam.sq));
+  ctx.drawImage(cookieTex, 0, 0);
+  if (!castle || castle.t < 3.4) ctx.drawImage(decoTex, 0, 0);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+function toTex(x, y) { return [TC + x * texR, TC + y * texR]; }
+// ================= spatial grid for ground lace =================
+const grid = new Map();
+function gkey(x, y) { return (Math.floor(x * 10) + 60) * 1000 + (Math.floor(y * 10) + 60); }
+function gridAdd(sid, x, y) { const k = gkey(x, y); let a = grid.get(k); if (!a) { a = []; grid.set(k, a); } a.push(sid, x, y); }
+const GN = { d: 1e9, x: 0, y: 0, sid: 0 };
+function gridNear(x, y, r, ex) {
+  GN.d = 1e9; const cr = Math.ceil(r * 10);
+  const gx = Math.floor(x * 10), gy = Math.floor(y * 10);
+  for (let i = -cr; i <= cr; i++) for (let j = -cr; j <= cr; j++) {
+    const a = grid.get((gx + i + 60) * 1000 + (gy + j + 60)); if (!a) continue;
+    for (let k = 0; k < a.length; k += 3) { if (a[k] === ex) continue; const d = Math.hypot(a[k + 1] - x, a[k + 2] - y); if (d < GN.d && d < r) { GN.d = d; GN.x = a[k + 1]; GN.y = a[k + 2]; GN.sid = a[k]; } }
+  }
+  return GN.d < 1e8;
+}
+
+// ================= castle morph helpers =================
+const HOLE = .46, T1R = .44, T2R = .28, T1H = .34, T2H = .30, ZTOP = T1H + T2H;
+const MO = { x: 0, y: 0, z: 0, top: false };
+function morphP(x, y, lace) {
+  MO.top = false;
+  if (!castle || castle.morph <= 0) { MO.x = x; MO.y = y; MO.z = 0; return MO; }
+  const k = castle.morph; const r = Math.hypot(x, y);
+  if (r < HOLE) {
+    const a = Math.atan2(y, x); const rr = r < T2R + .02 ? T2R + .04 + (r / (T2R + .02)) * .08 : clamp(r, T2R + .04, T1R - .03);
+    MO.x = lerp(x, Math.cos(a) * rr, k); MO.y = lerp(y, Math.sin(a) * rr, k); MO.z = castle.h1 + (lace ? .01 : 0); MO.top = true;
+  } else { MO.x = x; MO.y = y; MO.z = lace ? .06 * k : 0; }
+  return MO;
+}
+function bridgeZ(s, u) { if (!castle || !s || castle.bridgeSid !== s.id) return 0; return castle.bridge * .14 * Math.sin(Math.PI * clamp(u / s.len, 0, 1)); }
+const strokeById = id => { for (const s of strokes) if (s.id === id) return s; return null; };
+
+// ================= cream rendering =================
+const TX = new Float32Array(4096), TY = new Float32Array(4096), TW = new Float32Array(4096); const TCOL = new Array(4096);
+const LIGHT = [-.45, -.89];
+function creamDraw(n, hq) {
+  const c = ctx; if (n <= 0) return;
+  c.lineCap = 'round'; c.lineJoin = 'round';
+  if (n === 1) { dollop(TX[0], TY[0], TW[0], TCOL[0]); return; }
+  let wa = 0; for (let i = 0; i < n; i++) wa += TW[i]; wa /= n;
+  c.strokeStyle = 'rgba(110,45,25,.2)'; c.lineWidth = wa * 1.25; c.beginPath();
+  for (let i = 0; i < n; i++) c.lineTo(TX[i] + wa * .12, TY[i] + wa * .34); c.stroke();
+  for (let pass = 0; pass < 2; pass++) {
+    for (let i = 0; i < n - 1; i += 3) {
+      const j = Math.min(n - 1, i + 3); const col = TCOL[i];
+      c.strokeStyle = pass ? rgbS(col) : rgbS(mix(col, [150, 70, 90], .28)); c.lineWidth = TW[i] * (pass ? 1 : 1.14);
+      c.beginPath(); c.moveTo(TX[i], TY[i]); for (let k = i + 1; k <= j; k++) c.lineTo(TX[k], TY[k]); c.stroke();
+    }
+  }
+  const off = (amt, w, style) => {
+    c.strokeStyle = style; c.lineWidth = w; c.beginPath();
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1); let tx = TX[b] - TX[a], ty = TY[b] - TY[a]; const tl = Math.hypot(tx, ty) || 1; tx /= tl; ty /= tl;
+      let nx = -ty, ny = tx; if (nx * LIGHT[0] + ny * LIGHT[1] < 0) { nx = -nx; ny = -ny; }
+      c.lineTo(TX[i] + nx * TW[i] * amt, TY[i] + ny * TW[i] * amt);
+    }
+    c.stroke();
+  };
+  off(-.24, wa * .4, 'rgba(120,40,70,.10)');
+  if (hq) { off(.06, wa * .07, 'rgba(255,255,255,.4)'); off(-.1, wa * .06, 'rgba(150,60,90,.12)'); }
+  off(.22, wa * .2, 'rgba(255,255,255,.78)');
+  c.fillStyle = 'rgba(255,255,255,.22)';
+  for (let i = 0; i < n; i++) { const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1); let tx = TX[b] - TX[a], ty = TY[b] - TY[a]; const tl = Math.hypot(tx, ty) || 1; let nx = -ty / tl, ny = tx / tl; if (nx * LIGHT[0] + ny * LIGHT[1] < 0) { nx = -nx; ny = -ny; } ell(TX[i] + nx * TW[i] * .14, TY[i] + ny * TW[i] * .14, TW[i] * .3, TW[i] * .22); c.fill(); }
+  c.fillStyle = 'rgba(255,255,255,.9)';
+  for (let i = 1; i < n; i += 4) { const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1); let tx = TX[b] - TX[a], ty = TY[b] - TY[a]; const tl = Math.hypot(tx, ty) || 1; let nx = -ty / tl, ny = tx / tl; if (nx * LIGHT[0] + ny * LIGHT[1] < 0) { nx = -nx; ny = -ny; } circ(TX[i] + nx * TW[i] * .25, TY[i] + ny * TW[i] * .25, TW[i] * .07); c.fill(); }
+}
+function dollop(x, y, w, col) {
+  const c = ctx; const r = w * .75;
+  c.fillStyle = 'rgba(110,45,25,.2)'; ell(x + r * .1, y + r * .35, r * 1.15, r * .75); c.fill();
+  const lay = (yy, rr, t) => { c.fillStyle = radG(x - rr * .35, yy - rr * .4, rr * .1, rr * 1.1, [[0, rgbS(mix(col, WHITE, .5))], [.6, rgbS(col)], [1, rgbS(mix(col, [150, 70, 90], .3))]], x, yy); ell(x, yy, rr, rr * .78); c.fill(); };
+  lay(y, r, 0); lay(y - r * .45, r * .72, 1); lay(y - r * .85, r * .42, 2);
+  c.fillStyle = 'rgba(255,255,255,.85)'; ell(x - r * .3, y - r * .7, r * .2, r * .12); c.fill();
+}
+// lace (branches) rendering into current ctx; pts already projected into TX/TY via callback
+function lacePasses(path, pearls, lw) {
+  const c = ctx; c.lineCap = 'round'; c.lineJoin = 'round';
+  c.save(); c.translate(lw * .5, lw * 1.1); c.strokeStyle = 'rgba(110,45,25,.22)'; c.lineWidth = lw * 1.4; c.stroke(path); c.fillStyle = 'rgba(110,45,25,.22)'; c.fill(pearls); c.restore();
+  c.strokeStyle = '#efe2dc'; c.lineWidth = lw * 1.15; c.stroke(path);
+  c.strokeStyle = '#fffaf5'; c.lineWidth = lw * .85; c.stroke(path); c.fillStyle = '#fff8f2'; c.fill(pearls);
+  c.save(); c.translate(-lw * .22, -lw * .3); c.strokeStyle = 'rgba(255,255,255,.95)'; c.lineWidth = lw * .35; c.stroke(path); c.fillStyle = '#fff'; c.restore();
+}
+
+// ================= strokes =================
+let totalPts = 0; const MAXPTS = 2600, MAXBR = 1700, MAXSW = 80;
+function strokeBegin(plane, x, y, z) {
+  const s = { id: SID++, pts: [], plane, z: z || 0, pre: !castle, done: false, len: 0, kind: null, endT: 0, baked: false, col0: rand(), brI: 0, brSide: rand() < .5 ? 1 : -1, lv: 0, live: true };
+  strokes.push(s); addPt(s, x, y, 0); return s;
+}
+function addPt(s, x, y, speed) {
+  const n = s.pts.length; let u = 0;
+  if (n) { const p = s.pts[n - 1]; u = p.u + dist(p.x, p.y, x, y); s.len = u; }
+  const w = (.07 - .024 * clamp(speed / 1.8, 0, 1)) * (s.plane === 'balcony' ? .6 : s.plane === 'top' ? .75 : 1) * rand(.95, 1.05);
+  s.pts.push({ x, y, t: T, w, c: palAt(G.pal, s.col0 + u * 1.3), u });
+  if (s.plane === 'ground') gridAdd(s.id, x, y);
+  totalPts++;
+}
+// project stroke points into TX.. ; returns count. cls: 0 all, 1 ground-only, 2 cake-top-only
+function strokeProject(s, cls, inflate) {
+  let n = 0; const P = s.pts; const R = cam.R;
+  for (let i = 0; i < P.length && n < 4090; i++) {
+    const p = P[i]; let x = p.x, y = p.y, z = s.z;
+    if (s.pre && castle) { morphP(x, y, false); if (cls === 1 && MO.top) { if (n > 0) break; continue; } if (cls === 2 && !MO.top) { if (n > 0) break; continue; } x = MO.x; y = MO.y; z = MO.z + bridgeZ(s, p.u); }
+    else if (cls === 2) continue;
+    proj(x, y, z); TX[n] = PX; TY[n] = PY;
+    const age = T - p.t; const inf = inflate ? (age < .3 ? .55 + .45 * easeOut(age / .3) + .12 * Math.sin(age * 25) * (1 - age / .3) : 1) : 1;
+    TW[n] = p.w * R * inf; TCOL[n] = p.c; n++;
+  }
+  return n;
+}
+function drawStrokeLive(s, cls) {
+  if (cls === 1 && s.pre && castle) {
+    // draw split runs: iterate runs manually
+    let i = 0; const P = s.pts;
+    while (i < P.length) {
+      let n = 0;
+      for (; i < P.length && n < 4090; i++) {
+        const p = P[i]; morphP(p.x, p.y, false); if (MO.top) { if (n) break; continue; }
+        proj(MO.x, MO.y, MO.z + bridgeZ(s, p.u)); TX[n] = PX; TY[n] = PY; TW[n] = p.w * cam.R; TCOL[n] = p.c; n++;
+      }
+      creamDraw(n, false);
+    }
+    return;
+  }
+  if (cls === 2) {
+    let i = 0; const P = s.pts;
+    while (i < P.length) {
+      let n = 0;
+      for (; i < P.length && n < 4090; i++) {
+        const p = P[i]; morphP(p.x, p.y, false); if (!MO.top) { if (n) break; continue; }
+        proj(MO.x, MO.y, MO.z); TX[n] = PX; TY[n] = PY; TW[n] = p.w * cam.R * .8; TCOL[n] = p.c; n++;
+      }
+      creamDraw(n, false);
+    }
+    return;
+  }
+  const n = strokeProject(s, 0, true); creamDraw(n, true);
+}
+function bakeStroke(s) {
+  const old = ctx; ctx = decoCtx; ctx.setTransform(1, 0, 0, 1, 0, 0);
+  let n = 0; for (const p of s.pts) { if (n >= 4090) break; TX[n] = TC + p.x * texR; TY[n] = TC + p.y * texR; TW[n] = p.w * texR; TCOL[n] = p.c; n++; }
+  creamDraw(n, true); ctx = old;
+}
+function bakeRing(s) {
+  const old = ctx; ctx = decoCtx; ctx.setTransform(1, 0, 0, 1, 0, 0); const c = ctx;
+  c.beginPath(); for (const p of s.pts) c.lineTo(TC + p.x * texR, TC + p.y * texR); c.closePath();
+  const p0 = s.pts[0]; const col = palAt(G.pal, s.col0 + .5);
+  let mx = 0, my = 0; for (const p of s.pts) { mx += p.x; my += p.y; } mx /= s.pts.length; my /= s.pts.length;
+  c.fillStyle = radG(TC + (mx - .05) * texR, TC + (my - .05) * texR, 0, texR * .4, [[0, rgbS(mix(col, WHITE, .5), .75)], [.5, rgbS(col, .55)], [1, rgbS(mix(col, [200, 60, 120], .3), .5)]]); c.fill();
+  c.fillStyle = 'rgba(255,255,255,.5)'; c.beginPath(); c.ellipse(TC + (mx - .04) * texR, TC + (my - .04) * texR, texR * .05, texR * .02, -.5, 0, TAU); c.fill();
+  ctx = old; void p0;
+}
+function bakeDimple(x, y, r) {
+  const old = ctx; ctx = decoCtx; ctx.setTransform(1, 0, 0, 1, 0, 0); const c = ctx; const X = TC + x * texR, Y = TC + y * texR, rr = r * texR;
+  const col = palAt(G.pal, rand());
+  c.fillStyle = rgbS(mix(col, WHITE, .3)); ell(X, Y, rr, rr); c.fill();
+  c.fillStyle = radG(X + rr * .2, Y + rr * .2, 0, rr * .8, [[0, 'rgba(140,60,80,.25)'], [1, 'rgba(140,60,80,0)']]); ell(X, Y, rr * .7, rr * .7); c.fill();
+  c.strokeStyle = 'rgba(255,255,255,.8)'; c.lineWidth = rr * .18; c.beginPath(); c.arc(X, Y, rr * .8, Math.PI * .9, Math.PI * 1.6); c.stroke();
+  ctx = old;
+}
+const bakeLog = [];
+function rebakeAll() { rebakeAllGrouped(); }
+
+// ================= lace branches =================
+function spawnBranch(s, i, side, opt) {
+  if (branches.length >= MAXBR) return null;
+  opt = opt || {};
+  const P = s.pts, n = P.length, p = P[i];
+  let tx = 1, ty = 0, curv = 0;
+  if (n > 1) { const a = P[Math.max(0, i - 1)], b = P[Math.min(n - 1, i + 1)]; tx = b.x - a.x; ty = b.y - a.y; const tl = Math.hypot(tx, ty) || 1; tx /= tl; ty /= tl; }
+  if (i > 0 && i < n - 1) { const a = P[i - 1], b = P[i + 1]; const ax = p.x - a.x, ay = p.y - a.y, bx = b.x - p.x, by = b.y - p.y; curv = (ax * by - ay * bx) / (Math.max(1e-4, Math.hypot(ax, ay) * Math.hypot(bx, by))); }
+  let nx = -ty * side, ny = tx * side; if (opt.ang !== undefined) { nx = Math.cos(opt.ang); ny = Math.sin(opt.ang); tx = -ny; ty = nx; }
+  const flowerish = opt.flower || s.len < .3;
+  const outer = -curv * side;
+  let len = (flowerish ? .13 : .095) * rand(.75, 1.25) * clamp(1 + outer * 1.4, .55, 1.7) * (s.plane === 'balcony' ? .5 : s.plane === 'top' ? .6 : 1);
+  if (opt.len) len = opt.len;
+  const m = 10; const K = (flowerish ? rand(3.6, 5.2) : rand(2.6, 4)) * (opt.curlMul || 1);
+  let ang = Math.atan2(ny + ty * .4, nx + tx * .4); const sign = side * (opt.flip ? -1 : 1);
+  const pts = new Float32Array((m + 1) * 2); let x = p.x + nx * p.w * .42, y = p.y + ny * p.w * .42;
+  if (opt.ox !== undefined) { x = opt.ox; y = opt.oy; ang = opt.a0; }
+  pts[0] = x; pts[1] = y;
+  for (let j = 1; j <= m; j++) { ang += sign * K * 2.6 * Math.pow(j / m, 1.6) / m; x += Math.cos(ang) * len / m; y += Math.sin(ang) * len / m; pts[j * 2] = x; pts[j * 2 + 1] = y; }
+  // reach out to nearby lace of another stroke
+  let joined = false;
+  if (s.plane === 'ground' && !opt.sub && gridNear(pts[m * 2], pts[m * 2 + 1], .07, s.id)) {
+    joined = true; const gx = GN.x, gy = GN.y;
+    for (let j = 5; j <= m; j++) { const t = ease((j - 5) / (m - 5)); pts[j * 2] = lerp(pts[j * 2], gx, t); pts[j * 2 + 1] = lerp(pts[j * 2 + 1], gy, t); }
+  }
+  const b = { pts, m, tb: T + (opt.delay || 0) + rand(0, .08), dur: rand(.55, .9) * (flowerish ? 1.2 : 1), z: s.z, plane: s.plane, pre: s.pre, sid: s.id, done: false, baked: false, tip: joined ? 0 : (flowerish && !opt.sub && rand() < .55 ? 2 : 1), tipCol: palAt(G.pal, rand()), lv: s.lv++, snd: false };
+  branches.push(b);
+  if (!opt.sub && !joined && rand() < (flowerish ? .75 : .45)) {
+    const j0 = 4; spawnBranch(s, i, side, { sub: true, ox: pts[j0 * 2], oy: pts[j0 * 2 + 1], a0: Math.atan2(pts[j0 * 2 + 3] - pts[j0 * 2 + 1], pts[j0 * 2 + 2] - pts[j0 * 2]) - sign * 1.1, len: len * .45, flip: true, delay: (opt.delay || 0) + .25, curlMul: 1.1 });
+  }
+  return b;
+}
+function spawnScallops(s, delay0) {
+  const P = s.pts; const n = P.length; if (n < 4) return; const sc = s.plane === 'ground' ? 1 : .6; let k = 0;
+  for (const side of [1, -1]) {
+    for (let i = 0; i + 2 < n; i += 2) {
+      if (branches.length >= MAXBR) return;
+      const A = P[i], B = P[i + 2]; let tx = B.x - A.x, ty = B.y - A.y; const tl = Math.hypot(tx, ty) || 1; tx /= tl; ty /= tl; const nx = -ty * side, ny = tx * side;
+      const off = (A.w * .5 + .028) * sc, bul = .024 * sc; const m = 6; const pts = new Float32Array((m + 1) * 2);
+      for (let j = 0; j <= m; j++) { const t = j / m; pts[j * 2] = lerp(A.x, B.x, t) + nx * (off + bul * Math.sin(Math.PI * t)); pts[j * 2 + 1] = lerp(A.y, B.y, t) + ny * (off + bul * Math.sin(Math.PI * t)); }
+      branches.push({ pts, m, tb: T + delay0 + i * .018 + (side < 0 ? .05 : 0), dur: .3, z: s.z, plane: s.plane, pre: s.pre, sid: s.id, done: false, baked: false, tip: (i / 2) % 2 ? 0 : 1, tipCol: [255, 255, 255], lv: k++, snd: true });
+    }
+  }
+}
+const LPATH_SCALE = .0135;
+function buildLacePath(list, mapFn, lw, growLive) {
+  const path = new Path2D(), pearls = new Path2D(), buds = [];
+  for (const b of list) {
+    let prog = 1;
+    if (growLive) { prog = easeOut((T - b.tb) / b.dur); if (prog <= 0) continue; }
+    const fm = prog * b.m; const mi = Math.floor(fm);
+    mapFn(b, b.pts[0], b.pts[1]); path.moveTo(PX, PY);
+    let lx = PX, ly = PY;
+    for (let j = 1; j <= mi; j++) { mapFn(b, b.pts[j * 2], b.pts[j * 2 + 1]); path.lineTo(PX, PY); lx = PX; ly = PY; }
+    if (mi < b.m) { const f = fm - mi; const x = lerp(b.pts[mi * 2], b.pts[mi * 2 + 2], f), y = lerp(b.pts[mi * 2 + 1], b.pts[mi * 2 + 3], f); mapFn(b, x, y); path.lineTo(PX, PY); lx = PX; ly = PY; }
+    const tr = lw * (b.tip === 2 ? 1.6 : 1.25) * (.4 + .6 * prog);
+    if (b.tip) { pearls.moveTo(lx + tr, ly); pearls.arc(lx, ly, tr, 0, TAU); if (b.tip === 2 && prog > .85) buds.push(lx, ly, tr, b.tipCol, prog); }
+  }
+  lacePasses(path, pearls, lw);
+  for (let i = 0; i < buds.length; i += 5) miniBud(buds[i], buds[i + 1], buds[i + 2] * 1.7 * ease((buds[i + 4] - .85) / .15), buds[i + 3]);
+}
+function miniBud(x, y, r, col) {
+  const c = ctx; if (r < .5) return;
+  for (let k = 0; k < 5; k++) { const a = k / 5 * TAU - .3; c.fillStyle = rgbS(mix(col, WHITE, .2), .95); ell(x + Math.cos(a) * r * .6, y + Math.sin(a) * r * .45, r * .5, r * .42); c.fill(); }
+  c.fillStyle = '#ff7a9c'; circ(x, y - r * .1, r * .35); c.fill(); c.fillStyle = '#fff'; circ(x - r * .12, y - r * .22, r * .12); c.fill();
+}
+function mapBranchLive(b, x, y) {
+  let z = b.z;
+  if (b.pre && castle) { morphP(x, y, true); x = MO.x; y = MO.y; z = MO.z; }
+  proj(x, y, z);
+}
+function mapBranchTex(b, x, y) { PX = TC + x * texR; PY = TC + y * texR; }
+function bakeBranches(list) { const old = ctx; ctx = decoCtx; ctx.setTransform(1, 0, 0, 1, 0, 0); buildLacePath(list, mapBranchTex, texR * LPATH_SCALE, false); ctx = old; }
+
+// rail posts for lifted lace in castle mode
+function drawRailPosts(list) {
+  if (!castle || castle.morph <= 0) return;
+  const c = ctx; c.strokeStyle = 'rgba(255,250,245,.9)'; c.lineWidth = Math.max(1, cam.R * .006); c.beginPath();
+  for (const b of list) {
+    if (!b.pre || (b.lv % 3)) continue; const x = b.pts[0], y = b.pts[1]; morphP(x, y, true); if (MO.top) continue;
+    proj(x, y, 0); c.moveTo(PX, PY); proj(MO.x, MO.y, MO.z); c.lineTo(PX, PY);
+  }
+  c.stroke();
+}
+
+// ================= sweets =================
+function liveSweets() { let n = 0; for (const o of sweets) if (!o.gone) n++; return n; }
+function makeFlower(x, y, s, opt) {
+  opt = opt || {};
+  const ca = palAt(G.pal, s ? s.col0 + rand(.5) : rand()), cb = palAt(G.pal, rand());
+  const f = { kind: 'flower', x, y, z: s ? s.z : 0, plane: s ? s.plane : 'ground', pre: s ? s.pre : !castle, r: (opt.r || .095) * rand(.9, 1.15), tb: T + (opt.delay === undefined ? .35 : opt.delay), petals: pick([5, 5, 6, 6, 7, 8]), layers: 1, layerT: [T + (opt.delay === undefined ? .35 : opt.delay)], rot: rand(TAU), ca, cb, seed: Math.floor(rand(1e6)), rose: false, crown: false, jigT: -9, held: false, gone: false, spr: null, sprR: 0, snd: false, sid: s ? s.id : 0, u: 0, sx: 0, sy: 0, wx: x, wy: y, wz: 0, born: T };
+  sweets.push(f); return f;
+}
+function makeBerry(x, y, s, u, delay, gem) {
+  const b = { kind: gem ? 'gem' : 'berry', x, y, z: s ? s.z : 0, plane: s ? s.plane : 'ground', pre: s ? s.pre : !castle, r: gem ? rand(.03, .04) : rand(.034, .048) * (rand() < .12 ? 1.35 : 1), tb: T + delay, leafRot: rand(TAU), gold: !gem && rand() < .05, gemCol: pick([[255, 143, 176], [255, 226, 122], [159, 240, 207], [198, 163, 255]]), seed: Math.floor(rand(1e6)), jigT: -9, held: false, gone: false, spr: null, sprR: 0, snd: false, sid: s ? s.id : 0, u: u || 0, sx: 0, sy: 0, wx: x, wy: y, wz: 0, born: T };
+  sweets.push(b); return b;
+}
+function makePetit(x, y, z, sub) {
+  const o = { kind: sub === 'flower' ? 'flower' : 'petit', sub, leafRot: rand(TAU), x, y, z, plane: 'balcony', pre: false, r: .045 * rand(.95, 1.1), tb: T + .3, petals: 6, layers: 1, layerT: [T + .3], rot: rand(TAU), ca: palAt(G.pal, rand()), cb: palAt(G.pal, rand()), seed: Math.floor(rand(1e6)), jigT: -9, held: false, gone: false, spr: null, sprR: 0, snd: false, sid: 0, u: 0, sx: 0, sy: 0, wx: x, wy: y, wz: z, born: T, tea: true };
+  sweets.push(o); return o;
+}
+function sweetGrow(o) {
+  if (o.kind === 'flower') { const lt = o.layerT[o.layerT.length - 1]; return clamp((T - lt) / 1.3, 0, 1); }
+  return clamp((T - o.tb) / (o.kind === 'berry' ? 1.0 : .8), 0, 1);
+}
+// world position of a sweet (handles castle morph)
+function sweetPos(o) {
+  if (o.pre && castle && castle.morph > 0) {
+    morphP(o.x, o.y, false); let x = MO.x, y = MO.y, z = MO.z;
+    if (!MO.top) {
+      for (const tw of castle.towers) { const d = dist(x, y, tw.x, tw.y), m = tw.r + .06; if (d < m) { const k = castle.morph; const a = Math.atan2(y - tw.y, x - tw.x); x = lerp(x, tw.x + Math.cos(a) * m, k); y = lerp(y, tw.y + Math.sin(a) * m, k); } }
+      if (o.sid) z += bridgeZ(strokeById(o.sid), o.u);
+    }
+    o.wx = x; o.wy = y; o.wz = z; o.onTop = MO.top;
+  } else { o.wx = o.x; o.wy = o.y; o.wz = o.z; o.onTop = o.plane === 'top'; }
+}
+function deepen(c) { const m = (c[0] + c[1] + c[2]) / 3; return [clamp(m + (c[0] - m) * 2.2 - 25, 0, 255), clamp(m + (c[1] - m) * 2.2 - 25, 0, 255), clamp(m + (c[2] - m) * 2.2 - 25, 0, 255)]; }
+function drawPetal(a, len, wd, fsq, lift, c1, c2, sc, rr) {
+  if (sc <= .01) return; const c = ctx; len *= sc; wd *= sc;
+  const ca = Math.cos(a), sa = Math.sin(a);
+  const X = (al, pe) => al * ca - pe * sa, Y = (al, pe) => (al * sa + pe * ca) * fsq - lift;
+  c.beginPath(); c.moveTo(X(0, 0), Y(0, 0));
+  c.bezierCurveTo(X(len * .3, wd * .62), Y(len * .3, wd * .62), X(len * .86, wd * .62), Y(len * .86, wd * .62), X(len, wd * .2), Y(len, wd * .2));
+  c.quadraticCurveTo(X(len * 1.1, 0), Y(len * 1.1, 0), X(len, -wd * .2), Y(len, -wd * .2));
+  c.bezierCurveTo(X(len * .86, -wd * .62), Y(len * .86, -wd * .62), X(len * .3, -wd * .62), Y(len * .3, -wd * .62), X(0, 0), Y(0, 0));
+  c.fillStyle = linG(X(0, 0), Y(0, 0), X(len, 0), Y(len, 0), [[0, rgbS(c1, .97)], [.5, rgbS(mix(c1, c2, .55), .93)], [1, rgbS(c2, .95)]]); c.fill();
+  c.lineWidth = Math.max(.6, wd * .07); c.strokeStyle = 'rgba(255,255,255,.6)'; c.stroke();
+  c.fillStyle = 'rgba(255,255,255,.32)'; ell(X(len * .4, -wd * .12), Y(len * .4, -wd * .12), wd * .2, wd * .12 * fsq + wd * .05); c.fill();
+  c.fillStyle = 'rgba(255,255,255,.95)';
+  for (let k = 0; k < 3; k++) { const al = len * (.7 + rr() * .25), pe = wd * (rr() - .5) * .7; circ(X(al, pe), Y(al, pe), Math.max(.5, wd * .045)); c.fill(); }
+}
+function drawFlowerShape(o, u, liveGrow) {
+  const c = ctx; const rr = mulberry(o.seed); const fsq = clamp(cam.sq * 1.05, .45, .9);
+  c.fillStyle = 'rgba(110,45,25,.2)'; ell(u * .08, u * .12, u * 1.05, u * .45); c.fill();
+  const L = o.layers; let topLift = 0;
+  for (let l = 0; l < L; l++) {
+    const t0 = o.layerT[l]; const g = liveGrow ? T - t0 : 9; if (g <= 0) continue;
+    const n = o.petals + (l % 2 ? -1 : 0); const len = u * (1 - .2 * l) * (o.rose && l > 0 ? .9 : 1); const wd = len * (n <= 5 ? .95 : .78);
+    const lift = u * (.12 + .17 * l * (o.rose ? 1.45 : 1)); topLift = lift; const lf = lerp(fsq, 1, Math.min(.6, l * (o.rose ? .2 : .1)));
+    const colA = l % 2 ? o.cb : o.ca; const c1 = deepen(deepen(colA)), c2 = mix(colA, WHITE, .3);
+    const idx = []; for (let i = 0; i < n; i++) idx.push(i);
+    const rot = o.rot + l * .55; idx.sort((a, b) => Math.sin(rot + a * TAU / n) - Math.sin(rot + b * TAU / n));
+    for (const i of idx) { const sc = liveGrow ? elastic((g - i * .06) / .7) : 1; drawPetal(rot + i * TAU / n, len, wd, lf, lift, c1, c2, sc, rr); }
+  }
+  const cg = liveGrow ? ease((T - o.layerT[0] - .3) / .5) : 1;
+  if (cg > 0) {
+    const cy = -topLift - u * .08, cr = u * .2 * cg * (o.rose ? 1.15 : 1);
+    c.fillStyle = radG(-cr * .35, cy - cr * .4, cr * .1, cr * 1.1, [[0, '#ffc2d0'], [.4, '#ff5a80'], [1, '#c3123f']], 0, cy); circ(0, cy, cr); c.fill();
+    if (o.rose) { c.strokeStyle = 'rgba(255,220,230,.8)'; c.lineWidth = cr * .14; c.beginPath(); for (let a = 0; a < 9; a += .3) c.lineTo(Math.cos(a) * cr * a / 11, cy + Math.sin(a) * cr * a / 11 * .8); c.stroke(); }
+    c.fillStyle = '#fff'; circ(-cr * .35, cy - cr * .4, cr * .22); c.fill();
+    if (o.crown) {
+      for (let k = 0; k < 5; k++) {
+        const a = k / 5 * TAU + .3; const x = Math.cos(a) * cr * 1.5, y = cy + Math.sin(a) * cr * .7 - cr * .3;
+        c.fillStyle = linG(x, y - cr * 1.4, x, y, [[0, '#fff6c0'], [.5, '#ffc94a'], [1, '#e39320']]);
+        c.beginPath(); c.moveTo(x - cr * .3, y); c.lineTo(x, y - cr * 1.3); c.lineTo(x + cr * .3, y); c.closePath(); c.fill();
+        c.fillStyle = '#ff6f9a'; circ(x, y - cr * 1.3, cr * .22); c.fill();
+      }
+    }
+  }
+}
+function drawBerryShape(o, u, g) {
+  const c = ctx; const s = u;
+  c.fillStyle = 'rgba(110,45,25,.22)'; ell(s * .08, s * .06, s * .85 * Math.max(.4, g), s * .3); c.fill();
+  if (g < .55) {
+    const bg = easeOut(g / .45); const r = s * (.25 + .5 * bg);
+    c.globalAlpha = 1 - clamp((g - .4) / .15, 0, 1);
+    c.fillStyle = radG(-r * .3, -r - r * .3, r * .1, r * 1.1, [[0, 'rgba(255,220,230,.85)'], [.5, 'rgba(255,90,120,.6)'], [1, 'rgba(200,20,60,.5)']], 0, -r); circ(0, -r, r); c.fill();
+    c.fillStyle = 'rgba(255,255,255,.8)'; circ(-r * .35, -r * 1.35, r * .2); c.fill();
+    c.globalAlpha = 1; if (g < .4) return;
+  }
+  const fg = easeOut((g - .4) / .35); c.save(); c.globalAlpha = clamp((g - .4) / .15, 0, 1); c.scale(.6 + .4 * backOut((g - .4) / .4), .6 + .4 * backOut((g - .4) / .4));
+  c.beginPath(); c.moveTo(0, -.05 * s);
+  c.bezierCurveTo(-.55 * s, -.1 * s, -.95 * s, -.95 * s, -.75 * s, -1.35 * s); c.bezierCurveTo(-.55 * s, -1.75 * s, -.15 * s, -1.7 * s, 0, -1.6 * s);
+  c.bezierCurveTo(.15 * s, -1.7 * s, .55 * s, -1.75 * s, .75 * s, -1.35 * s); c.bezierCurveTo(.95 * s, -.95 * s, .55 * s, -.1 * s, 0, -.05 * s);
+  if (o.gold) c.fillStyle = radG(-.3 * s, -1.15 * s, .1 * s, 1.3 * s, [[0, '#fffbe0'], [.35, '#ffd95a'], [.8, '#e8a91c'], [1, '#b07408']], 0, -.9 * s);
+  else c.fillStyle = radG(-.3 * s, -1.15 * s, .1 * s, 1.3 * s, [[0, '#ffa6b4'], [.35, '#ff3d5e'], [.8, '#d61b40'], [1, '#a50d2c']], 0, -.9 * s);
+  c.fill();
+  c.lineWidth = s * .04; c.strokeStyle = 'rgba(120,0,30,.25)'; c.stroke();
+  const rr = mulberry(o.seed);
+  if (fg > .3) {
+    c.globalAlpha *= clamp((fg - .3) / .4, 0, 1);
+    for (let row = 0; row < 4; row++) { const yy = -(.35 + row * .3) * s; const wdt = (.35 + row * .12) * s; const cnt = 2 + row; for (let k = 0; k < cnt; k++) { const xx = -wdt + (k + .5) / cnt * wdt * 2 + (rr() - .5) * s * .08; c.fillStyle = o.gold ? '#fff7d0' : '#ffe27a'; ell(xx, yy, s * .045, s * .07); c.fill(); c.fillStyle = 'rgba(120,20,30,.25)'; ell(xx + s * .02, yy + s * .05, s * .035, s * .02); c.fill(); } }
+  }
+  c.globalAlpha = 1;
+  c.fillStyle = 'rgba(255,255,255,.6)'; c.beginPath(); c.ellipse(-.38 * s, -1.15 * s, .13 * s, .28 * s, -.4, 0, TAU); c.fill();
+  c.fillStyle = '#fff'; circ(-.42 * s, -1.32 * s, .06 * s); c.fill();
+  c.restore();
+  const lg = elastic((g - .62) / .38);
+  if (lg > 0) {
+    for (let k = 0; k < 5; k++) {
+      const a = o.leafRot + k * TAU / 5; const l = .55 * s * lg; const x = Math.cos(a) * l, y = -1.58 * s * (.6 + .4 * fg) + Math.sin(a) * l * .45;
+      c.fillStyle = linG(0, -1.6 * s, x, y, [[0, '#3ea45a'], [1, '#8be08a']]);
+      c.beginPath(); c.moveTo(0, -1.58 * s * (.6 + .4 * fg)); c.quadraticCurveTo((x - Math.sin(a) * .18 * s), y - .08 * s, x, y); c.quadraticCurveTo((x + Math.sin(a) * .18 * s) * .5, y + .02 * s, 0, -1.58 * s * (.6 + .4 * fg)); c.fill();
+    }
+    c.strokeStyle = '#3c9a52'; c.lineWidth = s * .09; c.lineCap = 'round'; c.beginPath(); c.moveTo(0, -1.6 * s); c.lineTo(s * .06, -1.95 * s * (.7 + .3 * lg)); c.stroke();
+  }
+}
+function drawGemShape(o, u, g) {
+  const c = ctx; const s = u * (.3 + .7 * backOut(g)); const col = o.gemCol; const rr = mulberry(o.seed);
+  c.fillStyle = 'rgba(110,45,25,.2)'; ell(s * .1, s * .1, s * 1.1, s * .4); c.fill();
+  const n = 6, pts = []; for (let i = 0; i < n; i++) { const a = i / n * TAU + rr(); const r = s * (.8 + rr() * .3); pts.push([Math.cos(a) * r, Math.sin(a) * r * .5 - s * .9]); }
+  c.fillStyle = rgbS(deepen(col), .85); c.beginPath(); for (const p of pts) c.lineTo(p[0], p[1] + s * .7); c.lineTo(pts[0][0], pts[0][1] + s * .7); for (let i = n - 1; i >= 0; i--) c.lineTo(pts[i][0], pts[i][1]); c.fill();
+  c.fillStyle = radG(-s * .3, -s * 1.1, s * .1, s * 1.2, [[0, rgbS(mix(col, WHITE, .7), .95)], [.6, rgbS(col, .85)], [1, rgbS(deepen(col), .9)]], 0, -s * .9);
+  c.beginPath(); for (const p of pts) c.lineTo(p[0], p[1]); c.closePath(); c.fill();
+  c.strokeStyle = 'rgba(255,255,255,.7)'; c.lineWidth = Math.max(.6, s * .05); c.stroke();
+  c.beginPath(); c.moveTo(pts[0][0], pts[0][1]); c.lineTo(pts[3][0], pts[3][1]); c.moveTo(pts[1][0], pts[1][1]); c.lineTo(pts[4][0], pts[4][1]); c.strokeStyle = 'rgba(255,255,255,.35)'; c.stroke();
+  for (let k = 0; k < 10; k++) { c.fillStyle = 'rgba(255,255,255,.5)'; circ((rr() - .5) * s * 1.2, -s * .9 + (rr() - .5) * s * .5, s * .04); c.fill(); }
+  c.fillStyle = '#fff'; circ(-s * .3, -s * 1.05, s * .12); c.fill();
+}
+function drawPetitShape(o, u, g) {
+  const c = ctx; const s = u * (.3 + .7 * backOut(g)); const col = o.ca;
+  c.fillStyle = 'rgba(110,45,25,.2)'; ell(0, s * .05, s * 1.05, s * .4); c.fill();
+  if (o.sub === 'macaron') {
+    const sh = (y, cc) => { c.fillStyle = radG(-s * .3, y - s * .25, s * .1, s * 1.1, [[0, rgbS(mix(cc, WHITE, .5))], [1, rgbS(deepen(cc))]], 0, y); ell(0, y, s * .95, s * .45); c.fill(); };
+    sh(-s * .3, col); c.fillStyle = '#fff8f0'; ell(0, -s * .55, s * .85, s * .32); c.fill(); sh(-s * .8, col);
+    c.fillStyle = 'rgba(255,255,255,.6)'; ell(-s * .3, -s * 1.0, s * .3, s * .1); c.fill();
+  } else {
+    const ry = s * .42; c.fillStyle = rgbS(mix(col, WHITE, .2)); c.beginPath(); c.ellipse(0, 0, s, ry, 0, 0, Math.PI); c.lineTo(-s, -s * .7); c.ellipse(0, -s * .7, s, ry, 0, Math.PI, 0, true); c.closePath(); c.fill();
+    c.fillStyle = '#f6cf86'; c.fillRect(-s, -s * .45, s * 2, s * .18); c.fillStyle = '#e8395a'; c.fillRect(-s, -s * .3, s * 2, s * .06);
+    c.fillStyle = linG(-s, 0, s, 0, [[0, 'rgba(0,0,0,.12)'], [.35, 'rgba(255,255,255,.15)'], [1, 'rgba(0,0,0,.2)']]); c.beginPath(); c.ellipse(0, 0, s, ry, 0, 0, Math.PI); c.lineTo(-s, -s * .7); c.ellipse(0, -s * .7, s, ry, 0, Math.PI, 0, true); c.fill();
+    c.fillStyle = '#fffaf4'; ell(0, -s * .7, s, ry); c.fill();
+    for (let k = 0; k < 8; k++) { const a = k / 8 * TAU; c.fillStyle = '#fff'; circ(Math.cos(a) * s * .82, -s * .7 + Math.sin(a) * ry * .82, s * .14); c.fill(); }
+    c.save(); c.translate(0, -s * .72); drawBerryShape(o, s * .45, 1); c.restore();
+  }
+}
+const SPR = { w: 4.4, ox: 2.2, oy: 3.3 };
+function drawSweetShape(o, u, g, live) {
+  if (o.kind === 'flower') drawFlowerShape(o, u, live);
+  else if (o.kind === 'berry') drawBerryShape(o, u, g);
+  else if (o.kind === 'gem') drawGemShape(o, u, g);
+  else drawPetitShape(o, u, g);
+}
+function sweetDone(o) { if (o.kind === 'flower') { const lt = o.layerT[o.layerT.length - 1]; return T - lt > 1.6 && T - o.layerT[0] > 1.6; } return T - o.tb > 1.1; }
+function drawSweetAt(o, sx, sy, scale) {
+  const u = o.r * cam.R * scale; if (u < .5) return;
+  const jt = T - o.jigT; let jx = 1, jy = 1;
+  if (jt < 1) { const e = Math.exp(-jt * 5); jx = 1 + .16 * Math.sin(jt * 32) * e; jy = 1 - .16 * Math.sin(jt * 32) * e; }
+  if (sweetDone(o)) {
+    if (!o.spr || Math.abs(o.sprR - u) > u * .1) {
+      const S = Math.ceil(u * SPR.w * DPR) + 2; o.spr = mkCanvas(S, S); o.sprR = u; const old = ctx; ctx = o.spr.getContext('2d');
+      ctx.setTransform(DPR, 0, 0, DPR, u * SPR.ox * DPR, u * SPR.oy * DPR); drawSweetShape(o, u, 1, false); ctx = old;
+    }
+    const k = u / o.sprR; ctx.setTransform(DPR * jx * k, 0, 0, DPR * jy * k, DPR * sx, DPR * sy);
+    ctx.drawImage(o.spr, -o.sprR * SPR.ox, -o.sprR * SPR.oy, o.spr.width / DPR, o.spr.height / DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  } else {
+    ctx.save(); ctx.translate(sx, sy); ctx.scale(jx, jy); drawSweetShape(o, u, sweetGrow(o), true); ctx.restore();
+  }
+}
+
+// ================= arches =================
+function makeArch(ax, ay, bx, by) {
+  const d = dist(ax, ay, bx, by); if (d < .05) return null;
+  const a = { ax, ay, bx, by, h: clamp(.06 + d * .32, .08, .22), tb: T + .25, dur: 1.2, pre: !castle, snd: false };
+  arches.push(a); G.arches++; G.score += 2;
+  if (G.arches === 1) G.act1Evt = T + 1.5;
+  return a;
+}
+function archPt(a, s, hm) {
+  let x = lerp(a.ax, a.bx, s), y = lerp(a.ay, a.by, s), z = 0;
+  if (a.pre && castle) { morphP(x, y, false); x = MO.x; y = MO.y; z = MO.z; }
+  proj(x, y, z + a.h * hm * Math.sin(Math.PI * s));
+}
+function drawArch(a) {
+  const p = easeOut((T - a.tb) / a.dur); if (p <= 0) return;
+  const lw = cam.R * LPATH_SCALE * 1.4; const N = 20; const c = ctx;
+  c.strokeStyle = 'rgba(110,45,25,.12)'; c.lineWidth = lw * 2; c.lineCap = 'round'; c.beginPath();
+  for (let i = 0; i <= N; i++) { const s = i / N; let x = lerp(a.ax, a.bx, s), y = lerp(a.ay, a.by, s); if (a.pre && castle) { morphP(x, y, false); x = MO.x; y = MO.y; } proj(x + .02, y + .03, 0); c.lineTo(PX, PY); }
+  c.stroke();
+  const path = new Path2D(), pearls = new Path2D();
+  const seg = (s0, s1, hm, deco) => {
+    const k = Math.max(2, Math.round((s1 - s0) * N));
+    for (let i = 0; i <= k; i++) {
+      const s = lerp(s0, s1, i / k); archPt(a, s, hm); if (i === 0) path.moveTo(PX, PY); else path.lineTo(PX, PY);
+      if (deco && i % 3 === 0) { const x = PX, y = PY; path.moveTo(x + lw * 1.6, y + lw * 1.4); path.arc(x, y + lw * 1.4, lw * 1.6, 0, Math.PI); path.moveTo(x, y); pearls.moveTo(x + lw, y); pearls.arc(x, y, lw, 0, TAU); }
+    }
+  };
+  seg(0, p / 2, 1, true); seg(1 - p / 2, 1, 1, true); seg(0, p / 2, .74, false); seg(1 - p / 2, 1, .74, false);
+  lacePasses(path, pearls, lw);
+}
+// ================= princess =================
+const pr = {
+  x: 0, y: -1.1, z: 0, act: null, actT: 0, actDur: 0, actPri: -1,
+  blink: 0, nextBlink: 2.5, lx: 0, ly: 0, tlx: 0, tly: 0, tilt: 0, lean: 0, bob: 0, sway: 0, swayV: 0, spin: 0, spinOn: false,
+  hands: { lx: -11, ly: -40, rx: 11, ry: -40 }, cheek: 0, cream: 0, walkPh: 0, path: null, pathI: 0, walkCb: null, speed: .22, moving: false,
+  plate: null, eatT: 0, idleNext: 7, lastWalk: 0, climbJ: -1, hop: 0, sparkle: 0, mood: 0, sx: 0, sy: 0, u: 1, headX: 0, headY: 0, plateX: 0, plateY: 0,
+  where: 'ground', lookBack: 0, stepT: 0, hidden: false, ovr: null, watchMini: 0,
+};
+function prAct(name, dur, pri) {
+  if (pr.act && pri < pr.actPri && T - pr.actT < pr.actDur) return false;
+  pr.act = name; pr.actT = T; pr.actDur = dur; pr.actPri = pri;
+  if (name === 'joy' || name === 'spin') { pr.spinOn = true; pr.spinT = T; }
+  return true;
+}
+function prActive(name) { return pr.act === name && T - pr.actT < pr.actDur; }
+function prBusy() { return pr.act && T - pr.actT < pr.actDur && pr.actPri >= 2; }
+function prWalkTo(pts, cb, speed) { pr.path = pts; pr.pathI = 0; pr.walkCb = cb || null; pr.speed = speed || .22; }
+function prScale() { return lerp(.55, .37, easeInOut(camK)); }
+function updPrincess(dt) {
+  // blink
+  pr.nextBlink -= dt; if (pr.nextBlink < 0) { pr.blink = .14; pr.nextBlink = rand(2, 5); if (rand() < .2) pr.nextBlink = .25; }
+  pr.blink = Math.max(0, pr.blink - dt);
+  // walking
+  pr.moving = false;
+  if (pr.path && pr.pathI < pr.path.length) {
+    const t = pr.path[pr.pathI]; const dx = t.x - pr.x, dy = t.y - pr.y, dz = (t.z || 0) - pr.z; const d = Math.hypot(dx, dy, dz);
+    const sp = pr.speed * dt;
+    if (d <= sp) { pr.x = t.x; pr.y = t.y; pr.z = t.z || 0; pr.pathI++; if (pr.pathI >= pr.path.length) { const cb = pr.walkCb; pr.path = null; pr.walkCb = null; if (cb) cb(); } }
+    else { pr.x += dx / d * sp; pr.y += dy / d * sp; pr.z += dz / d * sp; pr.moving = true; pr.dirX = dx; }
+  }
+  if (pr.moving) {
+    pr.walkPh += dt * 9;
+    pr.stepT -= dt; if (pr.stepT <= 0) { pr.stepT = TAU / 9 / 2 * 1.0; footstepAt(pr.x, pr.y, pr.z); }
+  }
+  pr.bob = pr.moving ? -Math.abs(Math.sin(pr.walkPh)) * 3.2 : 0;
+  // sway spring for dress
+  const swayT = pr.moving ? Math.sin(pr.walkPh) * .8 : 0; pr.swayV += (swayT - pr.sway) * 60 * dt - pr.swayV * 6 * dt; pr.sway += pr.swayV * dt;
+  // spin
+  if (pr.spinOn) { const k = (T - pr.spinT) / .9; pr.spin = k >= 1 ? 0 : easeInOut(k); if (k >= 1) pr.spinOn = false; }
+  // look target
+  let tx = null, ty = null;
+  if (bag.drag) { tx = bag.tipX; ty = bag.tipY; pr.sparkle = Math.min(1, pr.sparkle + dt * 3); } else pr.sparkle = Math.max(0, pr.sparkle - dt * 1.5);
+  if (carry.o) { tx = carry.x; ty = carry.y; }
+  if (tx === null) {
+    if (pr.ovr) { tx = pr.ovr.x; ty = pr.ovr.y; }
+    else if (castle && G.act === 3) { proj(0, 0, castle.h1 + castle.h2); tx = PX; ty = PY; }
+    else if (pr.watchMini > T && minis.length) { const m = minis[minis.length - 1]; tx = m.x + m.w / 2; ty = m.y + m.h / 2; }
+    else { const k = Math.sin(T * .35) > 0; tx = k ? bag.tipX : cam.cx; ty = k ? bag.tipY : cam.cy; }
+  }
+  const dx = tx - pr.headX, dy = ty - pr.headY; const dl = Math.hypot(dx, dy) || 1;
+  pr.tlx = dx / dl * Math.min(1, dl / 60); pr.tly = dy / dl * Math.min(1, dl / 60);
+  pr.lx += (pr.tlx - pr.lx) * Math.min(1, dt * 10); pr.ly += (pr.tly - pr.ly) * Math.min(1, dt * 10);
+  // pose targets
+  let H = { lx: -11, ly: -40, rx: 11, ry: -40 }; let lean = 0, tilt = Math.sin(T * .8) * .05 + pr.lx * .08;
+  const a = (pr.act && T - pr.actT < pr.actDur) ? pr.act : null; const at = T - pr.actT;
+  if (!a) pr.actPri = -1;
+  pr.mood = 0;
+  switch (a) {
+    case 'lean': lean = .5 * Math.sin(Math.min(1, at / pr.actDur) * Math.PI); pr.mood = 1; break;
+    case 'surprise': pr.mood = 2; H = { lx: -16, ly: -50, rx: 16, ry: -50 }; break;
+    case 'clap': { pr.mood = 3; const o = Math.abs(Math.sin(at * 9)) * 6; H = { lx: -1 - o, ly: -56, rx: 1 + o, ry: -56 }; if (Math.sin(at * 9) * Math.sin((at - .016) * 9) < 0) S.clap(); break; }
+    case 'joy': pr.mood = 3; H = { lx: -24, ly: -72, rx: 24, ry: -72 }; break;
+    case 'eat': { pr.mood = 4; const m = Math.sin(at * 10); H = { lx: -11, ly: -40, rx: 4, ry: -66 + m * 1.5 }; pr.cheek = Math.min(1, pr.cheek + dt * 4); if (Math.sin(at * 10) > .95) S.eat(); break; }
+    case 'bow': lean = .9 * Math.sin(Math.min(1, at / pr.actDur) * Math.PI); pr.mood = 3; H = { lx: -14, ly: -36, rx: 14, ry: -36 }; break;
+    case 'spin': pr.mood = 3; H = { lx: -20, ly: -52, rx: 20, ry: -52 }; break;
+    case 'tiara': H = { lx: -11, ly: -40, rx: 9, ry: -94 }; tilt = -.15; break;
+    case 'skirt': H = { lx: -20, ly: -24, rx: 20, ry: -24 }; lean = .25 * Math.sin(Math.min(1, at / pr.actDur) * Math.PI); break;
+    case 'peek': lean = .45; tilt = .25; pr.mood = 5; break;
+    case 'beg': H = { lx: -9, ly: -50, rx: 9, ry: -50 }; lean = .2; pr.mood = 1; break;
+    case 'lookback': pr.mood = 3; tilt = -.2; break;
+    case 'sip': H = { lx: -11, ly: -40, rx: 3, ry: -64 }; pr.mood = 1; break;
+    case 'wow': pr.mood = 2; lean = -.2; H = { lx: -14, ly: -46, rx: 14, ry: -46 }; break;
+  }
+  if (carry.o && !a) { H = { lx: -9, ly: -50, rx: 9, ry: -50 }; lean = .2; pr.mood = 1; }
+  if (a !== 'eat') pr.cheek = Math.max(0, pr.cheek - dt * 1.5);
+  pr.cream = Math.max(0, pr.cream - dt * .12);
+  const hk = Math.min(1, dt * 12);
+  pr.hands.lx += (H.lx - pr.hands.lx) * hk; pr.hands.ly += (H.ly - pr.hands.ly) * hk; pr.hands.rx += (H.rx - pr.hands.rx) * hk; pr.hands.ry += (H.ry - pr.hands.ry) * hk;
+  pr.lean += (lean - pr.lean) * Math.min(1, dt * 8); pr.tilt += (tilt - pr.tilt) * Math.min(1, dt * 6);
+  // idle gestures
+  if (!a && !pr.moving && !bag.drag && !carry.o) {
+    pr.idleNext -= dt;
+    if (pr.idleNext < 0) {
+      pr.idleNext = rand(4.5, 8);
+      const opts = ['tiara', 'skirt', 'tilt'];
+      if (!pr.plate) opts.push('peek', 'peek');
+      if (minis.length) opts.push('mini');
+      const c = pick(opts);
+      if (c === 'tiara') prAct('tiara', 1.4, 0); else if (c === 'skirt') prAct('skirt', 1.5, 0); else if (c === 'peek') prAct('peek', 1.3, 0);
+      else if (c === 'mini') { pr.watchMini = T + 2.2; setTimeout0(() => { if (!pr.act || pr.actPri < 1) { prAct('lookback', 1, 0); S.giggle(); } }, 1.2); }
+    }
+  }
+  // eating plate contents
+  if (pr.plate && pr.eatT && T > pr.eatT) {
+    const o = pr.plate; if (!o.bite) prAct('eat', 1.9, 3); o.bite = (o.bite || 0) + 1; pr.eatT = T + .55; S.eat();
+    proj(pr.x, pr.y, pr.z); sugarBurst(pr.plateX, pr.plateY - 4, 4, null, 60, 10);
+    if (o.bite >= 3) { pr.plate = null; pr.eatT = 0; pr.cream = 1; o.gone = true; setTimeout0(() => { prAct('joy', 1.2, 2); S.giggle(); heartsAt(pr.headX, pr.headY - 20, 3); }, .3); }
+  }
+}
+// tiny timer helper (game-time based)
+const timers = [];
+function setTimeout0(fn, d) { timers.push({ t: T + d, fn }); }
+function updTimers() { for (let i = timers.length - 1; i >= 0; i--) if (T >= timers[i].t) { const f = timers[i].fn; timers.splice(i, 1); f(); } }
+function heartsAt(x, y, n) { for (let i = 0; i < n; i++) spawn('heart', x + rand(-18, 18), y + rand(-8, 8), 0, -rand(30, 50), rand(1.2, 1.8), rand(5, 8), pick(['#ff7aa2', '#ff9cc0', '#ffb3d0'])); }
+function footstepAt(x, y, z) {
+  if (z > .01 || !gridNear(x, y, .05, -1)) { S.footstep(); return; }
+  footprints.push({ x: x + rand(-.01, .01), y: y + .01, t: T }); if (footprints.length > 26) footprints.shift();
+  S.footstep(); proj(x, y, 0); if (rand() < .5) sugarBurst(PX, PY, 2, null, 40, 6);
+}
+function drawFootprints() {
+  for (const f of footprints) {
+    const a = 1 - (T - f.t) / 9; if (a <= 0) continue; let x = f.x, y = f.y, z = 0; if (castle) { morphP(x, y, false); x = MO.x; y = MO.y; z = MO.z; }
+    proj(x, y, z); const r = cam.R * .014;
+    ctx.globalAlpha = a; ctx.fillStyle = 'rgba(150,70,90,.22)'; ell(PX, PY, r * 1.2, r * .55); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.8)'; ctx.lineWidth = r * .3; ctx.beginPath(); ctx.ellipse(PX, PY + r * .1, r * 1.2, r * .55, 0, .2, Math.PI - .2); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+function prScreen() { proj(pr.x, pr.y, pr.z); pr.sx = PX; pr.sy = PY; pr.u = cam.R * prScale() / 100; }
+function drawPrincess(sx, sy, u) {
+  const c = ctx; const p = pr; const hair = G.hair;
+  c.save(); c.translate(sx, sy); c.scale(u, u);
+  c.fillStyle = 'rgba(110,45,25,.22)'; ell(0, 0, 24, 7); c.fill();
+  c.translate(0, p.bob - p.hop * 30);
+  const sc = Math.cos(p.spin * TAU); const back = sc < 0;
+  c.scale(Math.max(.1, Math.abs(sc)), 1);
+  c.rotate(p.lean * .12 * (p.dirX < 0 ? -1 : 1) * 0 + p.lean * .1);
+  const sw = p.sway * 4 + Math.sin(T * 1.7) * .6;
+  // shoes
+  const fl = p.moving ? Math.max(0, Math.sin(p.walkPh)) * 4 : 0, fr = p.moving ? Math.max(0, -Math.sin(p.walkPh)) * 4 : 0;
+  c.fillStyle = '#ff8fb0'; ell(-7, -3 - fl, 5, 3.2); c.fill(); ell(7, -3 - fr, 5, 3.2); c.fill();
+  c.fillStyle = 'rgba(255,255,255,.7)'; ell(-8.5, -4.2 - fl, 1.6, 1); c.fill(); ell(5.5, -4.2 - fr, 1.6, 1); c.fill();
+  // back hair (long)
+  c.fillStyle = linG(0, -96, 0, -50, [[0, hair[0]], [1, hair[1]]]);
+  c.beginPath(); c.moveTo(-19, -82); c.bezierCurveTo(-25, -66, -23, -56, -18, -50); c.quadraticCurveTo(-10, -47, -6, -52); c.lineTo(6, -52); c.quadraticCurveTo(10, -47, 18, -50); c.bezierCurveTo(23, -56, 25, -66, 19, -82); c.closePath(); c.fill();
+  // skirt
+  c.beginPath(); c.moveTo(-11, -47);
+  c.bezierCurveTo(-16, -36, -27 + sw, -20, -31 + sw * 1.3, -6);
+  const hem = 7; for (let i = 0; i <= hem; i++) { const x = -31 + sw * 1.3 + i / hem * 62; c.quadraticCurveTo(x - 62 / hem / 2, -2 + (i % 2) * 1.5, x, -6); }
+  c.bezierCurveTo(27 + sw, -20, 16, -36, 11, -47); c.closePath();
+  c.fillStyle = linG(0, -47, 0, -4, [[0, '#fffaf0'], [1, '#f6dcb4']]); c.fill();
+  c.fillStyle = linG(-30, 0, 30, 0, [[0, 'rgba(200,140,90,.22)'], [.35, 'rgba(255,255,255,.18)'], [1, 'rgba(180,120,80,.28)']]); c.fill();
+  c.strokeStyle = 'rgba(215,160,120,.45)'; c.lineWidth = 1.1; c.beginPath();
+  for (const k of [-14, -4, 6, 16]) { c.moveTo(k * .4, -44); c.quadraticCurveTo(k * .8 + sw * .5, -26, k * 1.15 + sw, -8); } c.stroke();
+  // lace hem
+  c.fillStyle = '#ffffff'; for (let i = 0; i < 12; i++) { const x = -30 + sw * 1.3 + i * 5.4; circ(x, -5.5, 2.6); c.fill(); }
+  c.fillStyle = '#ffd0de'; for (let i = 0; i < 12; i++) { circ(-30 + sw * 1.3 + i * 5.4, -6.4, .9); c.fill(); }
+  // pink overskirt drape
+  c.fillStyle = 'rgba(255,170,200,.55)'; c.beginPath(); c.moveTo(-11, -46); c.quadraticCurveTo(-22 + sw, -30, -18 + sw, -18); c.quadraticCurveTo(0 + sw, -26, 18 + sw, -18); c.quadraticCurveTo(22 + sw, -30, 11, -46); c.closePath(); c.fill();
+  // bodice
+  c.fillStyle = linG(0, -63, 0, -45, [[0, '#fff8ec'], [1, '#ffe4c4']]);
+  c.beginPath(); c.moveTo(-10, -62); c.quadraticCurveTo(0, -60, 10, -62); c.lineTo(11, -46); c.quadraticCurveTo(0, -43, -11, -46); c.closePath(); c.fill();
+  c.fillStyle = '#ff9fbf'; c.beginPath(); c.moveTo(-11.5, -48.5); c.quadraticCurveTo(0, -45.5, 11.5, -48.5); c.lineTo(11.5, -45); c.quadraticCurveTo(0, -42, -11.5, -45); c.fill();
+  if (!back) { c.fillStyle = '#ff8fb0'; ell(-3.5, -46.5, 3.5, 2.4); c.fill(); ell(3.5, -46.5, 3.5, 2.4); c.fill(); c.fillStyle = '#ff6f9a'; circ(0, -46.5, 1.6); c.fill(); }
+  // amber brooch
+  if (!back) { c.fillStyle = radG(-.5, -57, 0, 3, [[0, '#fff'], [.4, '#ffb3d0'], [1, '#e8487a']]); circ(0, -56.5, 2.4); c.fill(); }
+  // neck
+  c.fillStyle = '#ffdcc8'; c.fillRect(-3, -65, 6, 4);
+  // sleeves
+  c.fillStyle = radG(-12, -60, 1, 8, [[0, '#ffffff'], [1, '#ffe2c6']]); circ(-12, -58.5, 6); c.fill(); circ(12, -58.5, 6); c.fill();
+  // arms
+  c.strokeStyle = '#ffd8c4'; c.lineWidth = 4.6; c.lineCap = 'round';
+  c.beginPath(); c.moveTo(-12, -56); c.quadraticCurveTo((-12 + p.hands.lx) / 2 - 4, (-56 + p.hands.ly) / 2 + 2, p.hands.lx, p.hands.ly); c.stroke();
+  c.beginPath(); c.moveTo(12, -56); c.quadraticCurveTo((12 + p.hands.rx) / 2 + 4, (-56 + p.hands.ry) / 2 + 2, p.hands.rx, p.hands.ry); c.stroke();
+  // head group
+  c.save(); c.translate(0, -66); c.rotate(p.tilt); c.translate(0, 66);
+  const cw = 17 + p.cheek * 1.4;
+  if (back) {
+    c.fillStyle = radG(-5, -86, 2, 22, [[0, hair[0]], [1, hair[1]]]); ell(0, -79, 19, 19); c.fill();
+    c.fillStyle = '#ff8fb0'; ell(-5, -66, 5, 3); c.fill(); ell(5, -66, 5, 3); c.fill();
+  } else {
+    c.fillStyle = radG(-5, -84, 2, 20, [[0, '#fff3ea'], [1, '#ffd2bc']]); ell(0, -78, cw, 16.5); c.fill();
+    // cheeks
+    c.fillStyle = 'rgba(255,120,150,.42)'; ell(-10.5, -71, 3.8 + p.cheek * 1.4, 2.4 + p.cheek * .6); c.fill(); ell(10.5, -71, 3.8 + p.cheek * 1.4, 2.4 + p.cheek * .6); c.fill();
+    // eyes
+    const ex = p.lx * 1.3, ey = p.ly * .9; const bl = p.blink > 0 ? .12 : 1;
+    const happy = p.mood === 3 || (p.mood === 4 && Math.sin(T * 6) > 0);
+    for (const s of [-1, 1]) {
+      const x = s * 6.5;
+      if (happy) { c.strokeStyle = '#5a3040'; c.lineWidth = 1.6; c.beginPath(); c.arc(x, -75, 3.2, Math.PI * 1.1, Math.PI * 1.9); c.stroke(); continue; }
+      const big = p.mood === 2 ? 1.2 : 1; const ry = 4.6 * big * bl;
+      c.fillStyle = linG(0, -80, 0, -71, [[0, '#3a2030'], [1, '#8a4a70']]); ell(x + ex * .4, -76 + ey * .4, 3.5 * big, ry); c.fill();
+      if (bl > .5) {
+        c.fillStyle = '#fff'; circ(x + ex * .4 - 1.2, -77.6 + ey * .4, 1.4 * big + p.sparkle * .4); c.fill(); circ(x + ex * .4 + 1.2, -74.5 + ey * .4, .7); c.fill();
+        if (p.sparkle > .3) { c.fillStyle = 'rgba(255,240,180,.9)'; starPath(x + ex * .4 + .8, -78 + ey * .4, 1.2 * p.sparkle, 4, .35, T * 2); c.fill(); }
+      }
+      c.strokeStyle = '#3a2030'; c.lineWidth = 1; c.beginPath(); c.moveTo(x + s * 2.5, -79.5); c.lineTo(x + s * 4.6, -81); c.stroke();
+    }
+    // brows
+    c.strokeStyle = 'rgba(150,90,70,.6)'; c.lineWidth = .9; const by = p.mood === 2 ? -84.5 : -83;
+    c.beginPath(); c.moveTo(-9, by); c.quadraticCurveTo(-6.5, by - 1.2, -4, by); c.moveTo(4, by); c.quadraticCurveTo(6.5, by - 1.2, 9, by); c.stroke();
+    // mouth
+    c.fillStyle = '#e8587a'; c.strokeStyle = '#c84060'; c.lineWidth = 1;
+    if (p.mood === 2) { ell(0, -68.5, 1.8, 2.4); c.fill(); }
+    else if (p.mood === 4) { const m = Math.abs(Math.sin((T - p.actT) * 10)); ell(0, -68.5, 2 + m * .6, .6 + m * 1.6); c.fill(); }
+    else if (p.mood === 3) { c.beginPath(); c.moveTo(-3, -69.5); c.quadraticCurveTo(0, -65, 3, -69.5); c.closePath(); c.fill(); }
+    else { c.beginPath(); c.moveTo(-2.4, -69); c.quadraticCurveTo(0, -67, 2.4, -69); c.stroke(); }
+    if (p.cream > .05) { c.globalAlpha = Math.min(1, p.cream * 2); c.fillStyle = '#fff'; circ(3.8, -67.6, 1.5); c.fill(); circ(4.8, -68.4, 1); c.fill(); c.globalAlpha = 1; }
+    // bangs
+    c.fillStyle = radG(-4, -92, 2, 22, [[0, hair[0]], [1, hair[1]]]);
+    c.beginPath(); c.moveTo(-18, -77); c.bezierCurveTo(-20, -92, -10, -98, 0, -97); c.bezierCurveTo(10, -98, 20, -92, 18, -77);
+    c.quadraticCurveTo(15, -84, 10, -85); c.quadraticCurveTo(7, -81, 3, -85); c.quadraticCurveTo(0, -82, -3, -85); c.quadraticCurveTo(-7, -81, -10, -85); c.quadraticCurveTo(-15, -84, -18, -77); c.fill();
+    // side curls
+    c.beginPath(); c.moveTo(-17, -80); c.quadraticCurveTo(-21, -70, -18, -64); c.quadraticCurveTo(-14, -61, -15, -66); c.quadraticCurveTo(-17, -72, -14, -78); c.fill();
+    c.beginPath(); c.moveTo(17, -80); c.quadraticCurveTo(21, -70, 18, -64); c.quadraticCurveTo(14, -61, 15, -66); c.quadraticCurveTo(17, -72, 14, -78); c.fill();
+    c.strokeStyle = 'rgba(255,255,255,.35)'; c.lineWidth = 1.4; c.beginPath(); c.arc(-4, -88, 8, Math.PI * 1.15, Math.PI * 1.5); c.stroke();
+  }
+  // bun
+  c.fillStyle = radG(-2, -102, 1, 8, [[0, hair[0]], [1, hair[1]]]); circ(0, -99, 7); c.fill();
+  // tiara (amber candy)
+  const tj = (x, y, r, col) => { c.fillStyle = radG(x - r * .3, y - r * .4, r * .1, r * 1.2, [[0, 'rgba(255,255,255,.95)'], [.4, rgbS(col, .9)], [1, rgbS(deepen(col), .9)]], x, y); c.beginPath(); c.moveTo(x, y - r * 1.5); c.quadraticCurveTo(x + r * 1.1, y, x, y + r); c.quadraticCurveTo(x - r * 1.1, y, x, y - r * 1.5); c.fill(); };
+  c.fillStyle = '#ffd86b'; c.beginPath(); c.ellipse(0, -92, 11, 3, 0, Math.PI, TAU); c.lineTo(11, -91); c.ellipse(0, -91, 11, 2.4, 0, 0, Math.PI, true); c.fill();
+  tj(-7, -94, 2.2, [160, 240, 210]); tj(7, -94, 2.2, [255, 230, 130]); tj(0, -96.5, 3.4, [255, 130, 170]);
+  c.fillStyle = '#fff'; circ(-1, -98, .9); c.fill();
+  c.restore();
+  // hands
+  c.fillStyle = '#ffe0cf'; circ(p.hands.lx, p.hands.ly, 3); c.fill(); circ(p.hands.rx, p.hands.ry, 3); c.fill();
+  c.restore();
+}
+function drawPlate(sx, sy, u) {
+  // plate held at waist (design coords 0,-40) – drawn after princess so items show
+  const c = ctx; const bob = Math.sin(T * 2) * .6;
+  const px = sx, py = sy + (pr.bob - pr.hop * 30 - 40 + bob) * u - (prActive('beg') || carry.o ? 8 * u : 0);
+  pr.plateX = px; pr.plateY = py;
+  if (Math.cos(pr.spin * TAU) < 0) return;
+  c.fillStyle = 'rgba(120,60,40,.15)'; ell(px + u, py + 3 * u, 15 * u, 4.5 * u); c.fill();
+  c.fillStyle = radG(px - 4 * u, py - 2 * u, u, 16 * u, [[0, '#ffffff'], [.8, '#f6eef4'], [1, '#e6d4de']]); ell(px, py, 15 * u, 4.6 * u); c.fill();
+  c.strokeStyle = '#ffb3cc'; c.lineWidth = 1.2 * u; ell(px, py, 12.8 * u, 3.6 * u); c.stroke();
+  if (pr.plate) {
+    const o = pr.plate; const k = 1 - (o.bite || 0) * .28; drawSweetAt(o, px, py + 1 * u, .9 * k);
+  }
+}
+
+// ================= birds =================
+function newBird(col, peek) {
+  const a = L.birdAng; return { x: Math.cos(a) * 1.0, y: Math.sin(a) * 1.0, z: peek ? -.1 : 0, st: peek ? 'peek' : 'roam', col: col || pick(BIRD_COLS), dir: 1, tilt: 0, tiltT: 0, blink: 0, nb: 2, flap: 0, flapT: 0, hop: null, peck: 0, next: 1, eat: null, eatN: 0, sx: 0, sy: 0, u: 1, fly: null, perch: null, beak: 0, scale: rand(.9, 1.1), alive: true, hopZ: 0 };
+}
+let birds = [];
+function birdHop(b, x, y, z, dur) { b.hop = { fx: b.x, fy: b.y, fz: b.z, tx: x, ty: y, tz: z === undefined ? 0 : z, t: 0, d: dur || .32, h: .05 }; if (Math.abs(x - b.x) > .005) b.dir = x > b.x ? 1 : -1; }
+function birdFly(b, x, y, z, cb) { b.fly = { fx: b.x, fy: b.y, fz: b.z, tx: x, ty: y, tz: z, t: 0, d: clamp(dist(b.x, b.y, x, y) * 1.2 + Math.abs(z - b.z) * .8, .8, 2.4), cb }; b.dir = x > b.x ? 1 : -1; b.st = 'fly'; }
+function updBird(b, dt) {
+  b.nb -= dt; if (b.nb < 0) { b.blink = .12; b.nb = rand(1.5, 4); } b.blink = Math.max(0, b.blink - dt);
+  b.flap = Math.max(0, b.flap - dt); b.peck = Math.max(0, b.peck - dt); b.beak = Math.max(0, b.beak - dt);
+  // tilt toward bag tip when drawing
+  let tt = Math.sin(T * 1.3 + b.x * 9) * .15;
+  if (bag.drag) { const dx = bag.tipX - b.sx; tt = clamp(dx * .004 * b.dir, -.45, .45) + .25 * Math.sin(T * 3); }
+  if (b.tiltT > T) tt = .5 * Math.sin(T * 7);
+  b.tilt += (tt - b.tilt) * Math.min(1, dt * 6);
+  if (b.fly) {
+    const f = b.fly; f.t += dt; const k = clamp(f.t / f.d, 0, 1), e = easeInOut(k);
+    b.x = lerp(f.fx, f.tx, e); b.y = lerp(f.fy, f.ty, e); b.z = lerp(f.fz, f.tz, e) + Math.sin(k * Math.PI) * .25; b.flap = .2;
+    if (k >= 1) { b.fly = null; b.z = f.tz; b.st = 'roam'; if (f.cb) f.cb(); }
+    return;
+  }
+  if (b.hop) {
+    const h = b.hop; h.t += dt; const k = clamp(h.t / h.d, 0, 1);
+    b.x = lerp(h.fx, h.tx, k); b.y = lerp(h.fy, h.ty, k); b.z = lerp(h.fz, h.tz, k); b.hopZ = Math.sin(k * Math.PI) * h.h;
+    if (k >= 1) { b.hop = null; b.hopZ = 0; }
+    return;
+  }
+  if (b.st === 'peek') {
+    b.z = -.075 + Math.max(0, Math.sin(T * 1.1)) * .035; b.dir = Math.cos(L.birdAng) < 0 ? 1 : -1;
+    if (rand() < dt * .3) { b.tiltT = T + .6; }
+    return;
+  }
+  if (b.eat) {
+    const o = b.eat; b.dir = o.wx > b.x ? 1 : -1;
+    b.next -= dt; if (b.next < 0) { b.peck = .2; b.next = .4; b.eatN++; S.eat(); o.bite = (o.bite || 0) + 1; proj(o.wx, o.wy, o.wz); sugarBurst(PX, PY - 4, 3, ['#ff5a7a', '#ffd0dc', '#fff'], 60, 6); }
+    if (b.eatN >= 3) { o.gone = true; b.eat = null; b.flap = 1.2; S.chirp(); heartsAt(b.sx, b.sy - 20, 2); b.next = 1.2; }
+    return;
+  }
+  if (b.st === 'perch') { b.next -= dt; if (b.next < 0) { b.next = rand(1, 3); const r = rand(); if (r < .3) { b.peck = .25; } else if (r < .5) { b.flap = .5; S.chirp(); } else if (r < .7) b.tiltT = T + .5; else b.dir *= -1; } return; }
+  // roam
+  b.next -= dt;
+  if (b.next < 0) {
+    b.next = rand(.7, 2);
+    const r = rand();
+    if (r < .5) {
+      // hop toward something interesting
+      let tx = b.x + rand(-.15, .15), ty = b.y + rand(-.1, .1);
+      const tgt = rand() < .5 ? pickNearSweet(b) : null; if (tgt) { tx = tgt.wx + rand(-.06, .06); ty = tgt.wy + .05; }
+      if (castle && castle.built) { const d = Math.hypot(tx, ty); if (d < .78) { const a = Math.atan2(ty, tx); tx = Math.cos(a) * .8; ty = Math.sin(a) * .8; } }
+      const d = Math.hypot(tx, ty); if (d > .9) { tx *= .9 / d; ty *= .9 / d; }
+      const step = Math.min(.1, dist(b.x, b.y, tx, ty)); const a = Math.atan2(ty - b.y, tx - b.x);
+      birdHop(b, b.x + Math.cos(a) * step, b.y + Math.sin(a) * step, 0);
+    } else if (r < .72) { b.peck = .25; proj(b.x, b.y, b.z); if (rand() < .5) sugarBurst(b.sx + b.dir * 8, b.sy, 2, null, 40, 4); }
+    else if (r < .86) { b.flap = .6; if (rand() < .6) S.chirp(); }
+    else b.tiltT = T + .6;
+  }
+}
+function pickNearSweet(b) { let best = null, bd = .5; for (const o of sweets) { if (o.gone || o.held || o.kind !== 'berry' || o.tea) continue; const d = dist(o.wx, o.wy, b.x, b.y); if (d < bd) { bd = d; best = o; } } return best; }
+function birdScreen(b) { proj(b.x, b.y, b.z + b.hopZ); b.sx = PX; b.sy = PY; b.u = cam.R * .0068 * b.scale * lerp(1, .85, camK); }
+function drawBird(b) {
+  const c = ctx; const u = b.u; c.save(); c.translate(b.sx, b.sy); c.scale(u * b.dir, u);
+  if (b.st !== 'peek' && !b.fly) { c.fillStyle = 'rgba(110,45,25,.2)'; ell(0, b.hopZ * cam.R * cam.hz / u, 11, 3.5); c.fill(); }
+  const col = b.col, light = mix(col, WHITE, .65), deep = deepen(col);
+  const peckA = b.peck > 0 ? Math.sin(b.peck / .25 * Math.PI) * .5 : 0;
+  c.rotate(peckA);
+  // feet
+  c.strokeStyle = '#f0a040'; c.lineWidth = 1.6; c.beginPath(); c.moveTo(-3, -2); c.lineTo(-3, 0); c.moveTo(3, -2); c.lineTo(3, 0); c.stroke();
+  // tail
+  c.fillStyle = rgbS(deep); c.beginPath(); c.moveTo(-9, -10); c.quadraticCurveTo(-17, -16, -16, -8); c.quadraticCurveTo(-13, -6, -9, -7); c.fill();
+  // body (marshmallow)
+  c.fillStyle = radG(-3, -14, 2, 14, [[0, '#ffffff'], [.55, rgbS(light)], [1, rgbS(col)]]); ell(0, -9, 11, 9); c.fill();
+  c.fillStyle = 'rgba(255,255,255,.7)'; ell(3, -6, 6, 4); c.fill();
+  // wing
+  const fl = b.flap > 0 ? Math.sin(T * 40) * .9 : Math.sin(T * 2) * .05;
+  c.save(); c.translate(-2, -11); c.rotate(-.3 - fl);
+  c.fillStyle = linG(0, -4, 0, 5, [[0, rgbS(mix(col, WHITE, .3))], [1, rgbS(deep)]]); c.beginPath(); c.ellipse(-3, 1, 7, 4.2, .25, 0, TAU); c.fill();
+  c.strokeStyle = 'rgba(255,255,255,.85)'; c.lineWidth = .8; c.stroke();
+  c.fillStyle = '#fff'; circ(-6, 0, .7); c.fill(); circ(-3, 2, .6); c.fill();
+  c.restore();
+  // head
+  c.save(); c.translate(5, -16); c.rotate(b.tilt);
+  c.fillStyle = radG(-2, -3, 1, 9, [[0, '#ffffff'], [.6, rgbS(light)], [1, rgbS(col)]]); circ(0, 0, 7.4); c.fill();
+  c.fillStyle = 'rgba(255,130,160,.45)'; ell(3, 2.5, 2, 1.3); c.fill();
+  if (b.blink > 0) { c.strokeStyle = '#2a1a20'; c.lineWidth = 1; c.beginPath(); c.moveTo(1.5, -1.5); c.lineTo(4.5, -1.5); c.stroke(); }
+  else { c.fillStyle = '#2a1a20'; circ(3, -1.5, 1.9); c.fill(); c.fillStyle = '#fff'; circ(2.4, -2.3, .75); c.fill(); }
+  const op = (b.beak > 0 || b.peck > 0) ? 1.3 : 0;
+  c.fillStyle = '#ffb84a'; c.beginPath(); c.moveTo(6.5, -1.5 - op * .5); c.lineTo(10.5, 0); c.lineTo(6.5, 1); c.fill();
+  if (op) { c.beginPath(); c.moveTo(6.5, 1); c.lineTo(10, 1.8 + op); c.lineTo(6.5, 2); c.fill(); }
+  c.fillStyle = rgbS(deep); circ(-1, -7.5, 1.6); c.fill(); circ(1, -7.8, 1.3); c.fill();
+  c.restore();
+  c.restore();
+}
+// ================= castle =================
+let stairs = null;
+function startCastle() {
+  const tw = [];
+  const defs = [[-2.36, rand(.86, 1.06)], [-.78, rand(.86, 1.06)], [2.78, rand(.56, .72)], [.36, rand(.56, .72)]];
+  for (const d of defs) tw.push({ ang: d[0], x: Math.cos(d[0]) * .66, y: Math.sin(d[0]) * .66, r: rand(.1, .12), h: d[1], grow: 0, roofH: rand(.22, .3), stripe: palAt(G.pal, rand()), roofCol: palAt(G.pal, rand()), win: rand() < .5 });
+  let ti = 0; for (let i = 1; i < 4; i++) if (tw[i].h > tw[ti].h) ti = i;
+  const wedges = []; const a0 = rand(TAU);
+  for (let i = 0; i < 4; i++) {
+    const a = a0 + i * Math.PI / 2; const mid = a + Math.PI / 4;
+    let best = 0, bd = 9; for (let k = 0; k < 4; k++) { if (wedges.some(w => w.tw === k)) continue; const d = Math.abs(Math.atan2(Math.sin(tw[k].ang - mid), Math.cos(tw[k].ang - mid))); if (d < bd) { bd = d; best = k; } }
+    wedges.push({ a, tw: best, k: 0 });
+  }
+  // bridge: longest pre path mostly outside hole
+  let bridgeSid = 0, bl = 0;
+  for (const s of strokes) { if (!s.pre || s.plane !== 'ground' || s.len < .5) continue; let out = 0; for (const p of s.pts) if (Math.hypot(p.x, p.y) > HOLE + .05) out++; if (out / s.pts.length > .8 && s.len > bl) { bl = s.len; bridgeSid = s.id; } }
+  castle = { t: 0, morph: 0, h1: 0, h2: 0, open: 0, crack: 0, bulge: 0, built: false, towers: tw, jewelTw: ti, crownTw: rand() < .3 ? (ti + 1 + Math.floor(rand(3))) % 4 : -1, wedges, jewel: 0, flash: 0, bal: 0, bridge: 0, bridgeSid, f: {}, crackPts: makeCrack(), wins: [], bell: null };
+  for (const a of [.55, 1.05, 1.57, 2.09, 2.59]) castle.wins.push({ a, z: .5, tier: 1, pop: 0 });
+  castle.wins.push({ a: 1.2, z: .5, tier: 2, pop: 0 }, { a: 1.94, z: .5, tier: 2, pop: 0 });
+  G.act = 3; G.actT = 0;
+  // characters step back & look
+  if (bag.drag) endBag();
+  const wx = L.watch.x * (pr.x < -.1 ? -1 : 1), wy = L.watch.y;
+  prWalkTo([{ x: wx, y: wy, z: 0 }], () => prAct('wow', 3, 3), .7);
+  pr.where = 'ground';
+  for (const b of birds) { if (b.st === 'peek') b.st = 'roam'; b.eat = null; const bx = -wx * .95, by = wy + .1; birdFly(b, bx + rand(-.1, .1), by + rand(-.05, .1), 0); }
+  S.crack();
+}
+function makeCrack() {
+  const pts = []; const a = rand(TAU); const N = 14;
+  for (let i = -N; i <= N; i++) { const t = i / N; pts.push({ t, x: Math.cos(a) * t * HOLE * .95 + Math.sin(a) * (rand(-.03, .03)), y: Math.sin(a) * t * HOLE * .95 - Math.cos(a) * rand(-.03, .03) }); }
+  return pts;
+}
+function cOnce(k, cond, fn) { if (!castle.f[k] && cond) { castle.f[k] = 1; fn(); } }
+function updCastle(dt) {
+  if (!castle) return; const c = castle; const t = (c.t += dt);
+  if (!c.built) {
+    c.crack = clamp(t / 1.3, 0, 1); c.bulge = clamp((t - 1.3) / 1.5, 0, 1); c.open = easeOut((t - 3.0) / .6);
+    camK = easeInOut((t - 3.4) / 3.4);
+    c.h1 = T1H * easeOut((t - 3.4) / 2.6); c.morph = ease((t - 3.6) / 2.6);
+    c.towers.forEach((w, i) => { w.grow = easeOut((t - 4.3 - i * .35) / 1.9); });
+    c.wedges.forEach((w, i) => { w.k = easeInOut((t - 3.7 - i * .3) / 2.5); });
+    c.h2 = T2H * easeOut((t - 6.1) / 1.6); c.bal = ease((t - 7.4) / .8); c.bridge = ease((t - 6.8) / 1.6);
+    c.jewel = backOut((t - 8.2) / .9);
+    c.flash = t > 8.2 ? Math.max(0, Math.sin(clamp((t - 8.2) / 2.2, 0, 1) * Math.PI)) : 0;
+    c.wins.forEach((w, i) => { w.pop = backOut((t - (w.tier === 1 ? 5.2 : 7.2) - i * .15) / .5); });
+    cOnce('m', t > 1.3, () => { S.munyu(); proj(0, 0, 0); sugarBurst(PX, PY, 14, ['#ffe27a', '#fff3b0', '#fff'], 120, 20); });
+    cOnce('p', t > 3.0, () => { S.paka(); proj(0, 0, 0); sugarBurst(PX, PY, 22, null, 220, 30); for (let i = 0; i < 10; i++) spawn('crumb', PX + rand(-40, 40), PY + rand(-10, 10), rand(-120, 120), -rand(80, 200), 1, rand(2, 4), G.flavor.c2, PY + rand(10, 40)); });
+    cOnce('a', t > 3.7, () => S.arp());
+    cOnce('w', t > 5.2, () => { for (let i = 0; i < 5; i++) setTimeout0(() => bell(scaleF(9 + i), .05, .7), i * .15); });
+    cOnce('j', t > 8.2, () => { S.bigBell(); const tw = c.towers[c.jewelTw]; proj(tw.x, tw.y, tw.h + tw.roofH + .12); sparkle(PX, PY, 16, '#fff6c0', 40); sugarBurst(PX, PY, 18, ['#ff7aa2', '#ffe27a', '#9ff0cf', '#c6a3ff', '#fff'], 200, 120); });
+    cOnce('b', t > 9.0, () => { prAct('joy', 1.4, 3); S.joy(); for (const b of birds) { b.flap = 1; } S.chirp(); });
+    if (t > 10.6) finishCastle();
+  }
+}
+function finishCastle() {
+  const c = castle; c.built = true; camK = 1; c.morph = 1; c.h1 = T1H; c.h2 = T2H; c.bal = 1; c.bridge = 1; c.jewel = 1; c.flash = 0;
+  G.act = 4; G.actT = 0;
+  for (const s of sweets) s.spr = null;
+  stairs = { steps: [], N: 13, done: false, lastX: 0 };
+  // ramp from bridge end to the gate
+  const bs = strokeById(c.bridgeSid);
+  if (bs) {
+    const a = bs.pts[0], b = bs.pts[bs.pts.length - 1]; const e = dist(a.x, a.y, 0, T1R) < dist(b.x, b.y, 0, T1R) ? a : b;
+    const s = strokeBegin('ground', e.x, e.y, 0); s.pre = false; const gx = 0, gy = T1R + .05; const d = dist(e.x, e.y, gx, gy); const n = Math.ceil(d / .028);
+    for (let i = 1; i <= n; i++) { const k = i / n; addPt(s, lerp(e.x, gx, k) + Math.sin(k * Math.PI) * .04, lerp(e.y, gy, k), .5); s.pts[s.pts.length - 1].t = T + k * .6; }
+    s.done = true; s.endT = T + .6; s.kind = 'ramp';
+  }
+  // princess goes to the stair base
+  const h = prHome(); const pts = []; if (pr.y < .3) pts.push({ x: Math.sign(pr.x || 1) * .86, y: .4, z: 0 }); pts.push({ x: h.x, y: h.y, z: 0 });
+  prWalkTo(pts, () => { prAct('peek', 1.2, 1); }, .35);
+  bag.goHome = true;
+}
+// geometry helpers
+function cylPath(x, y, z0, z1, r) {
+  proj(x, y, z0); const bx = PX, by = PY; proj(x, y, z1); const tx = PX, ty = PY; const rx = r * cam.R, ry = r * cam.R * cam.sq;
+  ctx.beginPath(); ctx.ellipse(bx, by, rx, ry, 0, 0, Math.PI); ctx.lineTo(tx - rx, ty); ctx.ellipse(tx, ty, rx, ry, 0, Math.PI, 0, true); ctx.closePath();
+  return [bx, by, tx, ty, rx, ry];
+}
+function drawCylinder(x, y, z0, z1, r, bands, topCol, opt) {
+  if (z1 - z0 < .002) return; const c = ctx; opt = opt || {};
+  // bands from top downward
+  let zt = z1; let i = 0;
+  while (zt > z0 + .0005 && i < 60) { const b = bands[i % bands.length]; const zb = Math.max(z0, zt - b[0]); cylPath(x, y, zb, zt, r); c.fillStyle = b[1]; c.fill(); zt = zb; i++; }
+  const g = cylPath(x, y, z0, z1, r);
+  c.fillStyle = linG(g[2] - g[4], 0, g[2] + g[4], 0, [[0, 'rgba(120,60,40,.28)'], [.28, 'rgba(255,255,255,.2)'], [.55, 'rgba(255,255,255,0)'], [1, 'rgba(110,50,40,.32)']]); c.fill();
+  // top
+  if (topCol) {
+    c.fillStyle = radG(g[2] - g[4] * .3, g[3] - g[5] * .3, 0, g[4] * 1.1, [[0, '#ffffff'], [1, topCol]]); ell(g[2], g[3], g[4], g[5]); c.fill();
+    if (opt.beads) { const n = Math.max(10, Math.round(r * 60)); for (let k = 0; k < n; k++) { const a = k / n * TAU; const bx = g[2] + Math.cos(a) * g[4], by = g[3] + Math.sin(a) * g[5]; c.fillStyle = '#fff'; circ(bx, by, g[4] * .07); c.fill(); c.fillStyle = 'rgba(200,120,140,.25)'; circ(bx + g[4] * .02, by + g[4] * .03, g[4] * .04); c.fill(); } }
+  }
+  return g;
+}
+function drawWindow(x, y, r, a, z, w, h, pop) {
+  if (pop <= 0) return; const sa = Math.sin(a); if (sa < .15) return;
+  proj(x + Math.cos(a) * r, y + sa * r, z); const sx = PX, sy = PY; const ww = w * cam.R * sa * pop, hh = h * cam.R * pop; const c = ctx;
+  c.fillStyle = '#fff6ee'; c.beginPath(); c.moveTo(sx - ww * .65, sy + hh * .5); c.lineTo(sx - ww * .65, sy - hh * .1); c.arc(sx, sy - hh * .1, ww * .65, Math.PI, 0); c.lineTo(sx + ww * .65, sy + hh * .5); c.closePath(); c.fill();
+  c.fillStyle = radG(sx - ww * .2, sy - hh * .2, 0, hh * .9, [[0, '#fff8d0'], [.4, '#ffc35a'], [1, '#e07a2a']]);
+  c.beginPath(); c.moveTo(sx - ww * .5, sy + hh * .42); c.lineTo(sx - ww * .5, sy - hh * .1); c.arc(sx, sy - hh * .1, ww * .5, Math.PI, 0); c.lineTo(sx + ww * .5, sy + hh * .42); c.closePath(); c.fill();
+  c.strokeStyle = 'rgba(255,240,220,.8)'; c.lineWidth = Math.max(.8, ww * .08); c.beginPath(); c.moveTo(sx, sy - hh * .55); c.lineTo(sx, sy + hh * .42); c.moveTo(sx - ww * .5, sy + hh * .1); c.lineTo(sx + ww * .5, sy + hh * .1); c.stroke();
+  c.fillStyle = 'rgba(255,255,255,.9)'; ell(sx - ww * .22, sy - hh * .2, ww * .1, hh * .1); c.fill();
+  c.globalCompositeOperation = 'lighter'; c.fillStyle = radG(sx, sy, 0, hh, [[0, 'rgba(255,200,120,.25)'], [1, 'rgba(255,200,120,0)']]); circ(sx, sy, hh); c.fill(); c.globalCompositeOperation = 'source-over';
+}
+function scallopRing(x, y, z, r, front, col, size) {
+  const c = ctx; const n = Math.max(12, Math.round(r * 70)); c.fillStyle = col || '#fff';
+  for (let k = 0; k < n; k++) { const a = k / n * TAU; const s = Math.sin(a); if (front === 1 && s < 0) continue; if (front === -1 && s >= 0) continue; proj(x + Math.cos(a) * r, y + s * r, z); circ(PX, PY, cam.R * (size || .016)); c.fill(); }
+}
+const TIER1_BANDS = [[.035, '#fff7f0'], [.07, '#f6cf86'], [.022, '#e8395a'], [.03, '#fffaf2'], [.075, '#f2c477'], [.022, '#ff6f91'], [.03, '#fffaf2'], [.08, '#f6cf86']];
+const TIER2_BANDS = [[.03, '#ffe3ee'], [.07, '#f6cf86'], [.02, '#e8395a'], [.03, '#fff3f8'], [.07, '#f2c477'], [.02, '#ff9fbf'], [.03, '#fffaf2']];
+function drawHoleAndCrack() {
+  const c = castle; if (!c) return; const cx = ctx;
+  if (c.open > 0) {
+    proj(0, 0, 0); const rx = HOLE * cam.R * (.6 + .4 * c.open), ry = rx * cam.sq;
+    cx.fillStyle = radG(PX, PY, 0, rx, [[0, '#fff3b0'], [.6, '#ffd35a'], [1, '#d99a2a']]); ell(PX, PY, rx, ry); cx.fill();
+    cx.globalCompositeOperation = 'lighter'; cx.fillStyle = radG(PX, PY, 0, rx * 1.4, [[0, 'rgba(255,230,140,.4)'], [1, 'rgba(255,230,140,0)']]); ell(PX, PY - rx * .2, rx * 1.4, rx); cx.fill(); cx.globalCompositeOperation = 'source-over';
+  }
+  if (c.crack > 0 && c.open < 1) {
+    cx.globalAlpha = 1 - c.open; const n = c.crackPts.length; const m = Math.floor(n / 2);
+    cx.lineCap = 'round'; cx.lineJoin = 'round';
+    for (const pass of [0, 1]) {
+      cx.strokeStyle = pass ? '#ffe27a' : 'rgba(80,35,10,.75)'; cx.lineWidth = cam.R * (pass ? .008 + c.bulge * .02 : .018 + c.bulge * .02);
+      cx.beginPath(); for (let i = 0; i < n; i++) { const p = c.crackPts[i]; if (Math.abs(p.t) > c.crack) continue; proj(p.x, p.y, 0); cx.lineTo(PX, PY); } cx.stroke();
+    }
+    void m;
+    cx.globalAlpha = 1;
+  }
+  if (c.bulge > 0 && c.open < 1) {
+    const w = 1 + Math.sin(T * 9) * .06 * (1 - c.open); proj(0, 0, 0); const r = cam.R * .16 * easeOut(c.bulge) * w * (1 - c.open * .5);
+    cx.fillStyle = radG(PX - r * .3, PY - r * .7, r * .1, r * 1.2, [[0, '#fffbe0'], [.45, '#ffd95a'], [1, '#e8a02a']], PX, PY - r * .3);
+    cx.beginPath(); cx.ellipse(PX, PY, r, r * cam.sq, 0, 0, Math.PI); cx.bezierCurveTo(PX - r, PY - r * 1.3, PX + r, PY - r * 1.3, PX + r, PY); cx.fill();
+    cx.fillStyle = 'rgba(255,255,255,.85)'; ell(PX - r * .3, PY - r * .7, r * .22, r * .12); cx.fill();
+  }
+}
+// wedge (flat cookie piece) -> cone roof
+function wedgePt(w, rr, ph, out) {
+  const c = castle; const tw = c.towers[w.tw]; const k = w.k;
+  const slide = .1 * c.open; const mid = w.a + Math.PI / 4;
+  const fx = Math.cos(ph) * rr + Math.cos(mid) * slide, fy = Math.sin(ph) * rr + Math.sin(mid) * slide, fz = .01 + .03 * c.open;
+  const topZ = tw.h * tw.grow; const rb = tw.r * 1.3; const psi = (ph - w.a) / (Math.PI / 2) * Math.PI;
+  const bx = tw.x + Math.cos(psi) * rb, by = tw.y + Math.sin(psi) * rb; const ax = tw.x, ay = tw.y, az = topZ + tw.roofH;
+  const f = rr / HOLE; const tx = lerp(ax, bx, f), ty = lerp(ay, by, f), tz = lerp(az, topZ, f);
+  out.x = lerp(fx, tx, k); out.y = lerp(fy, ty, k); out.z = lerp(fz, tz, k) + Math.sin(k * Math.PI) * .45;
+  return out;
+}
+const WP = { x: 0, y: 0, z: 0 };
+function drawWedge(w) {
+  const c = ctx; const F = G.flavor; const N = 10; const tw = castle.towers[w.tw];
+  c.beginPath(); wedgePt(w, 0, w.a, WP); proj(WP.x, WP.y, WP.z); c.moveTo(PX, PY); const ax = PX, ay = PY;
+  let lx = 0, rx = 0;
+  for (let i = 0; i <= N; i++) { const ph = w.a + i / N * Math.PI / 2; wedgePt(w, HOLE, ph, WP); proj(WP.x, WP.y, WP.z); c.lineTo(PX, PY); if (i === 0) rx = PX; if (i === N) lx = PX; }
+  c.closePath();
+  c.fillStyle = linG(Math.min(lx, rx), 0, Math.max(lx, rx) + 1, 0, [[0, F.c0], [.5, F.c1], [1, F.c3]]); c.fill();
+  c.lineWidth = Math.max(1, cam.R * .006); c.strokeStyle = rgbS(F.dk, .5); c.stroke();
+  // sugar dots
+  const rr = mulberry(w.a * 1000 | 0); c.fillStyle = 'rgba(255,255,255,.9)';
+  for (let i = 0; i < 14; i++) { const r0 = Math.sqrt(rr()) * HOLE * .9, ph = w.a + rr() * Math.PI / 2; wedgePt(w, r0, ph, WP); proj(WP.x, WP.y, WP.z); c.fillRect(PX - 1, PY - 1, 2, 2); }
+  if (w.k > .98) {
+    // cream ring + candy on apex
+    const topZ = tw.h * tw.grow; scallopRing(tw.x, tw.y, topZ, tw.r * 1.3, 1, '#fff', .02);
+    proj(tw.x, tw.y, topZ + tw.roofH); const s = cam.R * .022;
+    if (castle.jewelTw === w.tw) drawTopJewel(PX, PY);
+    else if (castle.crownTw === w.tw) drawCandyCrown(PX, PY, s);
+    else { c.fillStyle = radG(PX - s * .3, PY - s * .3, 0, s, [[0, '#fff'], [.4, rgbS(tw.roofCol)], [1, rgbS(deepen(tw.roofCol))]]); circ(PX, PY - s * .6, s); c.fill(); }
+  }
+  void ax; void ay;
+}
+function drawTopJewel(x, y) {
+  const j = castle.jewel; if (j <= 0) return; const s = cam.R * .05 * j; const c = ctx; const bob = Math.sin(T * 2) * s * .15;
+  c.globalCompositeOperation = 'lighter'; c.fillStyle = radG(x, y - s * 1.2, 0, s * 3, [[0, 'rgba(255,200,220,.45)'], [1, 'rgba(255,200,220,0)']]); circ(x, y - s * 1.2, s * 3); c.fill(); c.globalCompositeOperation = 'source-over';
+  const o = { gold: false, seed: 7, leafRot: .5 }; c.save(); c.translate(x, y + bob); drawBerryShape(o, s, 1); c.restore();
+  c.fillStyle = 'rgba(255,255,255,.9)'; starPath(x + s * .5, y - s * 1.6 + bob, s * .35 * (1 + Math.sin(T * 5) * .3), 4, .3, T); c.fill();
+}
+function drawCandyCrown(x, y, s) {
+  const c = ctx; const cols = ['#ff7aa2', '#ffe27a', '#9ff0cf', '#9fd2ff', '#c6a3ff'];
+  for (let k = 0; k < 5; k++) { const xx = x + (k - 2) * s * .7; c.fillStyle = cols[k]; c.beginPath(); c.moveTo(xx - s * .35, y); c.lineTo(xx, y - s * 1.6); c.lineTo(xx + s * .35, y); c.fill(); c.fillStyle = '#fff'; circ(xx, y - s * 1.6, s * .2); c.fill(); }
+  c.fillStyle = '#ffd86b'; c.fillRect(x - s * 1.8, y - s * .2, s * 3.6, s * .5);
+}
+function drawTower(tw) {
+  if (tw.grow <= 0) return; const z1 = tw.h * tw.grow;
+  const bands = [[.03, '#fffaf4'], [.09, '#f6cf86'], [.025, rgbS(tw.stripe)], [.09, '#f2c477'], [.025, '#fffaf2']];
+  drawCylinder(tw.x, tw.y, 0, z1, tw.r, bands, '#fff6ee');
+  scallopRing(tw.x, tw.y, z1, tw.r, 1, '#fff', .013);
+  if (tw.win) drawWindow(tw.x, tw.y, tw.r, Math.PI / 2, z1 * .6, .045, .07, clamp(tw.grow * 2 - 1, 0, 1));
+  else drawWindow(tw.x, tw.y, tw.r, Math.PI / 2 + (tw.x > 0 ? -.5 : .5), z1 * .55, .04, .06, clamp(tw.grow * 2 - 1, 0, 1));
+}
+function drawTier1() {
+  const c = castle; if (c.h1 <= .001) return;
+  drawCylinder(0, 0, 0, c.h1, T1R, TIER1_BANDS, '#fff3f6', { beads: true });
+  for (const w of c.wins) if (w.tier === 1) drawWindow(0, 0, T1R, w.a, c.h1 * w.z, .055, .085, w.pop);
+  // gate door
+  if (c.h1 > .15) {
+    proj(0, T1R, 0); const sx = PX, sy = PY, ww = cam.R * .07, hh = cam.R * .13 * clamp((c.h1 - .15) / .1, 0, 1); const cx = ctx;
+    cx.fillStyle = '#fff6ee'; cx.beginPath(); cx.moveTo(sx - ww * 1.2, sy); cx.lineTo(sx - ww * 1.2, sy - hh); cx.arc(sx, sy - hh, ww * 1.2, Math.PI, 0); cx.lineTo(sx + ww * 1.2, sy); cx.fill();
+    cx.fillStyle = linG(0, sy - hh * 1.5, 0, sy, [[0, '#a8603a'], [1, '#6e3a1e']]); cx.beginPath(); cx.moveTo(sx - ww, sy); cx.lineTo(sx - ww, sy - hh); cx.arc(sx, sy - hh, ww, Math.PI, 0); cx.lineTo(sx + ww, sy); cx.fill();
+    cx.fillStyle = '#ffd86b'; circ(sx + ww * .5, sy - hh * .5, ww * .14); cx.fill();
+    cx.fillStyle = '#ff7aa2'; heartPath(sx, sy - hh * 1.2, ww * .35); cx.fill();
+  }
+  for (const s of strokes) if (s.pre) drawStrokeLive(s, 2);
+}
+function drawTier2() {
+  const c = castle; if (c.h2 <= .001) return;
+  drawCylinder(0, 0, c.h1, c.h1 + c.h2, T2R, TIER2_BANDS, '#fff8fb', { beads: true });
+  for (const w of c.wins) if (w.tier === 2) drawWindow(0, 0, T2R, w.a, c.h1 + c.h2 * w.z, .045, .07, w.pop);
+}
+function drawRail(front) {
+  const c = castle; if (c.bal <= 0) return; const z = c.h1 + c.h2, hgt = .06 * c.bal; const r = T2R * .97;
+  const cx = ctx; cx.strokeStyle = '#fffaf5'; cx.lineWidth = Math.max(1, cam.R * .007); cx.lineCap = 'round';
+  const n = 22; cx.beginPath();
+  for (let k = 0; k < n; k++) { const a = k / n * TAU; const s = Math.sin(a); if ((front && s < 0) || (!front && s >= 0)) continue; proj(Math.cos(a) * r, s * r, z); cx.moveTo(PX, PY); proj(Math.cos(a) * r, s * r, z + hgt); cx.lineTo(PX, PY); }
+  cx.stroke();
+  proj(0, 0, z + hgt); const rx = r * cam.R, ry = r * cam.R * cam.sq;
+  cx.lineWidth = Math.max(1.5, cam.R * .011); cx.strokeStyle = '#efe2dc'; cx.beginPath(); cx.ellipse(PX, PY, rx, ry, 0, front ? 0 : Math.PI, front ? Math.PI : TAU); cx.stroke();
+  cx.lineWidth = Math.max(1, cam.R * .007); cx.strokeStyle = '#fff'; cx.stroke();
+  for (let k = 0; k < n; k++) { const a = k / n * TAU; const s = Math.sin(a); if ((front && s < 0) || (!front && s >= 0)) continue; proj(Math.cos(a) * r, s * r, z + hgt); cx.fillStyle = '#fff'; circ(PX, PY, cam.R * .009); cx.fill(); }
+}
+// ---- tea set on the balcony ----
+const TEA = { plate: { x: .07, y: .07 }, cup: { x: -.13, y: .1 }, pot: { x: .13, y: -.1 }, prSpot: { x: -.1, y: -.08 } };
+function drawTeaSet() {
+  const c = castle; if (c.bal <= 0) return; const z = c.h1 + c.h2; const cx = ctx; const u = cam.R * .001 * c.bal;
+  const tea = G.tea;
+  // teapot
+  {
+    proj(TEA.pot.x, TEA.pot.y, z); const x = PX, y = PY; const s = u * 42;
+    const tilt = tea && tea.pour > 0 ? Math.sin(Math.min(1, tea.pour) * Math.PI) * -.6 : 0;
+    cx.save(); cx.translate(x, y); cx.rotate(tilt);
+    cx.fillStyle = 'rgba(110,45,25,.18)'; ell(0, 0, s * .9, s * .3); cx.fill();
+    cx.strokeStyle = '#ffd0de'; cx.lineWidth = s * .12; cx.beginPath(); cx.arc(s * .75, -s * .55, s * .3, -1.4, 1.4); cx.stroke();
+    cx.fillStyle = '#fff'; cx.beginPath(); cx.moveTo(-s * .6, -s * .6); cx.quadraticCurveTo(-s * 1.1, -s * .9, -s * 1.15, -s * 1.15); cx.lineTo(-s * 1.0, -s * 1.1); cx.quadraticCurveTo(-s * .8, -s * .7, -s * .5, -s * .4); cx.fill();
+    cx.fillStyle = radG(-s * .3, -s * .8, s * .1, s * 1, [[0, '#ffffff'], [1, '#f2dbe6']], 0, -s * .55); ell(0, -s * .55, s * .7, s * .55); cx.fill();
+    cx.fillStyle = '#ff9fbf'; ell(0, -s * .55, s * .7, s * .12); cx.fill(); heartPath(0, -s * .62, s * .14); cx.fillStyle = '#ff6f9a'; cx.fill();
+    cx.fillStyle = '#ffd0de'; ell(0, -s * 1.05, s * .35, s * .1); cx.fill(); cx.fillStyle = '#ff7aa2'; circ(0, -s * 1.15, s * .1); cx.fill();
+    cx.restore();
+    TEA.potS = [x, y - s * .6, s];
+  }
+  // cake plate (stand)
+  {
+    proj(TEA.plate.x, TEA.plate.y, z); const x = PX, y = PY; const s = u * 60;
+    cx.fillStyle = 'rgba(110,45,25,.15)'; ell(x, y, s * .5, s * .15); cx.fill();
+    cx.fillStyle = '#f6eef4'; cx.fillRect(x - s * .05, y - s * .25, s * .1, s * .25);
+    cx.fillStyle = radG(x - s * .2, y - s * .3, 0, s * .9, [[0, '#fff'], [1, '#ecdce6']]); ell(x, y - s * .25, s * .7, s * .2); cx.fill();
+    cx.strokeStyle = '#ffb3cc'; cx.lineWidth = s * .03; ell(x, y - s * .25, s * .6, s * .16); cx.stroke();
+    TEA.plateS = [x, y - s * .25, s];
+  }
+}
+function drawCup() {
+  const c = castle; if (c.bal <= 0) return; const z = c.h1 + c.h2; const cx = ctx; const u = cam.R * .001 * c.bal; const tea = G.tea;
+  proj(TEA.cup.x, TEA.cup.y, z); const x = PX, y = PY; const s = u * 26;
+  cx.fillStyle = 'rgba(110,45,25,.15)'; ell(x, y, s * .9, s * .3); cx.fill();
+  cx.fillStyle = '#fff'; ell(x, y, s * .85, s * .26); cx.fill();
+  cx.strokeStyle = '#fff'; cx.lineWidth = s * .14; cx.beginPath(); cx.arc(x + s * .6, y - s * .5, s * .22, -1.5, 1.5); cx.stroke();
+  cx.fillStyle = linG(x - s * .6, 0, x + s * .6, 0, [[0, '#f4e4ec'], [.4, '#ffffff'], [1, '#e8d2dc']]); cx.beginPath(); cx.moveTo(x - s * .6, y - s * .85); cx.quadraticCurveTo(x - s * .55, y - s * .05, x, y - s * .05); cx.quadraticCurveTo(x + s * .55, y - s * .05, x + s * .6, y - s * .85); cx.fill();
+  cx.fillStyle = '#ffb3cc'; cx.fillRect(x - s * .58, y - s * .65, s * 1.16, s * .08);
+  const lvl = tea ? tea.level : 0; cx.fillStyle = '#fff'; ell(x, y - s * .85, s * .6, s * .18); cx.fill();
+  if (lvl > 0) { cx.fillStyle = radG(x - s * .2, y - s * .9, 0, s * .6, [[0, '#ffc0d0'], [1, '#ff5a84']]); ell(x, y - s * .85 + s * .05 * (1 - lvl), s * .5 * (.7 + .3 * lvl), s * .14); cx.fill(); }
+  TEA.cupS = [x, y - s * .85, s];
+  // pouring stream
+  if (tea && tea.pour > .25 && tea.pour < .85 && TEA.potS) {
+    const p = TEA.potS; const sx = p[0] - p[2] * 1.05, sy = p[1] - p[2] * .45; cx.strokeStyle = 'rgba(255,110,150,.8)'; cx.lineWidth = s * .14;
+    cx.beginPath(); cx.moveTo(sx, sy); cx.quadraticCurveTo((sx + x) / 2, Math.min(sy, y) - s * .8, x, y - s * .85); cx.stroke();
+  }
+}
+function drawBellTop() {
+  const b = G.tea && G.tea.bellT; if (!b) return; const c = castle; const z = c.h1 + c.h2 + .26;
+  proj(.0, -.05, z); const x = PX, y = PY; const s = cam.R * .045 * clamp((T - b) / .4, 0, 1); const sw = Math.sin((T - (G.tea.ring || 0)) * 10) * Math.exp(-(T - (G.tea.ring || 0)) * 1.5) * .5;
+  const cx = ctx; cx.strokeStyle = '#fff'; cx.lineWidth = s * .12; cx.beginPath(); proj(0, -.05, c.h1 + c.h2 + .06); cx.moveTo(PX, PY); cx.lineTo(x, y - s * .8); cx.stroke();
+  cx.save(); cx.translate(x, y - s * .8); cx.rotate(sw);
+  cx.fillStyle = linG(-s, 0, s, 0, [[0, '#e0a020'], [.35, '#fff3b0'], [1, '#c88a10']]); cx.beginPath(); cx.moveTo(-s * .2, 0); cx.quadraticCurveTo(-s * .8, s * .2, -s * .9, s * 1.3); cx.lineTo(s * .9, s * 1.3); cx.quadraticCurveTo(s * .8, s * .2, s * .2, 0); cx.closePath(); cx.fill();
+  cx.fillStyle = '#ff7aa2'; circ(0, s * 1.4, s * .2); cx.fill(); cx.fillStyle = '#ff9fbf'; ell(0, s * .05, s * .4, s * .15); cx.fill();
+  cx.restore(); G.tea.bellS = [x, y, s];
+}
+// ---- stairs ----
+function stepPos(j, x) { const f = j / (stairs.N - 1); return { x, y: lerp(.7, .3, f), z: f * (ZTOP - .02) }; }
+function addStep(xw) {
+  if (!stairs || stairs.done) return; const j = stairs.steps.length;
+  const tx = clamp(xw, -.2, .2); const x = j ? clamp(lerp(stairs.lastX, tx, .5), stairs.lastX - .06, stairs.lastX + .06) : tx * .5; stairs.lastX = x;
+  const p = stepPos(j, x); p.tb = T; p.col = palAt(G.pal, j * .13 + rand(.05)); p.berry = j % 3 === 1; stairs.steps.push(p);
+  S.step(j); proj(p.x, p.y, p.z); sugarBurst(PX, PY, 5, null, 90, 12); sparkle(PX, PY - 6, 2);
+  G.score += .5;
+  if (stairs.steps.length >= stairs.N) {
+    stairs.done = true; setTimeout0(() => { S.flower(); proj(0, .3, ZTOP); sparkle(PX, PY, 10, '#fff6c0', 30); }, .3);
+  }
+}
+function stairTopScreen() { const j = stairs.steps.length; const p = j ? stairs.steps[j - 1] : { x: 0, y: .78, z: 0 }; proj(p.x, p.y, p.z); return [PX, PY]; }
+function drawStep(p, j) {
+  const g = backOut((T - p.tb) / .45); if (g <= 0) return; const c = ctx;
+  const w = .2 * g, d = .085 * g, th = .045;
+  const corners = [[-w / 2, -d / 2], [w / 2, -d / 2], [w / 2, d / 2], [-w / 2, d / 2]];
+  // support lace column (thin)
+  c.strokeStyle = 'rgba(255,250,245,.75)'; c.lineWidth = Math.max(1, cam.R * .006); c.beginPath(); proj(p.x, p.y, p.z - th); c.moveTo(PX, PY); proj(p.x, p.y, Math.max(0, p.z - .12)); c.lineTo(PX, PY); c.stroke();
+  // front face
+  c.beginPath(); proj(p.x - w / 2, p.y + d / 2, p.z); c.moveTo(PX, PY); proj(p.x + w / 2, p.y + d / 2, p.z); c.lineTo(PX, PY); proj(p.x + w / 2, p.y + d / 2, p.z - th); c.lineTo(PX, PY); proj(p.x - w / 2, p.y + d / 2, p.z - th); c.lineTo(PX, PY); c.closePath();
+  c.fillStyle = rgbS(mix(p.col, [200, 120, 130], .25)); c.fill();
+  // top face
+  c.beginPath(); for (const k of corners) { proj(p.x + k[0], p.y + k[1], p.z); c.lineTo(PX, PY); } c.closePath();
+  c.fillStyle = rgbS(mix(p.col, WHITE, .35)); c.fill(); c.strokeStyle = 'rgba(255,255,255,.8)'; c.lineWidth = 1; c.stroke();
+  // lace scallops on the front edge
+  c.fillStyle = '#fff'; for (let k = 0; k < 6; k++) { proj(p.x - w / 2 + (k + .5) / 6 * w, p.y + d / 2, p.z - th); circ(PX, PY, cam.R * .009); c.fill(); }
+  // rail post + rail
+  c.strokeStyle = '#fffaf5'; c.lineWidth = Math.max(1, cam.R * .006); c.beginPath(); proj(p.x + w / 2, p.y, p.z); c.moveTo(PX, PY); proj(p.x + w / 2, p.y, p.z + .07); c.lineTo(PX, PY); c.stroke();
+  const q = stairs.steps[j - 1]; if (q) { c.lineWidth = Math.max(1.5, cam.R * .009); c.beginPath(); proj(q.x + .1, q.y, q.z + .07); c.moveTo(PX, PY); proj(p.x + w / 2, p.y, p.z + .07); c.lineTo(PX, PY); c.stroke(); }
+  proj(p.x + w / 2, p.y, p.z + .07); c.fillStyle = '#fff'; circ(PX, PY, cam.R * .01); c.fill();
+  if (p.berry) { proj(p.x - w * .3, p.y, p.z); c.save(); c.translate(PX, PY); drawBerryShape({ seed: j, leafRot: j, gold: false }, cam.R * .02, 1); c.restore(); }
+}
+function drawStairHint() {
+  if (!stairs || stairs.done || G.act < 4) return; const j = stairs.steps.length; const p = stepPos(j, stairs.lastX); proj(p.x, p.y, p.z);
+  const pul = .5 + .5 * Math.sin(T * 4); const r = cam.R * (.05 + .012 * pul); const c = ctx;
+  c.globalCompositeOperation = 'lighter'; c.fillStyle = radG(PX, PY, 0, r * 2, [[0, 'rgba(255,240,200,.55)'], [1, 'rgba(255,240,200,0)']]); ell(PX, PY, r * 2, r * 1.3); c.fill(); c.globalCompositeOperation = 'source-over';
+  c.globalAlpha = .55 + .3 * pul; dollop(PX, PY, r * .8, palAt(G.pal, j * .13)); c.globalAlpha = 1;
+}
+// ---- tea party ----
+function updTea(dt) {
+  if (!castle || !castle.built) return;
+  const tea = G.tea; if (!tea) return; tea.t += dt; const t = tea.t;
+  if (tea.pour > 0) { tea.pour += dt / 2.2; if (tea.pour > .35 && tea.pour < .85) tea.level = Math.min(1, tea.level + dt * .9); if (tea.pour >= 1) tea.pour = 0; }
+  if (tea.level > .3 && rand() < dt * 2.2 && TEA.cupS) spawn('heart', TEA.cupS[0] + rand(-4, 4), TEA.cupS[1] - 4, 0, -rand(22, 34), rand(1.4, 2), rand(4, 6.5), pick(['#ff9cc0', '#ffb3d0', '#ffffff']));
+  if (!tea.birds && t > 1.5) { tea.birds = true; callBirds(); }
+  if (!tea.poured && t > 3.5) { tea.poured = true; teaPour(); music.on = true; music.next = 0; }
+  if (!tea.bellT && t > 6.5) { tea.bellT = T; setTimeout0(ringBell, .5); }
+  if (t > 8 && T > (tea.nextFw || 0)) { tea.nextFw = T + (tea.fwN < 4 ? .7 : rand(6, 10)); tea.fwN = (tea.fwN || 0) + 1; firework(); }
+  // princess snack / sip loop
+  if (pr.where === 'balcony' && !prBusy() && T > (tea.nextSnack || 0)) {
+    tea.nextSnack = T + rand(7, 11);
+    const s = sweets.find(o => o.tea && !o.gone && !o.held && sweetDone(o));
+    if (s && !pr.plate) { s.held = true; givePrincess(s, true); }
+    else if (tea.level > .3) { prAct('sip', 1.6, 1); setTimeout0(() => { tea.level = Math.max(0, tea.level - .4); heartsAt(pr.headX, pr.headY - 10, 2); S.giggle(); }, .9); }
+  }
+  if (tea.level < .2 && !tea.pour && t > 10 && rand() < dt * .3) teaPour();
+  // after a while of party, offer the next dough
+  if (!G.dough && t > 26) spawnDough();
+}
+function startTea() { if (G.tea) return; G.tea = { t: 0, pour: 0, level: 0, birds: false, poured: false, bellT: 0, ring: 0, fwN: 0, nextSnack: T + 1 }; }
+function teaPour() { if (!G.tea) return; G.tea.pour = .001; S.pour(); }
+function ringBell() { if (!G.tea) return; G.tea.ring = T; S.bigBell(); if (G.tea.bellS) sparkle(G.tea.bellS[0], G.tea.bellS[1], 6, '#fff6c0', 20); setTimeout0(firework, .6); }
+function callBirds() {
+  const n = 2 + Math.floor(rand(3)); const z = ZTOP;
+  for (let i = 0; i < n; i++) {
+    const b = newBird(pick(BIRD_COLS), false); const side = i % 2 ? 1 : -1; b.x = side * 1.6; b.y = -1.3 + rand(.4); b.z = 1.2; birds.push(b);
+    const a = (i % 2 ? .25 : 2.9) + (i >> 1) * .45 * (i % 2 ? 1 : -1); const rr = T2R * .97;
+    setTimeout0(() => birdFly(b, Math.cos(a) * rr, Math.sin(a) * rr, z + .06, () => { b.st = 'perch'; b.perch = true; S.chirp(); }), i * .4);
+  }
+  for (const b of birds) if (!b.perch && b.st !== 'fly' && b.alive && birds.indexOf(b) === 0) { const a = 1.9; birdFly(b, Math.cos(a) * T2R * .97, Math.sin(a) * T2R * .97, z + .06, () => { b.st = 'perch'; b.perch = true; }); }
+}
+function firework() {
+  if (!castle) return; const tw = pick(castle.towers); proj(tw.x, tw.y, tw.h + tw.roofH + .3 + rand(.2)); const x = PX + rand(-20, 20), y = PY - rand(20, 60);
+  const cols = [pick(['#ff7aa2', '#ff9fbf', '#ffb3d0']), pick(['#ffe27a', '#fff3b0']), pick(['#9ff0cf', '#9fd2ff', '#c6a3ff']), '#ffffff'];
+  const n = 26; for (let i = 0; i < n; i++) { const a = i / n * TAU; const sp = rand(70, 110); spawn('fw', x, y, Math.cos(a) * sp, Math.sin(a) * sp, rand(1.1, 1.6), rand(2.2, 3.4), cols[i % cols.length]); }
+  for (let i = 0; i < 6; i++) { const a = i / 6 * TAU; spawn('spark', x + Math.cos(a) * 14, y + Math.sin(a) * 14, Math.cos(a) * 30, Math.sin(a) * 30, .9, 6, '#fff'); }
+  S.firework();
+}
+// ---- dough / next cycle ----
+function spawnDough() {
+  const nf = 1 + Math.floor(rand(3)); const next = (G.cycle === 0) ? nf : (FLAVORS.indexOf(G.flavor) + nf) % FLAVORS.length || 1;
+  G.dough = { t: 0, x: L.portrait ? .55 : .95, y: L.portrait ? 1.05 : .9, fx: .3, fy: .38, flavor: FLAVORS[next], wob: 0 };
+  S.munyu();
+}
+function doughScreen() { const d = G.dough; const k = easeInOut(d.t / 2); proj(lerp(d.fx, d.x, k), lerp(d.fy, d.y, k), 0); return [PX, PY, cam.R * .2 * (.4 + .6 * k)]; }
+function drawDough() {
+  const d = G.dough; if (!d || G.trans) return; const p = doughScreen(); const c = ctx; const F = d.flavor;
+  const w = 1 + Math.sin(T * 3) * .04 + d.wob * Math.sin(T * 25) * .1; const r = p[2];
+  if (d.t > 2) { const pul = .5 + .5 * Math.sin(T * 3.5); c.globalCompositeOperation = 'lighter'; c.fillStyle = radG(p[0], p[1], 0, r * 2.2, [[0, `rgba(255,240,200,${.35 + .25 * pul})`], [1, 'rgba(255,240,200,0)']]); ell(p[0], p[1] - r * .2, r * 2.2, r * 1.5); c.fill(); c.globalCompositeOperation = 'source-over'; }
+  c.fillStyle = 'rgba(110,45,25,.2)'; ell(p[0] + r * .1, p[1] + r * .15, r * 1.1, r * .4); c.fill();
+  c.fillStyle = radG(p[0] - r * .3, p[1] - r * .55, r * .1, r * 1.3, [[0, '#fffaf0'], [.4, F.c0], [1, F.c2]], p[0], p[1] - r * .3);
+  c.beginPath(); c.ellipse(p[0], p[1], r * w, r * .42 / w, 0, 0, Math.PI); c.bezierCurveTo(p[0] - r * w, p[1] - r * .9 / w, p[0] + r * w, p[1] - r * .9 / w, p[0] + r * w, p[1]); c.fill();
+  c.fillStyle = 'rgba(255,255,255,.7)'; ell(p[0] - r * .35, p[1] - r * .5, r * .25, r * .1); c.fill();
+  const rr = mulberry(9); c.fillStyle = rgbS(F.dk, .6); for (let i = 0; i < 6; i++) { circ(p[0] + (rr() - .5) * r * 1.4, p[1] - r * (.1 + rr() * .4), r * .05); c.fill(); }
+}
+function startTransition() {
+  if (G.trans || !G.dough) return;
+  const snap = snapshotCastle(); const d = G.dough; const ds = doughScreen();
+  G.trans = { t: 0, snap, from: { x: snap.x, y: snap.y, w: snap.w, h: snap.h }, to: miniSlot(minis.length), dx: ds[0], dy: ds[1], prFrom: { x: pr.sx, y: pr.sy } };
+  // new cycle data
+  G.cycle++; G.flavor = d.flavor; G.pal = pick(CREAM_PALS); G.cookieSeed = Math.floor(rand(1e9)); ROOT = pick([523.25, 587.33, 493.88, 554.37, 440]);
+  G.hair = pick(HAIRS);
+  strokes = []; branches = []; sweets = []; arches = []; footprints = []; butterflies = []; grid.clear(); bakeLog.length = 0; totalPts = 0;
+  castle = null; stairs = null; G.tea = null; G.dough = null; music.on = false;
+  G.act = 1; G.actT = 0; G.score = 0; G.feeds = 0; G.arches = 0; G.flowers = 0; G.paths = 0; G.act1Evt = 0;
+  for (const k in G.demoDone) delete G.demoDone[k];
+  camK = 0; updCam(); buildTextures(true);
+  pr.path = null; pr.plate = null; pr.eatT = 0; pr.where = 'ground'; pr.act = null; pr.hidden = true;
+  const keep = birds.filter(b => b.alive).slice(0, 1); birds = keep.length ? keep : [newBird(null, true)];
+  const b0 = birds[0]; Object.assign(b0, newBird(b0.col, true));
+  if (rand() < .5) { const b = newBird(null, false); b.st = 'peek'; const a = L.birdAng + .5; b.x = Math.cos(a); b.y = Math.sin(a); b.z = -.1; birds.push(b); }
+  bag.goHome = true; bag.restW = null;
+  S.paka(); setTimeout0(() => S.arp(), .4);
+}
+function miniSlot(i) {
+  const k = i % 3; const w = L.portrait ? W * .26 : W * .16; const h = w * .9;
+  if (L.portrait) return { x: 10 + k * (w + 8), y: 10, w, h };
+  return { x: 14, y: 14 + k * (h + 6), w, h };
+}
+function snapshotCastle() {
+  const x0 = cam.cx - cam.R * 1.15, x1 = cam.cx + cam.R * 1.15, y0 = cam.cy - cam.R * (1.45 * cam.hz + .2), y1 = cam.cy + cam.R * (cam.sq * 1.05 + .12);
+  const w = x1 - x0, h = y1 - y0; const f = Math.min(1, 520 / w);
+  const can = mkCanvas(w * f, h * f); const old = ctx; ctx = can.getContext('2d');
+  ctx.setTransform(f, 0, 0, f, -x0 * f, -y0 * f);
+  const oD = DPR; DPR = f; ctx.setTransform(DPR, 0, 0, DPR, -x0 * f, -y0 * f);
+  // render world into snapshot with translated transform: temporarily shift camera
+  const ocx = cam.cx, ocy = cam.cy; cam.cx -= x0; cam.cy -= y0; ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  try { renderWorld(true); } catch (e) { }
+  cam.cx = ocx; cam.cy = ocy; DPR = oD; ctx = old;
+  return { img: can, x: x0, y: y0, w, h };
+}
+function updTransition(dt) {
+  const tr = G.trans; if (!tr) return; tr.t += dt; const k = easeInOut(tr.t / 2.6);
+  if (tr.t > 1.4 && pr.hidden) { pr.hidden = false; const h = prHome(); pr.x = h.x; pr.y = h.y; pr.z = 0; pr.hop = 0; prAct('joy', 1.2, 2); S.joy(); proj(pr.x, pr.y, 0); sparkle(PX, PY - 30, 8, '#fff6c0', 30); }
+  if (tr.t > 2.8) { minis.push({ img: tr.snap.img, x: tr.to.x, y: tr.to.y, w: tr.to.w, h: tr.to.h, slot: minis.length }); if (minis.length > 3) minis.shift(); minis.forEach((m, i) => Object.assign(m, miniSlot(i))); G.trans = null; }
+  void k;
+}
+function drawTransition() {
+  const tr = G.trans; const k = easeInOut(tr.t / 2.4); const c = ctx;
+  const g = easeOut(clamp((tr.t - .3) / 2.1, 0, 1)); const s = lerp(.15, 1, g) * (1 + Math.sin(tr.t * 14) * .03 * (1 - g));
+  const o = { cx: cam.cx, cy: cam.cy, R: cam.R };
+  cam.cx = lerp(tr.dx, o.cx, g); cam.cy = lerp(tr.dy, o.cy, g); cam.R = o.R * s; drawCookie(); cam.cx = o.cx; cam.cy = o.cy; cam.R = o.R;
+  const f = tr.from, t = tr.to; const x = lerp(f.x, t.x, k), y = lerp(f.y, t.y, k), w = lerp(f.w, t.w, k), h = lerp(f.h, t.h, k);
+  c.drawImage(tr.snap.img, x, y, w, h);
+  if (tr.t > 1.6) for (const b of birds) { birdScreen(b); drawBird(b); }
+}
+function drawMinis() {
+  for (const m of minis) {
+    const bob = Math.sin(T * .8 + m.slot) * 1.5; const c = ctx;
+    c.fillStyle = 'rgba(110,45,25,.12)'; ell(m.x + m.w / 2, m.y + m.h * .93, m.w * .45, m.h * .08); c.fill();
+    c.globalAlpha = .92; c.drawImage(m.img, m.x, m.y + bob, m.w, m.h); c.globalAlpha = 1;
+  }
+}
+// ================= piping bag =================
+const bag = { tipX: 0, tipY: 0, vx: 0, vy: 0, ang: -Math.PI / 2, angV: 0, drag: false, fx: 0, fy: 0, offX: 0, offY: -60, press: 0, bead: .4, wob: 0, hop: 0, restW: null, releaseT: -99, goHome: false, stroke: null, sm: null, plane: null, z: 0, speed: 0, ptrId: null, stairAcc: 0, lastSX: 0, lastSY: 0, init: false, glow: 0 };
+const SP = .026;
+function bagHomeScreen() { const h = bagHomeW(); proj(h.x, h.y, 0); return [PX, PY]; }
+function bagGrip() { const d = 62 * BS; return [bag.tipX - Math.cos(bag.ang) * d, bag.tipY - Math.sin(bag.ang) * d]; }
+function updBag(dt) {
+  if (!bag.init) { const h = bagHomeScreen(); bag.tipX = h[0]; bag.tipY = h[1]; bag.init = true; bag.ang = Math.atan2(cam.cy - h[1], cam.cx - h[0]); }
+  let tx, ty;
+  if (bag.drag) { tx = bag.fx + bag.offX; ty = bag.fy + bag.offY; }
+  else if (bag.restW && !bag.goHome && T - bag.releaseT < 9 && G.act !== 3) { proj(bag.restW.x, bag.restW.y, bag.restW.z); tx = PX; ty = PY; }
+  else { const h = bagHomeScreen(); tx = h[0]; ty = h[1]; if (dist(bag.tipX, bag.tipY, tx, ty) < 4) { bag.goHome = false; bag.restW = null; } }
+  tx = clamp(tx, 8, W - 8); ty = clamp(ty, 8, H - 8);
+  const k = bag.drag ? 1100 : 90, d = bag.drag ? 2 * Math.sqrt(k) * .72 : 2 * Math.sqrt(k) * .95;
+  const n = Math.ceil(dt / .006), h = dt / n;
+  let ta;
+  if (bag.drag) ta = Math.atan2(bag.offY, bag.offX) + clamp(bag.vx * .0005, -.45, .45);
+  else { const dx = cam.cx - bag.tipX, dy = cam.cy - bag.tipY; ta = Math.hypot(dx, dy) < cam.R * .3 ? bag.ang : Math.atan2(dy, dx); }
+  let da = ta - bag.ang; while (da > Math.PI) da -= TAU; while (da < -Math.PI) da += TAU;
+  for (let i = 0; i < n; i++) {
+    bag.vx += ((tx - bag.tipX) * k - bag.vx * d) * h; bag.vy += ((ty - bag.tipY) * k - bag.vy * d) * h;
+    bag.tipX += bag.vx * h; bag.tipY += bag.vy * h;
+    bag.angV += (da * 160 - bag.angV * 18) * h; bag.ang += bag.angV * h; da -= bag.angV * h;
+  }
+  bag.press += ((bag.drag ? 1 : 0) - bag.press) * Math.min(1, dt * (bag.drag ? 18 : 6));
+  bag.wob = Math.max(0, bag.wob - dt * 2.5);
+  bag.hop = Math.max(0, bag.hop - dt * 2.2);
+  const sp = Math.hypot(bag.vx, bag.vy) / Math.max(1, cam.R); bag.speed += (sp - bag.speed) * Math.min(1, dt * 10);
+  bag.bead += ((bag.drag ? (bag.speed < .3 ? 1 : .55) : .45 + (G.idle > 9 ? .35 + .25 * Math.sin(T * 3) : 0)) - bag.bead) * Math.min(1, dt * 5);
+}
+function drawBag() {
+  const c = ctx; const s = BS; const glow = bag.glow;
+  const hopY = -Math.sin(bag.hop * Math.PI) * 14 * s;
+  c.save(); c.translate(bag.tipX, bag.tipY + hopY); c.rotate(bag.ang + Math.PI / 2); c.scale(s, s);
+  if (glow > 0) { c.globalCompositeOperation = 'lighter'; const pul = .5 + .5 * Math.sin(T * 4); c.fillStyle = radG(0, 70, 0, 90, [[0, `rgba(255,236,200,${(.16 + .14 * pul) * glow})`], [1, 'rgba(255,236,200,0)']]); ell(0, 70, 70, 95); c.fill(); c.globalCompositeOperation = 'source-over'; }
+  const p = bag.press, wob = bag.wob; const br = 1 + Math.sin(T * 2.2) * .025;
+  // outline samples
+  const N = 22, L0 = 26, L1 = 132; const pts = [];
+  for (let i = 0; i <= N; i++) {
+    const t = i / N; const y = L0 + t * (L1 - L0) * (1 - p * .06);
+    let hw = 10 + 34 * Math.pow(t, .7); if (t > .78) hw *= Math.sqrt(Math.max(0, 1 - Math.pow((t - .78) / .22, 2))) * .9 + .1;
+    hw *= br * (1 - p * .16 * gauss(y - 58, 14) + p * .12 * gauss(y - 92, 18)) * (1 + wob * .08 * Math.sin(T * 30 + y * .1));
+    pts.push([hw, y]);
+  }
+  // shadow
+  c.fillStyle = 'rgba(110,45,25,.18)'; c.beginPath(); for (const q of pts) c.lineTo(q[0] + 6, q[1] + 8); for (let i = N; i >= 0; i--) c.lineTo(-pts[i][0] + 6, pts[i][1] + 8); c.fill();
+  const outline = sc => { c.beginPath(); for (const q of pts) c.lineTo(q[0] * sc, q[1]); for (let i = N; i >= 0; i--) c.lineTo(-pts[i][0] * sc, pts[i][1]); c.closePath(); };
+  // cream inside (rainbow stripes)
+  c.save(); outline(.86); c.clip();
+  const pal = G.pal; for (let i = -6; i < 14; i++) { c.fillStyle = rgbS(pal[((i % pal.length) + pal.length) % pal.length]); c.beginPath(); const y0 = 10 + i * 14 + (T * 3 % 14) * 0; c.moveTo(-60, y0); c.lineTo(60, y0 - 40); c.lineTo(60, y0 - 26); c.lineTo(-60, y0 + 14); c.fill(); }
+  c.fillStyle = linG(-44, 0, 44, 0, [[0, 'rgba(255,255,255,.3)'], [.4, 'rgba(255,255,255,0)'], [1, 'rgba(120,40,80,.18)']]); c.fillRect(-60, 0, 120, 160);
+  c.restore();
+  // film
+  outline(1); c.fillStyle = linG(-44, 0, 44, 0, [[0, 'rgba(255,255,255,.55)'], [.35, 'rgba(255,255,255,.18)'], [1, 'rgba(255,240,250,.3)']]); c.fill();
+  c.lineWidth = 1.6; c.strokeStyle = 'rgba(210,150,180,.7)'; c.stroke();
+  c.strokeStyle = 'rgba(255,255,255,.9)'; c.lineWidth = 3; c.lineCap = 'round'; c.beginPath(); c.moveTo(-8, 36); c.quadraticCurveTo(-24, 70, -22, 104); c.stroke();
+  c.lineWidth = 1.5; c.beginPath(); c.moveTo(-14, 44); c.quadraticCurveTo(-20, 60, -19, 74); c.stroke();
+  // twist + ribbon
+  c.fillStyle = 'rgba(255,255,255,.75)'; c.beginPath(); c.moveTo(-6, L1 - 4); c.lineTo(6, L1 - 4); c.lineTo(9, L1 + 12); c.lineTo(-9, L1 + 12); c.closePath(); c.fill(); c.strokeStyle = 'rgba(210,150,180,.6)'; c.lineWidth = 1; c.stroke();
+  c.fillStyle = '#ff8fb5'; c.beginPath(); c.ellipse(-9, L1 + 2, 9, 5, -.5, 0, TAU); c.fill(); c.beginPath(); c.ellipse(9, L1 + 2, 9, 5, .5, 0, TAU); c.fill(); c.fillStyle = '#ff6f9a'; circ(0, L1 + 2, 3.5); c.fill();
+  // coupler + star nozzle
+  c.fillStyle = linG(-12, 0, 12, 0, [[0, '#e9c3d3'], [.4, '#fff'], [1, '#d4a6ba']]); c.fillRect(-11, 22, 22, 6);
+  c.beginPath(); c.moveTo(-9, 23); c.lineTo(-4.5, 0); for (let i = 0; i <= 6; i++) { c.lineTo(-4.5 + i * 1.5, i % 2 ? -2 : 0); } c.lineTo(9, 23); c.closePath();
+  c.fillStyle = linG(-9, 0, 9, 0, [[0, '#f1d0de'], [.35, '#ffffff'], [.6, '#f7dce8'], [1, '#c99ab0']]); c.fill();
+  c.strokeStyle = 'rgba(180,120,150,.45)'; c.lineWidth = .8; c.beginPath(); for (const x of [-4, 0, 4]) { c.moveTo(x * .55, 1); c.lineTo(x * 1.6, 22); } c.stroke();
+  // cream bead
+  const bd = bag.bead; const col = palAt(G.pal, T * .1);
+  const by = -3 - bd * 5; const r = 3 + bd * 4.5;
+  c.fillStyle = radG(-r * .3, by - r * .3, r * .1, r * 1.1, [[0, rgbS(mix(col, WHITE, .55))], [.6, rgbS(col)], [1, rgbS(mix(col, [150, 70, 90], .3))]], 0, by);
+  c.beginPath(); c.ellipse(0, by, r * .9, r, 0, 0, TAU); c.fill(); c.fillStyle = 'rgba(255,255,255,.85)'; circ(-r * .35, by - r * .35, r * .25); c.fill();
+  c.restore();
+}
+
+// ================= planes for drawing =================
+function planeAt(sx, sy) {
+  if (G.trans || G.act === 3) return null;
+  if (!castle) { const w = unproj(sx, sy, 0); if (Math.hypot(w.x, w.y) < .96) return { plane: 'ground', z: 0 }; return null; }
+  if (!castle.built) return null;
+  let w = unproj(sx, sy, ZTOP); if (Math.hypot(w.x, w.y) < T2R * 1.15) return { plane: 'balcony', z: ZTOP };
+  if (stairs && !stairs.done) { const st = stairTopScreen(); proj(0, .78, 0); if (dist(sx, sy, st[0], st[1]) < 75 * BS || dist(sx, sy, PX, PY) < 70 * BS || (Math.abs(sx - cam.cx) < cam.R * .25 && sy > st[1] - 40 && sy < PY + 30)) return { plane: 'stair', z: 0 }; }
+  w = unproj(sx, sy, T1H); const r1 = Math.hypot(w.x, w.y); if (r1 < T1R * .96 && r1 > T2R) return { plane: 'top', z: T1H };
+  w = unproj(sx, sy, 0); const r0 = Math.hypot(w.x, w.y);
+  if (r0 < .96 && r0 > T1R + .02) { for (const tw of castle.towers) if (dist(w.x, w.y, tw.x, tw.y) < tw.r + .01) return null; return { plane: 'ground', z: 0 }; }
+  return null;
+}
+function tipOnPlane(plane, z) {
+  const w = unproj(bag.tipX, bag.tipY, z); const r = Math.hypot(w.x, w.y);
+  if (plane === 'ground') { if (r > .97) return null; if (castle && castle.built && r < T1R + .02) return null; return w; }
+  if (plane === 'top') { if (r > T1R * .97) return null; if (r < T2R + .015) { const a = Math.atan2(w.y, w.x); w.x = Math.cos(a) * (T2R + .015); w.y = Math.sin(a) * (T2R + .015); } return w; }
+  if (plane === 'balcony') { if (r > T2R * 1.2) return null; if (r > T2R * .85) { w.x *= T2R * .85 / r; w.y *= T2R * .85 / r; } return w; }
+  return null;
+}
+function startBag(x, y, near) {
+  audioInit();
+  bag.drag = true; bag.fx = x; bag.fy = y; bag.wob = 1; bag.glow = 0;
+  if (near) { bag.offX = bag.tipX - x; bag.offY = bag.tipY - y; }
+  else { let ox = bag.tipX - x, oy = bag.tipY - y; const l = Math.hypot(ox, oy); const want = 64 * BS; if (l < 20 * BS || l > 110 * BS) { ox = -.25 * want; oy = -.97 * want; } else { ox *= want / l; oy *= want / l; } bag.offX = ox; bag.offY = oy; }
+  // keep tip from jumping: shift tip target smoothly (spring handles it)
+  const pl = planeAt(bag.tipX, bag.tipY);
+  bag.plane = pl ? pl.plane : (castle && castle.built ? null : 'ground'); bag.z = pl ? pl.z : 0; bag.stairAcc = 0; bag.lastSX = bag.tipX; bag.lastSY = bag.tipY;
+  S.puni();
+  // immediate dollop for the very first response
+  if (pl && pl.plane !== 'stair') { const w = unproj(bag.tipX, bag.tipY, pl.z); bag.stroke = strokeBegin(pl.plane, w.x, w.y, pl.z); bag.sm = { x: w.x, y: w.y }; sugarBurst(bag.tipX, bag.tipY, 5, null, 90, 14); }
+  bag.restW = null; bag.goHome = false;
+}
+function endBag() {
+  if (!bag.drag) return; bag.drag = false; bag.releaseT = T;
+  if (bag.stroke) { finishStroke(bag.stroke); bag.stroke = null; }
+  const pl = planeAt(bag.tipX, bag.tipY); const z = pl && pl.plane !== 'stair' ? pl.z : 0; const w = unproj(bag.tipX, bag.tipY, z);
+  bag.restW = { x: clamp(w.x, -1.1, 1.1), y: clamp(w.y, -1.1, 1.3), z };
+  if (castle && castle.built) bag.goHome = true;
+  S.squish(false, 0); bag.wob = .8;
+}
+function updDraw(dt) {
+  if (!bag.drag) { return; }
+  if (G.dough && G.dough.t > 1.5) { const d = doughScreen(); if (dist(bag.tipX, bag.tipY, d[0], d[1] - d[2] * .3) < d[2] * 1.2) { endBag(); startTransition(); return; } }
+  S.squish(true, bag.speed);
+  if (bag.plane === 'stair') {
+    const d = dist(bag.tipX, bag.tipY, bag.lastSX, bag.lastSY); bag.stairAcc += d; bag.lastSX = bag.tipX; bag.lastSY = bag.tipY;
+    if (rand() < .3) spawn('grain', bag.tipX, bag.tipY, rand(-60, 60), -rand(40, 120), .7, rand(1.5, 3), pick(SUGAR_COLS), bag.tipY + 20);
+    if (bag.stairAcc > 24 * BS && stairs && !stairs.done) { bag.stairAcc = 0; addStep((bag.tipX - cam.cx) / cam.R); }
+    if (stairs && stairs.done) { const pl = planeAt(bag.tipX, bag.tipY); if (pl && pl.plane !== 'stair') { bag.plane = pl.plane; bag.z = pl.z; } }
+    return;
+  }
+  if (stairs && !stairs.done && bag.plane !== 'stair') { const pl = planeAt(bag.tipX, bag.tipY); if (pl && pl.plane === 'stair') { if (bag.stroke) { finishStroke(bag.stroke); bag.stroke = null; } bag.plane = 'stair'; bag.stairAcc = 0; bag.lastSX = bag.tipX; bag.lastSY = bag.tipY; return; } }
+  if (!bag.plane) { const pl = planeAt(bag.tipX, bag.tipY); if (pl) { bag.plane = pl.plane; bag.z = pl.z; } else return; }
+  const w = tipOnPlane(bag.plane, bag.z);
+  if (!w) { if (bag.stroke) { finishStroke(bag.stroke); bag.stroke = null; } const pl = planeAt(bag.tipX, bag.tipY); if (pl) { bag.plane = pl.plane; bag.z = pl.z; } return; }
+  if (!bag.stroke) { bag.stroke = strokeBegin(bag.plane, w.x, w.y, bag.z); bag.sm = { x: w.x, y: w.y }; S.puni(); return; }
+  const s = bag.stroke; bag.sm.x += (w.x - bag.sm.x) * Math.min(1, dt * 28); bag.sm.y += (w.y - bag.sm.y) * Math.min(1, dt * 28);
+  let last = s.pts[s.pts.length - 1]; let d = dist(last.x, last.y, bag.sm.x, bag.sm.y); const sp = bag.plane === 'balcony' ? SP * .6 : SP;
+  let guard = 0;
+  while (d >= sp && s.pts.length < 520 && totalPts < MAXPTS && guard++ < 12) {
+    const k = sp / d; addPt(s, lerp(last.x, bag.sm.x, k), lerp(last.y, bag.sm.y, k), bag.speed);
+    last = s.pts[s.pts.length - 1]; d = dist(last.x, last.y, bag.sm.x, bag.sm.y);
+    S.crystal(Math.floor(s.len / .09) + Math.floor(bag.speed * 2));
+    if (rand() < .45) spawn('grain', bag.tipX, bag.tipY, rand(-70, 70), -rand(50, 140), rand(.5, .8), rand(1.4, 2.8), pick(SUGAR_COLS), bag.tipY + rand(6, 18));
+  }
+  if (s.pts.length >= 520) { finishStroke(s); bag.stroke = null; }
+}
+function finishStroke(s) {
+  if (s.done) return; s.done = true; s.endT = T; s.live = true;
+  if (!s.pts.length) { strokes.splice(strokes.indexOf(s), 1); return; }
+  G.lastAction = T;
+  let mx = 0, my = 0; for (const p of s.pts) { mx += p.x; my += p.y; } mx /= s.pts.length; my /= s.pts.length;
+  if (s.plane === 'balcony') {
+    s.kind = 'tea'; const onPlate = sweets.filter(o => o.tea && !o.gone).length;
+    const n = s.len < .15 ? 1 : 2;
+    for (let i = 0; i < n; i++) {
+      let x, y, z = ZTOP; const k = onPlate + i;
+      if (k < 3) { const off = [[0, 0], [-.045, .01], [.045, .012]][k]; x = TEA.plate.x + off[0]; y = TEA.plate.y + off[1] - .005; z = ZTOP + .045; }
+      else { const p = s.pts[Math.floor(i / n * (s.pts.length - 1))]; x = p.x; y = p.y; }
+      if (liveSweets() < MAXSW + 14) { const sub = pick(G.sweetKinds.concat(['flower'])); const o = makePetit(x, y, z, sub); o.tb = T + .25 + i * .2; o.layerT = [o.tb]; setTimeout0(() => { S.flower(); proj(o.x, o.y, o.z); sparkle(PX, PY - 10, 5); prAct('lean', 1, 1); }, .3 + i * .2); }
+    }
+    for (let i = 0; i < s.pts.length; i += 2) spawnBranch(s, i, i % 4 ? 1 : -1);
+    G.score += 1; return;
+  }
+  if (s.len < .3) {
+    s.kind = 'flower';
+    let f = null, fd = .1; for (const o of sweets) { if (o.kind !== 'flower' || o.gone || o.held || o.plane !== s.plane || o.tea) continue; const d = dist(o.x, o.y, mx, my); if (d < fd) { fd = d; f = o; } }
+    if (f && f.layers < 4) {
+      f.layers++; f.layerT.push(T + .25); f.spr = null; if (f.layers >= 3) f.rose = true; if (f.layers >= 4) f.crown = true;
+      setTimeout0(() => { S.flower(); proj(f.x, f.y, f.z); sparkle(PX, PY - 14, 6, '#fff', 14); prAct('lean', 1.2, 1); if (f.layers >= 3) { prAct('wow', 1.2, 2); S.wow(); } }, .3);
+    } else if (f) { f.jigT = T; S.jiggle(); proj(f.x, f.y, f.z); sugarBurst(PX, PY - 10, 8); }
+    else if (liveSweets() < MAXSW) {
+      f = makeFlower(mx, my, s, s.plane === 'top' ? { r: .06 } : null); G.flowers++;
+      setTimeout0(() => { S.flower(); proj(f.x, f.y, f.z); sparkle(PX, PY - 10, 5); prAct('lean', 1.3, 1); if (rand() < .1 && !butterflies.length) spawnButterfly(f); }, .4);
+      if (!G.arches && G.flowers >= 3) tryArchFrom(s, mx, my, .8);
+    }
+    const nb = s.pts.length < 4 ? 6 : 3; const a0 = rand(TAU);
+    for (let k = 0; k < nb; k++) spawnBranch(s, Math.floor(s.pts.length / 2), 1, { ang: a0 + k * TAU / nb, flower: true, delay: .05 * k });
+    G.score += 1.5; return;
+  }
+  // long stroke → path
+  s.kind = 'path'; G.paths++; G.score += 2; spawnScallops(s, .15);
+  const a = s.pts[0], b = s.pts[s.pts.length - 1];
+  if (s.len > .7 && dist(a.x, a.y, b.x, b.y) < .14 && s.plane === 'ground') { s.kind = 'ring'; G.score += 1.5; setTimeout0(() => { S.flower(); }, .8); }
+  let next = rand(.05, .08), side = 1, idx = 0;
+  for (let i = 0; i < s.pts.length; i++) {
+    const p = s.pts[i]; if (p.u < next) continue; next += rand(.1, .14);
+    if (liveSweets() >= MAXSW) break;
+    const q = s.pts[Math.min(s.pts.length - 1, i + 1)], o = s.pts[Math.max(0, i - 1)]; let tx = q.x - o.x, ty = q.y - o.y; const tl = Math.hypot(tx, ty) || 1; tx /= tl; ty /= tl;
+    const off = (s.plane === 'top' ? .03 : .048) * rand(.85, 1.15);
+    const gem = s.kind === 'ring' && idx % 2 === 0;
+    const bb = makeBerry(p.x - ty * off * side, p.y + tx * off * side, s, p.u, .45 + idx * .13, gem); side *= -1; idx++;
+    if (s.plane === 'top') bb.r *= .75;
+  }
+  if (s.plane === 'ground') tryArchFrom(s, 0, 0, G.arches ? .35 : .8);
+}
+function tryArchFrom(s, fx, fy, maxD) {
+  if (G.arches >= 7 || s.plane !== 'ground') return;
+  let best = null, bd = maxD;
+  // nearest other lace
+  for (let i = 0; i < s.pts.length; i += 2) {
+    const p = s.pts[i];
+    if (gridNear(p.x, p.y, Math.min(bd, .5), s.id) && GN.d > .07 && GN.d < bd) { bd = GN.d; best = [p.x, p.y, GN.x, GN.y]; }
+    for (const o of sweets) { if (o.kind !== 'flower' || o.gone || o.held || o.sid === s.id || o.plane !== 'ground') continue; const d = dist(p.x, p.y, o.x, o.y); if (d > .08 && d < bd * 1.15) { bd = d / 1.15; best = [p.x, p.y, o.x, o.y]; } }
+  }
+  if (!best && maxD > .5) {
+    // short-stroke flowers: link to the nearest other flower
+    for (const o of sweets) { if (o.kind !== 'flower' || o.gone || o.held || o.sid === s.id || o.plane !== 'ground') continue; const d = dist(fx, fy, o.x, o.y); if (d > .08 && d < bd) { bd = d; best = [fx, fy, o.x, o.y]; } }
+  }
+  if (best) { const a = makeArch(best[0], best[1], best[2], best[3]); if (a) setTimeout0(() => { if (!a.snd) { a.snd = true; for (let i = 0; i < 5; i++) bell(scaleF(8 + i), .045, .6, i * .08); } }, .3); }
+}
+function spawnButterfly(f) { butterflies.push({ x: f.x, y: f.y, z: .05, t: 0, life: 14, col: pick([[160, 220, 255], [255, 180, 220], [200, 170, 255], [170, 245, 220]]), ph: rand(TAU) }); S.wow(); }
+function updButterflies(dt) {
+  for (let i = butterflies.length - 1; i >= 0; i--) {
+    const b = butterflies[i]; b.t += dt;
+    b.x += Math.cos(b.t * .7 + b.ph) * .12 * dt; b.y += Math.sin(b.t * 1.1 + b.ph) * .08 * dt; b.z = .12 + Math.sin(b.t * 2) * .05 + Math.min(.3, b.t * .05);
+    if (b.t > b.life) { b.y -= dt * .6; b.z += dt * .5; if (b.t > b.life + 3) butterflies.splice(i, 1); }
+  }
+}
+function drawButterflies() {
+  for (const b of butterflies) {
+    let x = b.x, y = b.y; proj(x, y, b.z); const s = cam.R * .028; const f = Math.abs(Math.sin(T * 14)) * .8 + .2; const c = ctx;
+    c.save(); c.translate(PX, PY);
+    for (const sd of [-1, 1]) {
+      c.save(); c.scale(sd * f, 1);
+      c.fillStyle = radG(s * .3, -s * .3, s * .1, s * 1.2, [[0, 'rgba(255,255,255,.95)'], [.5, rgbS(b.col, .85)], [1, rgbS(deepen(b.col), .8)]]);
+      c.beginPath(); c.ellipse(s * .55, -s * .35, s * .6, s * .45, -.5, 0, TAU); c.fill(); c.beginPath(); c.ellipse(s * .45, s * .3, s * .4, s * .3, .4, 0, TAU); c.fill();
+      c.fillStyle = 'rgba(255,255,255,.8)'; circ(s * .6, -s * .4, s * .1); c.fill();
+      c.restore();
+    }
+    c.fillStyle = '#7a4a6a'; ell(0, 0, s * .1, s * .4); c.fill(); c.restore();
+    if (rand() < .05) sparkle(PX, PY, 1, rgbS(mix(b.col, WHITE, .5)), 6);
+  }
+}
+
+// ================= carrying sweets =================
+const carry = { o: null, x: 0, y: 0, tx: 0, ty: 0, id: null, pending: null };
+function pickSweet(o, x, y) {
+  carry.o = o; o.held = true; carry.x = o.sx; carry.y = o.sy - 10; carry.tx = x; carry.ty = y; S.pick();
+  if (!castle && o.plane === 'ground') { bakeDimple(o.x, o.y, o.r * .6); bakeLog.push({ k: 'd', x: o.x, y: o.y, r: o.r * .6 }); }
+  sugarBurst(o.sx, o.sy, 6); G.lastAction = T;
+}
+function givePrincess(o, auto) {
+  pr.plate = o; o.held = true; o.bite = 0; prAct('joy', 1.5, 3); S.joy(); heartsAt(pr.headX, pr.headY - 26, 4);
+  pr.eatT = T + 1.6; if (!auto) { G.feeds++; G.score += 3; G.lastFeedT = T; }
+  for (const b of birds) if (b.st === 'roam' && rand() < .5) { b.flap = .6; b.tiltT = T + .5; }
+}
+function giveBird(b, o) {
+  o.held = false; o.pre = false; o.sid = 0; o.x = b.x + b.dir * .05; o.y = b.y + .01; o.z = b.z; o.plane = 'ground'; o.wx = o.x; o.wy = o.y; o.wz = o.z;
+  if (b.st === 'perch') { o.plane = 'balcony'; }
+  b.eat = o; b.eatN = 0; b.next = .3; b.beak = .4; S.chirp(); G.feeds++; G.score += 2; G.lastFeedT = T;
+}
+function dropCarry() {
+  const o = carry.o; if (!o) return; carry.o = null; G.lastAction = T;
+  if (!pr.hidden && !pr.plate && dist(carry.x, carry.y, pr.plateX, pr.plateY) < 60 * BS) { givePrincess(o); return; }
+  if (!pr.hidden && dist(carry.x, carry.y, pr.sx, pr.sy - pr.u * 55) < 50 * BS && !pr.plate) { givePrincess(o); return; }
+  for (const b of birds) { if (b.eat || b.st === 'fly' || b.st === 'peek' || !b.alive) continue; if (dist(carry.x, carry.y, b.sx, b.sy - 10 * b.u) < 46 * BS) { giveBird(b, o); return; } }
+  if (!castle) { const w = unproj(carry.x, carry.y + 10, 0); if (Math.hypot(w.x, w.y) < .92) { o.x = w.x; o.y = w.y; o.held = false; o.sid = 0; o.spr = null; o.jigT = T; S.drop(); sugarBurst(carry.x, carry.y + 10, 5); return; } }
+  o.held = false; o.jigT = T; S.drop(); if (pr.plate && dist(carry.x, carry.y, pr.plateX, pr.plateY) < 60 * BS) { S.hmm(); }
+}
+function updCarry(dt) {
+  if (!carry.o) return; const k = Math.min(1, dt * 22); carry.x += (carry.tx - carry.x) * k; carry.y += (carry.ty - 26 * BS - carry.y) * k;
+}
+function drawCarry() {
+  const o = carry.o; if (!o) return; const c = ctx;
+  c.fillStyle = 'rgba(110,45,25,.18)'; ell(carry.x + 6, carry.y + 26, o.r * cam.R * 1.2, o.r * cam.R * .45); c.fill();
+  // glow toward the plate when close
+  const d = dist(carry.x, carry.y, pr.plateX, pr.plateY);
+  if (!pr.plate && d < 160 * BS) { const a = (1 - d / (160 * BS)) * .6; c.globalCompositeOperation = 'lighter'; c.fillStyle = radG(pr.plateX, pr.plateY, 0, 50 * BS, [[0, `rgba(255,240,200,${a})`], [1, 'rgba(255,240,200,0)']]); circ(pr.plateX, pr.plateY, 50 * BS); c.fill(); c.globalCompositeOperation = 'source-over'; }
+  drawSweetAt(o, carry.x, carry.y + 6, 1.35 + Math.sin(T * 8) * .03);
+}
+
+// ================= pointer input =================
+const ptrs = new Map(); let primary = null;
+function hitTest(x, y) {
+  if (G.trans) return { kind: 'none' };
+  // bag
+  const g = bagGrip(); const tx = bag.tipX, ty = bag.tipY;
+  const segD = (() => { const bx = g[0] + (g[0] - tx) * .9, by = g[1] + (g[1] - ty) * .9; const vx = bx - tx, vy = by - ty; const l2 = vx * vx + vy * vy; const t = clamp(((x - tx) * vx + (y - ty) * vy) / l2, 0, 1); return dist(x, y, tx + vx * t, ty + vy * t); })();
+  if (G.act !== 3 && segD < 40 * BS) return { kind: 'bag', near: dist(x, y, tx, ty) < 30 * BS };
+  // dough
+  if (G.dough && G.dough.t > 1) { const d = doughScreen(); if (dist(x, y, d[0], d[1] - d[2] * .3) < d[2] * 1.3 + 10) return { kind: 'dough' }; }
+  // sweets (top-most first)
+  let best = null, bd = 1e9;
+  if (G.act !== 3) for (const o of sweets) {
+    if (o.gone || o.held || !sweetDone(o) || o.sx === undefined || !o.vis) continue; if (pr.plate === o) continue; if (birds.some(b => b.eat === o)) continue;
+    const u = o.r * cam.R; const r = Math.max(26, u * 1.7); const d = dist(x, y, o.sx, o.sy - u * .9);
+    if (d < r && d < bd) { bd = d; best = o; }
+  }
+  if (best) return { kind: 'sweet', o: best };
+  // characters
+  if (!pr.hidden) { const u = pr.u; if (Math.abs(x - pr.sx) < Math.max(26, 26 * u) && y < pr.sy + 6 && y > pr.sy - 105 * u) return { kind: 'princess' }; }
+  for (const b of birds) { if (dist(x, y, b.sx, b.sy - 10 * b.u) < Math.max(24, 16 * b.u)) return { kind: 'bird', b }; }
+  // tea items
+  if (castle && castle.built) {
+    if (TEA.potS && dist(x, y, TEA.potS[0], TEA.potS[1]) < Math.max(26, TEA.potS[2])) return { kind: 'pot' };
+    if (TEA.cupS && dist(x, y, TEA.cupS[0], TEA.cupS[1]) < Math.max(22, TEA.cupS[2] * 1.2)) return { kind: 'cup' };
+    if (G.tea && G.tea.bellS && dist(x, y, G.tea.bellS[0], G.tea.bellS[1]) < Math.max(24, G.tea.bellS[2] * 1.5)) return { kind: 'bell' };
+  }
+  // near the nozzle on a drawable plane → start squeezing from there
+  if (G.act !== 3 && dist(x, y, tx, ty) < 78 * BS && planeAt(x, y)) return { kind: 'bag', near: true };
+  if (castle && castle.built) { proj(0, 0, T1H * .5); if (Math.abs(x - PX) < T1R * cam.R && y > PY - cam.R * .9 && y < PY + cam.R * .4) return { kind: 'castle' }; }
+  const w = unproj(x, y, 0); if (Math.hypot(w.x, w.y) < 1) return { kind: 'cookie', w };
+  return { kind: 'bg' };
+}
+function onDown(e) {
+  e.preventDefault(); audioInit();
+  const x = e.clientX, y = e.clientY; G.lastInput = T; G.firstInput = true; G.demo = null;
+  ptrs.set(e.pointerId, { x, y });
+  if (primary) { if (primary.id !== e.pointerId) tapReact(hitTest(x, y), x, y, true); return; }
+  const h = hitTest(x, y);
+  primary = { id: e.pointerId, h, x0: x, y0: y, t0: T, moved: false };
+  switch (h.kind) {
+    case 'bag': startBag(x, y, h.near); break;
+    case 'sweet': { const o = h.o; o.jigT = T; tapSweetFx(o); break; }
+    default: tapReact(h, x, y, false); break;
+  }
+}
+function onMove(e) {
+  if (!primary || primary.id !== e.pointerId) return; e.preventDefault();
+  const x = e.clientX, y = e.clientY; G.lastInput = T;
+  const p = primary; if (dist(x, y, p.x0, p.y0) > 9) p.moved = true;
+  if (p.h.kind === 'bag' && bag.drag) { bag.fx = x; bag.fy = y; }
+  else if (p.h.kind === 'sweet') {
+    if (!carry.o && p.moved && !p.h.o.held && !p.h.o.gone) pickSweet(p.h.o, x, y);
+    if (carry.o) { carry.tx = x; carry.ty = y; }
+  }
+}
+function onUp(e) {
+  ptrs.delete(e.pointerId); audioInit();
+  if (!primary || primary.id !== e.pointerId) return;
+  const p = primary; primary = null;
+  if (p.h.kind === 'bag') endBag();
+  else if (p.h.kind === 'sweet' && carry.o) dropCarry();
+}
+function tapSweetFx(o) {
+  const u = o.r * cam.R; const x = o.sx, y = o.sy - u;
+  if (o.kind === 'flower') { S.jiggle(scaleF(rand(9, 14))); sugarBurst(x, y, 9, null, 120, 20); sparkle(x, y, 2); }
+  else if (o.kind === 'berry') { const f = scaleF(rand(3, 8)); tone(f, .2, { type: 'sine', vol: .12, f2: f * 1.6, glide: .08 }); sugarBurst(x, y, 4, ['#ff5a7a', '#fff', '#ffd0dc'], 90, 14); }
+  else { bell(scaleF(rand(10, 15)), .08, .9); sparkle(x, y, 4, rgbS(mix(o.gemCol || [255, 200, 220], WHITE, .4)), 12); }
+  if (o.butterflyChance === undefined && o.kind === 'flower' && rand() < .06 && !butterflies.length) { o.butterflyChance = 1; spawnButterfly(o); }
+}
+function tapReact(h, x, y, secondary) {
+  switch (h.kind) {
+    case 'princess': {
+      if (prBusy()) { S.giggle(); break; }
+      if (rand() < .5) prAct('bow', 1, 1); else prAct('spin', .95, 1); S.giggle(); heartsAt(pr.headX, pr.headY - 20, 1); break;
+    }
+    case 'bird': { const b = h.b; b.flap = .6; S.chirp(); if (!b.hop && !b.fly && b.st !== 'peek') { b.hop = { fx: b.x, fy: b.y, fz: b.z, tx: b.x, ty: b.y, tz: b.z, t: 0, d: .35, h: .08 }; } else if (b.st === 'peek') b.tiltT = T + .6; break; }
+    case 'pot': if (G.tea) teaPour(); else { bell(scaleF(9), .05, .5); } break;
+    case 'cup': if (TEA.cupS) heartsAt(TEA.cupS[0], TEA.cupS[1] - 6, 3); S.giggle(); if (pr.where === 'balcony' && !prBusy()) prAct('sip', 1.4, 1); break;
+    case 'bell': ringBell(); break;
+    case 'dough': if (!secondary) startTransition(); break;
+    case 'castle': { bell(scaleF(rand(8, 13)), .05, .7); sparkle(x, y, 4, '#fff6c0', 16); break; }
+    case 'cookie': {
+      if (h.w && gridNear(h.w.x, h.w.y, .05, -1)) { bell(scaleF(rand(10, 15)), .05, .6); sparkle(x, y, 3, '#fff', 10); ripple(x, y, 16, 'rgba(255,255,255,.9)'); }
+      else { S.tapCookie(); for (let i = 0; i < 4; i++) spawn('crumb', x, y, rand(-50, 50), -rand(40, 110), .6, rand(1.5, 3), G.flavor.c2, y + rand(3, 10)); ripple(x, y, 12, 'rgba(255,240,210,.8)'); }
+      break;
+    }
+    case 'bg': S.tapBg(); ripple(x, y, 14, 'rgba(255,255,255,.7)'); break;
+  }
+}
+cv.addEventListener('pointerdown', onDown, { passive: false });
+window.addEventListener('pointermove', onMove, { passive: false });
+window.addEventListener('pointerup', onUp);
+window.addEventListener('pointercancel', onUp);
+['touchstart', 'touchmove', 'touchend', 'gesturestart', 'gesturechange', 'dblclick', 'contextmenu'].forEach(ev => document.addEventListener(ev, e => { if (e.cancelable) e.preventDefault(); }, { passive: false }));
+// ================= strokes / branches update =================
+function updStrokes(dt) {
+  const pending = [];
+  for (const s of strokes) {
+    while (s.brI < s.pts.length) {
+      const p = s.pts[s.brI]; if (!s.done && T - p.t < .13) break;
+      if (s.kind !== 'flower' && (s.brI % 2 === 0 || s.pts.length < 3)) { spawnBranch(s, s.brI, s.brSide); s.brSide *= -1; }
+      s.brI++;
+    }
+    if (!castle && s.done && !s.baked && T > s.endT + .4) {
+      if (s.kind === 'ring') { bakeRing(s); bakeLog.push({ k: 'r', o: s }); }
+      bakeStroke(s); bakeLog.push({ k: 's', o: s }); s.baked = true; s.live = false;
+    }
+  }
+  for (const b of branches) {
+    if (!b.snd && T > b.tb) { b.snd = true; S.branch(b.lv); }
+    if (!b.done && T > b.tb + b.dur) b.done = true;
+    if (!castle && b.done && !b.baked) { b.baked = true; pending.push(b); bakeLog.push({ k: 'b', o: b }); }
+  }
+  if (pending.length) bakeBranches(pending);
+}
+// rebakeAll grouping (override)
+function rebakeAllGrouped() {
+  if (!decoCtx) return; decoCtx.setTransform(1, 0, 0, 1, 0, 0); decoCtx.clearRect(0, 0, decoTex.width, decoTex.height);
+  let grp = [];
+  const flush = () => { if (grp.length) { bakeBranches(grp); grp = []; } };
+  for (const e of bakeLog) { if (e.k === 'b') { grp.push(e.o); continue; } flush(); if (e.k === 's') bakeStroke(e.o); else if (e.k === 'r') bakeRing(e.o); else if (e.k === 'd') bakeDimple(e.x, e.y, e.r); }
+  flush();
+}
+
+// ================= story flow =================
+function act1Event() {
+  let b = birds.find(q => q.st === 'peek') || birds[0]; const a = arches[0];
+  if (b && a) {
+    const mx = (a.ax + a.bx) / 2, my = (a.ay + a.by) / 2 + .04;
+    b.st = 'roam'; birdHop(b, mx, my, 0, .7); b.hop.h = .25; b.flap = 1; S.chirp(); setTimeout0(() => { S.chirp(); b.tiltT = T + 1; }, .9);
+    for (const o of birds) if (o !== b && o.st === 'peek') setTimeout0(() => { o.st = 'roam'; birdHop(o, mx + .1, my + .05, 0, .7); o.hop.h = .2; S.chirp(); }, 1.6);
+  }
+  prAct('clap', 2.2, 2); S.joy();
+  setTimeout0(() => { if (G.act === 1) { G.act = 2; G.actT = 0; } }, 2.4);
+}
+function forceArch() {
+  const fl = sweets.filter(o => o.kind === 'flower' && !o.gone && !o.held && o.plane === 'ground');
+  let best = null, bd = 9;
+  for (let i = 0; i < fl.length; i++) for (let j = i + 1; j < fl.length; j++) { const d = dist(fl[i].x, fl[i].y, fl[j].x, fl[j].y); if (d < bd && d > .08) { bd = d; best = [fl[i].x, fl[i].y, fl[j].x, fl[j].y]; } }
+  if (!best) { const s = strokes.find(q => q.plane === 'ground' && q.done && q.pts.length > 3); if (s && fl.length) { const p = s.pts[Math.floor(s.pts.length / 2)]; best = [p.x, p.y, fl[0].x, fl[0].y]; } }
+  if (!best) { const s = strokes.filter(q => q.plane === 'ground' && q.done && q.pts.length > 2); if (s.length) { const p = s[0].pts[0], q = s[s.length - 1].pts[s[s.length - 1].pts.length - 1]; if (dist(p.x, p.y, q.x, q.y) > .1) best = [p.x, p.y, q.x, q.y]; else best = [p.x, p.y, -p.x * .5, -p.y * .5 + .2]; } }
+  if (best) { makeArch(best[0], best[1], best[2], best[3]); for (let i = 0; i < 5; i++) bell(scaleF(8 + i), .045, .6, .3 + i * .08); }
+}
+function planWalk() {
+  const paths = strokes.filter(s => s.plane === 'ground' && (s.kind === 'path' || s.kind === 'ring') && s.done && s.len > .4);
+  if (!paths.length) return false;
+  const s = paths[paths.length - 1 - Math.floor(rand(Math.min(3, paths.length)))];
+  const a = s.pts[0], b = s.pts[s.pts.length - 1]; const rev = dist(pr.x, pr.y, b.x, b.y) < dist(pr.x, pr.y, a.x, a.y);
+  const list = []; const P = rev ? s.pts.slice().reverse() : s.pts;
+  for (let i = 0; i < P.length; i += 2) list.push({ x: P[i].x, y: P[i].y + .015, z: 0 });
+  list.push({ x: P[P.length - 1].x, y: P[P.length - 1].y + .015, z: 0 });
+  pr.lastWalk = T + 999;
+  prWalkTo(list, () => {
+    prAct('lookback', 1.3, 1); S.giggle(); G.score += 1;
+    setTimeout0(() => { if (G.act === 2 && !pr.path) { const h = prHome(); prWalkTo([h], () => { pr.lastWalk = T; }); } else pr.lastWalk = T; }, 1.6);
+  }, .2);
+  const b0 = birds.find(q => q.st === 'roam'); if (b0) { b0.follow = T + 8; }
+  return true;
+}
+function balconySweets() { let n = 0; for (const o of sweets) if (o.tea && !o.gone) n++; return n; }
+function updClimb(dt) {
+  if (!stairs) return;
+  if (pr.hopA) {
+    const h = pr.hopA; h.t += dt; const k = clamp(h.t / h.d, 0, 1);
+    pr.x = lerp(h.f.x, h.to.x, k); pr.y = lerp(h.f.y, h.to.y, k); pr.z = lerp(h.f.z, h.to.z, k); pr.hop = Math.sin(k * Math.PI) * .45; pr.moving = false;
+    pr.sway = Math.sin(k * Math.PI) * 1.2;
+    if (k >= 1) {
+      pr.hopA = null; pr.hop = 0;
+      if (h.last) { pr.where = 'balcony'; pr.balT = T; prAct('joy', 1.4, 2); S.joy(); heartsAt(pr.headX, pr.headY - 20, 3); }
+      else if (pr.climbJ % 4 === 3) { prAct('lookback', .8, 1); S.giggle(); }
+    }
+    return;
+  }
+  if (pr.path) return;
+  const n = stairs.steps.length;
+  if (pr.where === 'ground') { const h = prHome(); if (n > 0 && dist(pr.x, pr.y, h.x, h.y) < .06 && T - stairs.steps[0].tb > .5) { pr.where = 'stairs'; pr.climbJ = -1; } return; }
+  if (pr.where === 'stairs') {
+    const j = pr.climbJ + 1;
+    if (j < n && T - stairs.steps[j].tb > .45) { const p = stairs.steps[j]; pr.hopA = { f: { x: pr.x, y: pr.y, z: pr.z }, to: { x: p.x, y: p.y, z: p.z }, t: 0, d: .42 }; pr.climbJ = j; S.footstep(); }
+    else if (j >= n && stairs.done) { pr.hopA = { f: { x: pr.x, y: pr.y, z: pr.z }, to: { x: TEA.prSpot.x, y: TEA.prSpot.y, z: ZTOP }, t: 0, d: .7, last: true }; }
+    else if (j >= n && !prBusy() && rand() < dt * .3) { prAct('beg', 1.4, 0); S.hmm(); }
+  }
+}
+function updGame(dt) {
+  G.actT += dt; G.idle = T - G.lastInput;
+  if (G.act === 1) {
+    if (G.act1Evt && T > G.act1Evt) { G.act1Evt = 0; act1Event(); }
+    if (!G.arches && G.score >= 7 && !bag.drag) forceArch();
+  }
+  if (G.act === 2) {
+    if (!pr.path && !prBusy() && !carry.o && T - pr.lastWalk > 6 && G.actT > 3 && pr.where === 'ground') planWalk();
+    const ready = (G.actT > 55 && G.score >= 24 && G.feeds >= 2) || (G.actT > 80 && G.score >= 30) || (G.actT > 130 && G.score >= 12) || G.actT > 240;
+    if (ready && !bag.drag && !carry.o && !pr.plate && !(pr.act === 'eat' && prActive('eat'))) startCastle();
+  }
+  if (G.act === 4 || G.act === 5) {
+    updClimb(dt);
+    if (pr.where === 'balcony' && !G.tea) { const n = balconySweets(); if (n >= 2 || (n >= 1 && T - pr.balT > 10) || T - pr.balT > 30) startTea(); }
+  }
+  if (G.dough) { G.dough.t += dt; G.dough.wob = Math.max(0, G.dough.wob - dt); }
+  // princess gaze points at the focus when idle
+  pr.ovr = null;
+  if (G.idle > 3 && G.focusPt) pr.ovr = { x: G.focusPt[0], y: G.focusPt[1] };
+  // birds follow princess on walks
+  for (const b of birds) if (b.follow > T && b.st === 'roam' && !b.hop && rand() < dt * 1.5) { const a = Math.atan2(b.y - pr.y, b.x - pr.x); birdHop(b, pr.x + Math.cos(a) * .12, pr.y + Math.sin(a) * .12, 0); }
+}
+// ================= guidance =================
+function computeFocus() {
+  G.focusPt = null; bag.glow = 0;
+  if (G.trans || G.act === 3 || bag.drag || carry.o) return null;
+  if (G.dough && G.dough.t > 2) { const d = doughScreen(); G.focusPt = [d[0], d[1] - d[2] * .3]; return { k: 'dough' }; }
+  if (castle && castle.built) {
+    if (stairs && !stairs.done) { const s = stairTopScreen(); G.focusPt = s; bag.glow = 1; return { k: 'stair', dest: s }; }
+    if (pr.where === 'balcony' && balconySweets() < 2 && TEA.plateS) { bag.glow = 1; G.focusPt = [TEA.plateS[0], TEA.plateS[1]]; return { k: 'balcony', dest: G.focusPt }; }
+    bag.glow = .6; return { k: 'bag' };
+  }
+  if (G.act === 2 && !pr.plate && !pr.hidden && T - (G.lastFeedT || 0) > 9 && G.actT > 4) {
+    let best = null, bd = 1e9; for (const o of sweets) { if (o.gone || o.held || !sweetDone(o) || !o.vis) continue; const d = dist(o.sx, o.sy, pr.plateX, pr.plateY); if (d < bd) { bd = d; best = o; } }
+    if (best) { G.focusPt = [best.sx, best.sy - best.r * cam.R]; return { k: 'sweet', o: best }; }
+  }
+  bag.glow = 1; G.focusPt = [bag.tipX, bag.tipY]; return { k: 'bag' };
+}
+function drawFocus(f) {
+  if (!f) return; const c = ctx; const pul = .5 + .5 * Math.sin(T * 4);
+  if (f.k === 'sweet') {
+    const o = f.o; const u = o.r * cam.R; const x = o.sx, y = o.sy - u;
+    c.globalCompositeOperation = 'lighter'; c.fillStyle = radG(x, y, 0, u * 3, [[0, `rgba(255,240,200,${.3 + .25 * pul})`], [1, 'rgba(255,240,200,0)']]); circ(x, y, u * 3); c.fill(); c.globalCompositeOperation = 'source-over';
+    c.fillStyle = '#fff'; starPath(x + u * .9, y - u * 1.4 - pul * 6, 4 + pul * 3, 4, .35, T); c.fill();
+    if ((T % 2.2) < .05) o.jigT = T;
+  } else if (f.dest) {
+    const [x, y] = f.dest; c.globalCompositeOperation = 'lighter'; c.fillStyle = radG(x, y, 0, 40 * BS, [[0, `rgba(255,240,200,${.25 + .25 * pul})`], [1, 'rgba(255,240,200,0)']]); circ(x, y, 40 * BS); c.fill(); c.globalCompositeOperation = 'source-over';
+  }
+  if (bag.glow > 0 && G.idle > 2.5 && (T % 2.4) < .03 && bag.hop <= 0) bag.hop = 1;
+}
+function updDemo(dt, f) {
+  if (G.demo) { G.demo.t += dt; if (G.demo.t > G.demo.d) G.demo = null; return; }
+  if (!f || G.idle < 6.5 || G.trans) return;
+  const key = f.k + ':' + G.act + ':' + G.cycle; if (G.demoDone[key]) return; G.demoDone[key] = 1;
+  const g = bagGrip(); let path;
+  if (f.k === 'bag') { const cx = cam.cx, cy = cam.cy; path = [[g[0], g[1]], [lerp(g[0], cx, .5) - 30, lerp(g[1], cy, .5)], [cx + 20, cy - 10], [cx + 50, cy + 20]]; }
+  else if (f.k === 'sweet') path = [[f.o.sx, f.o.sy - 10], [lerp(f.o.sx, pr.plateX, .5), lerp(f.o.sy, pr.plateY, .5) - 30], [pr.plateX, pr.plateY]];
+  else if (f.k === 'stair' || f.k === 'balcony') { const d = f.dest; path = [[g[0], g[1]], [lerp(g[0], d[0], .6), lerp(g[1], d[1], .6) + 20], [d[0], d[1] + 64 * BS], [d[0] + 10, d[1] + 20 * BS]]; }
+  else if (f.k === 'dough') { const d = doughScreen(); path = [[d[0], d[1] - d[2] * .3], [d[0], d[1] - d[2] * .3]]; }
+  if (path) G.demo = { t: 0, d: 2.8, path };
+}
+function drawDemo() {
+  const dm = G.demo; if (!dm) return; const t = dm.t; const P = dm.path; const c = ctx;
+  const a = t < .3 ? t / .3 : t > dm.d - .4 ? (dm.d - t) / .4 : 1; const mv = clamp((t - .6) / 1.6, 0, 1);
+  const f = mv * (P.length - 1); const i = Math.min(P.length - 2, Math.floor(f)); const k = ease(f - i);
+  const x = lerp(P[i][0], P[i + 1][0], k), y = lerp(P[i][1], P[i + 1][1], k); const press = t > .45 && t < dm.d - .5 ? 1 : 0;
+  c.save(); c.globalAlpha = a * .75; c.translate(x, y); c.scale(BS * (1 - press * .08), BS * (1 - press * .08));
+  if (press) { c.fillStyle = 'rgba(255,255,255,.5)'; circ(0, 0, 14 + Math.sin(t * 10) * 2); c.fill(); }
+  c.fillStyle = 'rgba(110,45,25,.18)'; c.beginPath(); c.ellipse(8, 40, 18, 26, -.3, 0, TAU); c.fill();
+  c.fillStyle = '#ffffff'; c.strokeStyle = 'rgba(200,150,170,.8)'; c.lineWidth = 2;
+  c.beginPath(); c.moveTo(-6, 4); c.quadraticCurveTo(-7, -4, 0, -4); c.quadraticCurveTo(7, -4, 6, 4); c.lineTo(7, 22); c.quadraticCurveTo(16, 18, 22, 26); c.quadraticCurveTo(26, 44, 16, 58); c.lineTo(-10, 58); c.quadraticCurveTo(-20, 44, -16, 30); c.quadraticCurveTo(-12, 24, -6, 24); c.closePath(); c.fill(); c.stroke();
+  c.restore(); c.globalAlpha = 1;
+}
+
+// ================= render =================
+const DL = []; let DLn = 0;
+function dl(k, fn, a) { let e = DL[DLn]; if (!e) { e = {}; DL[DLn] = e; } e.k = k; e.fn = fn; e.a = a; DLn++; }
+const dlCmp = (a, b) => a.k - b.k;
+function dSweet(o) { drawSweetAt(o, o.sx, o.sy, 1); }
+function dArch(a) { drawArch(a); }
+function dTower(tw) { drawTower(tw); }
+function dWedge(w) { drawWedge(w); }
+function dPrincess() { if (pr.hidden) return; drawPrincess(pr.sx, pr.sy, pr.u); drawPlate(pr.sx, pr.sy, pr.u); }
+function dBird(b) { drawBird(b); }
+function dStep(j) { drawStep(stairs.steps[j], j); }
+function dFn(f) { f(); }
+function dBalconyStrokes() { const list = []; for (const s of strokes) if (s.plane === 'balcony') drawStrokeLive(s, 0); for (const b of branches) if (b.plane === 'balcony') list.push(b); if (list.length) buildLacePath(list, mapBranchLive, cam.R * LPATH_SCALE * .7, true); }
+function dTopStrokes() { const list = []; for (const s of strokes) if (s.plane === 'top') drawStrokeLive(s, 0); for (const b of branches) if (b.plane === 'top' || (b.pre && castle && castle.morph > 0 && morphP(b.pts[0], b.pts[1], true).top)) list.push(b); if (list.length) buildLacePath(list, mapBranchLive, cam.R * LPATH_SCALE * .8, true); }
+function renderWorld(noActors) {
+  DLn = 0; const hideBirds = false;
+  if (!noActors && !hideBirds) for (const b of birds) if (b.st === 'peek') { birdScreen(b); drawBird(b); }
+  drawCookie();
+  if (castle) drawHoleAndCrack();
+  // flat cream and lace
+  const liveCastle = castle && castle.t >= 3.4;
+  const lw = cam.R * LPATH_SCALE;
+  if (!liveCastle) {
+    for (const s of strokes) if (!s.baked && s.plane === 'ground') drawStrokeLive(s, 0);
+    const list = []; for (const b of branches) if (!b.baked && b.plane === 'ground') list.push(b);
+    if (list.length) buildLacePath(list, mapBranchLive, lw, true);
+  } else {
+    for (const s of strokes) if (s.plane === 'ground') drawStrokeLive(s, s.pre ? 1 : 0);
+    const list = []; for (const b of branches) { if (b.plane !== 'ground') continue; if (b.pre && morphP(b.pts[0], b.pts[1], true).top) continue; list.push(b); }
+    drawRailPosts(list); if (list.length) buildLacePath(list, mapBranchLive, lw, true);
+  }
+  drawFootprints();
+  // drawables
+  for (const o of sweets) {
+    o.vis = false; if (o.gone || o.held) continue; if (T < o.tb - .02 && o.kind !== 'flower') continue;
+    sweetPos(o); proj(o.wx, o.wy, o.wz); o.sx = PX; o.sy = PY; o.vis = true;
+    const k = o.plane === 'balcony' ? .0003 + o.wy * 1e-5 : o.onTop ? .0001 + o.wy * 1e-5 : o.wy;
+    dl(k, dSweet, o);
+  }
+  for (const a of arches) { let my = (a.ay + a.by) / 2; dl(my, dArch, a); }
+  if (castle) {
+    const c = castle;
+    if (c.t >= 3.0) for (const w of c.wedges) { const tw = c.towers[w.tw]; dl(w.k < .5 ? -50 : tw.y + 1e-6, dWedge, w); }
+    for (const tw of c.towers) dl(tw.y, dTower, tw);
+    if (c.t >= 3.4) { dl(0, drawTier1, null); dl(.00005, dTopStrokes, null); dl(.0001, drawTier2, null); }
+    if (c.bal > 0) { dl(.00025, () => drawRail(false), null); dl(.00027, dBalconyStrokes, null); dl(.00028, drawTeaSet, null); dl(.0003 + TEA.cup.y * 1e-5, drawCup, null); dl(.00045, () => drawRail(true), null); dl(.00049, drawBellTop, null); }
+    if (stairs) { for (let j = 0; j < stairs.steps.length; j++) dl(.5 - j * 1e-4, dStep, j); dl(.4, drawStairHint, null); }
+  }
+  if (G.dough) dl(3, drawDough, null);
+  if (!noActors) {
+    if (!pr.hidden) {
+      prScreen(); proj(pr.x, pr.y, pr.z); pr.headX = PX; pr.headY = PY - pr.u * 78;
+      let k = pr.y; if (pr.where === 'stairs') k = .5 - Math.max(0, pr.climbJ) * 1e-4 + 5e-5; else if (pr.where === 'balcony') k = .0003 + pr.y * 1e-5;
+      dl(k, dPrincess, null);
+    }
+    for (const b of birds) {
+      if (b.st === 'peek') continue; birdScreen(b);
+      let k = b.y; if (b.perch || (castle && castle.built && b.z > ZTOP - .05)) k = Math.sin(Math.atan2(b.y, b.x)) >= 0 ? .00046 : .00024; if (b.fly) k = b.z > .4 ? .6 : b.y;
+      dl(k, dBird, b);
+    }
+  }
+  const arr = DL.slice(0, DLn); arr.sort(dlCmp);
+  for (const e of arr) e.fn(e.a);
+}
+let curFocus = null;
+function render() {
+  ctx = mainCtx; ctx.setTransform(DPR, 0, 0, DPR, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(bgCan, 0, 0, W, H);
+  drawMinis();
+  if (G.trans) {
+    drawTransition();
+    if (!pr.hidden) { prScreen(); pr.headX = pr.sx; pr.headY = pr.sy - pr.u * 78; drawPrincess(pr.sx, pr.sy, pr.u); drawPlate(pr.sx, pr.sy, pr.u); }
+  } else renderWorld(false);
+  drawFocus(curFocus);
+  drawButterflies();
+  if (!G.trans || G.trans.t > 1.2) drawBag();
+  drawCarry();
+  drawParts();
+  if (castle && castle.flash > 0) {
+    const f = castle.flash; const tw = castle.towers[castle.jewelTw]; proj(tw.x, tw.y, tw.h + tw.roofH + .1); const c = ctx;
+    c.globalCompositeOperation = 'lighter';
+    c.fillStyle = radG(PX, PY, 0, Math.max(W, H) * .8, [[0, `rgba(255,236,170,${.55 * f})`], [.4, `rgba(255,200,220,${.22 * f})`], [1, 'rgba(255,255,255,0)']]); c.fillRect(0, 0, W, H);
+    const cols = ['255,140,180', '255,230,140', '160,240,210', '160,210,255', '210,170,255'];
+    for (let i = 0; i < 10; i++) { const a = T * .4 + i * TAU / 10; const L = Math.max(W, H); c.fillStyle = `rgba(${cols[i % 5]},${.16 * f})`; c.beginPath(); c.moveTo(PX, PY); c.lineTo(PX + Math.cos(a - .06) * L, PY + Math.sin(a - .06) * L); c.lineTo(PX + Math.cos(a + .06) * L, PY + Math.sin(a + .06) * L); c.fill(); }
+    c.globalCompositeOperation = 'source-over';
+  }
+  drawDemo();
+}
+
+// ================= update / loop =================
+function update(dt) {
+  T += dt;
+  updTimers();
+  if (G.trans) updTransition(dt);
+  updCam();
+  updBag(dt); updDraw(dt); updCarry(dt);
+  updStrokes(dt);
+  updCastle(dt);
+  updPrincess(dt);
+  for (const b of birds) updBird(b, dt);
+  updButterflies(dt);
+  updGame(dt);
+  updTea(dt);
+  updParts(dt);
+  curFocus = computeFocus(); updDemo(dt, curFocus);
+  musicUpdate();
+  for (let i = sweets.length - 1; i >= 0; i--) if (sweets[i].gone && sweets[i] !== pr.plate) sweets.splice(i, 1);
+}
+let resizePending = false;
+function frame(now) {
+  if (!running) return;
+  rafId = requestAnimationFrame(frame);
+  if (resizePending) { resizePending = false; if (bag.drag) endBag(); if (carry.o) dropCarry(); layout(); }
+  const dt = Math.min(.05, Math.max(0, (now - lastNow) / 1000)) * (G.timeScale || 1); lastNow = now;
+  update(dt); render();
+}
+window.addEventListener('resize', () => { resizePending = true; });
+window.addEventListener('orientationchange', () => { resizePending = true; });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { running = false; cancelAnimationFrame(rafId); if (AU.c && AU.c.state === 'running') AU.c.suspend(); S.squish(false, 0); }
+  else if (!running) { running = true; lastNow = performance.now(); rafId = requestAnimationFrame(frame); if (AU.c) AU.c.resume(); }
+});
+// init
+function init() {
+  G.pal = pick(CREAM_PALS); G.hair = pick(HAIRS); G.cookieSeed = Math.floor(rand(1e9)); ROOT = pick([523.25, 587.33, 493.88]);
+  G.sweetKinds = pick([['petit', 'macaron'], ['petit'], ['macaron'], ['petit', 'macaron', 'flower']]);
+  layout();
+  const h = prHome(); pr.x = h.x; pr.y = h.y; pr.z = 0;
+  birds = [newBird(null, true)];
+  if (rand() < .3) { const b = newBird(null, true); const a = L.birdAng + .45; b.x = Math.cos(a); b.y = Math.sin(a); birds.push(b); }
+  lastNow = performance.now(); rafId = requestAnimationFrame(frame);
+}
+// test hooks (no UI)
+window.__lace = {
+  G, get state() { return { act: G.act, score: G.score, feeds: G.feeds, arches: G.arches, strokes: strokes.length, sweets: sweets.length, branches: branches.length, castle: !!castle, built: !!(castle && castle.built), steps: stairs ? stairs.steps.length : 0, stairsDone: !!(stairs && stairs.done), where: pr.where, tea: !!G.tea, dough: !!G.dough, trans: !!G.trans, cycle: G.cycle, pts: totalPts, parts: pCount, minis: minis.length, T }; },
+  bag() { const g = bagGrip(); return { tipX: bag.tipX, tipY: bag.tipY, gx: g[0], gy: g[1] }; },
+  sweets() { return sweets.filter(o => o.vis && !o.held && !o.gone && sweetDone(o)).map(o => ({ kind: o.kind, x: o.sx, y: o.sy - o.r * cam.R * .9, tea: !!o.tea })); },
+  plate() { return { x: pr.plateX, y: pr.plateY }; },
+  cam() { return { cx: cam.cx, cy: cam.cy, R: cam.R, sq: cam.sq, hz: cam.hz }; },
+  stairTop() { return stairs ? stairTopScreen() : null; },
+  balcony() { proj(0, 0, ZTOP); return [PX, PY]; },
+  dough() { return G.dough ? doughScreen() : null; },
+  birds() { return birds.map(b => ({ x: b.sx, y: b.sy, st: b.st })); },
+};
+init();
+})();
+</script></body></html>

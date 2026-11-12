@@ -1,0 +1,858 @@
+'use strict';
+/* ==========================================================
+   パンケーキ
+   固有の変身:
+   - 牛乳の量 → 生地のゆるさ → 流したときの広がり方・厚み
+   - 混ぜ方(回した量・速さ) → ダマの残り / ふくらみ(気泡)
+   - 注いだ場所と時間 → 自分だけの形のパンケーキ(複数枚も可)
+   - 焼き時間 → 表裏それぞれの焼き色 / 気泡がはじけてポツポツ穴
+   - ひっくり返すのは自分のフリック
+   - 最後はシロップを指でかける(軌跡が残る)
+   ========================================================== */
+(function () {
+
+  const def = {
+    id: 'pancake',
+    color: '#ffe3b3',
+    icon(ctx, r) {
+      /* fluffy stack with syrup drip + butter */
+      softShadow(ctx, 0, r * 0.75, r * 0.95, r * 0.3, 0.2);
+      for (let i = 0; i < 3; i++) {
+        const y = r * 0.42 - i * r * 0.36;
+        const w = r * 0.95 - i * r * 0.07;
+        ell(ctx, 0, y + r * 0.12, w, r * 0.42, '#b97a35');
+        const g = ctx.createLinearGradient(0, y - r * 0.3, 0, y + r * 0.3);
+        g.addColorStop(0, '#f2c26b'); g.addColorStop(1, '#d99a48');
+        ell(ctx, 0, y, w, r * 0.42, g);
+        ell(ctx, 0, y - r * 0.06, w * 0.82, r * 0.3, '#f7d791');
+      }
+      /* syrup */
+      ctx.fillStyle = '#c9781e';
+      ctx.beginPath();
+      ctx.ellipse(0, -r * 0.36, r * 0.62, r * 0.2, 0, 0, TAU);
+      ctx.fill();
+      for (const dx of [-0.45, 0.1, 0.4]) {
+        rr(ctx, dx * r - r * 0.05, -r * 0.32, r * 0.1, r * (0.24 + Math.abs(dx) * 0.2), r * 0.05);
+        ctx.fill();
+      }
+      drawButterCube(ctx, 0, -r * 0.52, r * 0.014);
+    },
+
+    steps(sc) {
+      const F = sc.food;
+      F.flour = false; F.eggStage = 0; F.milk = 0;
+      F.lump = 1; F.air = 0; F.batter = 1;
+      F.blobs = []; F.syrup = []; F.berries = []; F.butter = false;
+
+      const bowlAt = () => ({ x: App.W / 2, y: App.H * 0.56, r: Math.min(App.W * 0.34, 190 * App.S) });
+      const panAt = () => ({ x: App.W / 2, y: App.H * 0.5, r: Math.min(App.W * 0.4, 215 * App.S) });
+      const visc = () => clamp(1.25 - F.milk * 0.85, 0.35, 1.15);
+
+      /* ---- rich ingredient props ---- */
+      function drawFlourBag(ctx, x, y, S) {
+        softShadow(ctx, x, y + 52 * S, 42 * S, 12 * S, 0.22);
+        clay(ctx, () => rr(ctx, x - 38 * S, y - 46 * S, 76 * S, 92 * S, 12 * S),
+          { x, y, r: 52 * S, base: '#f6ead0', bot: '#d9c193', gloss: 0 });
+        /* folded cloth top */
+        ctx.fillStyle = '#e8d5ac';
+        rr(ctx, x - 38 * S, y - 46 * S, 76 * S, 22 * S, 12 * S); ctx.fill();
+        ctx.fillStyle = 'rgba(140,110,60,0.2)';
+        rr(ctx, x - 38 * S, y - 28 * S, 76 * S, 4 * S, 2 * S); ctx.fill();
+        /* label with wheat */
+        ell(ctx, x, y + 12 * S, 25 * S, 19 * S, '#fffdf6');
+        ctx.strokeStyle = '#d9b87a'; ctx.lineWidth = 2 * S;
+        ctx.beginPath(); ctx.ellipse(x, y + 12 * S, 25 * S, 19 * S, 0, 0, TAU); ctx.stroke();
+        ctx.strokeStyle = '#c9a250'; ctx.lineWidth = 2.4 * S; ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.moveTo(x, y + 22 * S); ctx.lineTo(x, y + 4 * S); ctx.stroke();
+        for (let i = 0; i < 3; i++) {
+          const yy = y + 8 * S + i * 4 * S;
+          ctx.beginPath(); ctx.moveTo(x, yy); ctx.lineTo(x - 6 * S, yy - 4 * S); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(x, yy); ctx.lineTo(x + 6 * S, yy - 4 * S); ctx.stroke();
+        }
+      }
+      function drawEggCup(ctx, x, y, S, crack) {
+        clayEll(ctx, x, y + 26 * S, 26 * S, 13 * S, '#a8d4ec', { gloss: 0.4 });
+        drawEggItem(ctx, x, y, S * 1.25, crack);
+      }
+      function drawYolk(ctx, x, y, s) {
+        const g = ctx.createRadialGradient(x - 6 * s, y - 5 * s, 2 * s, x, y, 26 * s);
+        g.addColorStop(0, '#fbd061');
+        g.addColorStop(0.7, '#f5ae2e');
+        g.addColorStop(1, '#e0921c');
+        ctx.fillStyle = g;
+        ctx.beginPath(); ctx.ellipse(x, y, 26 * s, 19 * s, 0, 0, TAU); ctx.fill();
+        ctx.globalAlpha = 0.75;
+        ell(ctx, x - 8 * s, y - 6 * s, 7 * s, 4.5 * s, '#ffe9ad');
+        ctx.globalAlpha = 1;
+      }
+
+      /* wavy liquid surface path inside the bowl */
+      function liquidPath(ctx, bx, by, rx, ry, amp, phase) {
+        ctx.beginPath();
+        const N = 30;
+        for (let i = 0; i <= N; i++) {
+          const a = i / N * TAU;
+          const k = 1 + amp * Math.sin(a * 3 + phase) + amp * 0.5 * Math.sin(a * 5 - phase * 1.7);
+          const px = bx + Math.cos(a) * rx * k;
+          const py = by + Math.sin(a) * ry * k;
+          i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+        }
+        ctx.closePath();
+      }
+
+      /* ---- batter appearance inside bowl (step 1) ---- */
+      function drawBatterBowl(ctx, x, y, r) {
+        drawBowl(ctx, x, y, r, '#8ecbe8');
+        ctx.save();
+        bowlClip(ctx, x, y, r);
+        const b = bowlInner(x, y, r);
+        if (F.milk > 0) {
+          const mrx = b.rx * (0.4 + F.milk * 0.55), mry = b.ry * (0.4 + F.milk * 0.5);
+          const g = ctx.createLinearGradient(0, b.y - mry, 0, b.y + mry);
+          g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#eef0e8');
+          ell(ctx, b.x, b.y + b.ry * 0.15, mrx, mry, g);
+          ctx.globalAlpha = 0.6;
+          ell(ctx, b.x - mrx * 0.3, b.y + b.ry * 0.05, mrx * 0.3, mry * 0.16, '#ffffff');
+          ctx.globalAlpha = 1;
+        }
+        if (F.flour) {
+          clayEll(ctx, b.x - b.rx * 0.25, b.y, b.rx * 0.42, b.ry * 0.5, '#f7f1e0', { grain: 0.6, gloss: 0.3 });
+          clayEll(ctx, b.x + b.rx * 0.2, b.y - b.ry * 0.1, b.rx * 0.3, b.ry * 0.36, '#fbf6ea', { grain: 0.6, gloss: 0.2 });
+        }
+        if (F.eggStage >= 2) {
+          drawYolk(ctx, b.x + b.rx * 0.32, b.y + b.ry * 0.22, App.S);
+        }
+        ctx.restore();
+        bowlFront(ctx, x, y, r, '#8ecbe8');
+      }
+
+      /* ---- mixing bowl (step 2) ---- */
+      const stir = new Stir();
+      function drawMixedBowl(ctx, x, y, r) {
+        const tilt = Math.sin(App.time * 9) * 0.012 * clamp(stir.speed / 14, 0, 1);
+        ctx.save();
+        ctx.translate(x, y); ctx.rotate(tilt); ctx.translate(-x, -y);
+        drawBowl(ctx, x, y, r, '#8ecbe8');
+        ctx.save();
+        bowlClip(ctx, x, y, r);
+        const b = bowlInner(x, y, r);
+        const amp = clamp(stir.speed / 26, 0, 0.1);
+        const phase = stir.revs * TAU;
+        /* batter body: smoother = creamier color */
+        const base = mixc('#efe0bc', '#f6dfa4', 1 - F.lump);
+        const g = ctx.createLinearGradient(0, b.y - b.ry, 0, b.y + b.ry);
+        g.addColorStop(0, mixc(base, '#ffffff', 0.25));
+        g.addColorStop(1, mixc(base, '#a06a28', 0.18));
+        ctx.fillStyle = g;
+        liquidPath(ctx, b.x, b.y + b.ry * 0.08, b.rx * 0.97, b.ry * 0.9, amp, phase);
+        ctx.fill();
+        ctx.save();
+        liquidPath(ctx, b.x, b.y + b.ry * 0.08, b.rx * 0.97, b.ry * 0.9, amp, phase);
+        ctx.clip();
+        /* marble streaks while unmixed */
+        if (F.lump > 0.03) {
+          ctx.globalAlpha = F.lump * 0.85;
+          ctx.lineWidth = 11 * App.S; ctx.lineCap = 'round';
+          for (let i = 0; i < 4; i++) {
+            ctx.strokeStyle = i % 2 ? '#fdfdf6' : '#f2c96b';
+            const a0 = i * 1.7 + stir.revs * 1.8;
+            ctx.beginPath();
+            ctx.arc(b.x, b.y, b.rx * (0.25 + i * 0.16), a0, a0 + 2.2);
+            ctx.stroke();
+          }
+          ctx.globalAlpha = 1;
+        }
+        /* creamy swirl highlight, rotates while stirring */
+        ctx.globalAlpha = 0.3 * (1 - F.lump * 0.5);
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 8 * App.S;
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.rx * 0.45, phase * 0.8, phase * 0.8 + 1.8);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        /* lumps — little clay nuggets */
+        const nl = Math.round(F.lump * 12);
+        for (let i = 0; i < nl; i++) {
+          const a = n1(i * 13) * TAU + App.time * 0.1 + phase * 0.15;
+          const rd = n1(i * 7 + 2) * b.rx * 0.7;
+          const lx = b.x + Math.cos(a) * rd, ly = b.y + Math.sin(a) * rd * 0.6;
+          const lr = (4 + n1(i) * 7) * App.S * (0.4 + F.lump * 0.6);
+          ell(ctx, lx, ly + lr * 0.3, lr, lr * 0.5, 'rgba(150,110,50,0.25)');
+          ell(ctx, lx, ly, lr, lr * 0.75, '#eadaa8');
+          ell(ctx, lx - lr * 0.3, ly - lr * 0.25, lr * 0.3, lr * 0.2, 'rgba(255,255,255,0.55)');
+        }
+        /* air bubbles with glossy dots */
+        const nb = Math.round(F.air * 14);
+        for (let i = 0; i < nb; i++) {
+          const a = n1(i * 31 + 5) * TAU;
+          const rd = (0.3 + n1(i * 17) * 0.6) * b.rx;
+          const bx2 = b.x + Math.cos(a) * rd, by2 = b.y + Math.sin(a) * rd * 0.55;
+          const br = (2.5 + n1(i * 3) * 3) * App.S;
+          ctx.strokeStyle = 'rgba(255,255,255,0.8)'; ctx.lineWidth = 1.8 * App.S;
+          ctx.beginPath(); ctx.arc(bx2, by2, br, 0, TAU); ctx.stroke();
+          ctx.fillStyle = 'rgba(255,255,255,0.7)';
+          circle(ctx, bx2 - br * 0.35, by2 - br * 0.35, br * 0.25);
+        }
+        /* volume: batter mounds up in the middle when still, dips into a vortex while stirring */
+        const stirN = clamp(stir.speed / 10, 0, 1);
+        const domeH = (1 - stirN) * (0.35 + 0.45 * (1 - F.lump));
+        if (domeH > 0.05) {
+          const dg = ctx.createRadialGradient(b.x - b.rx * 0.15, b.y - b.ry * 0.25 * domeH, b.rx * 0.05, b.x, b.y, b.rx * 0.75);
+          dg.addColorStop(0, rgba(mixc(base, '#ffffff', 0.4), 0.75 * domeH));
+          dg.addColorStop(0.7, rgba(mixc(base, '#ffffff', 0.1), 0.25 * domeH));
+          dg.addColorStop(1, rgba(base, 0));
+          ell(ctx, b.x, b.y - b.ry * 0.12 * domeH, b.rx * 0.72, b.ry * 0.62, dg);
+          /* occlusion ring where the mound meets the bowl wall */
+          ctx.globalAlpha = 0.25 * domeH;
+          ctx.strokeStyle = mixc(base, '#7a4a18', 0.5);
+          ctx.lineWidth = 7 * App.S;
+          ctx.beginPath(); ctx.ellipse(b.x, b.y + b.ry * 0.1, b.rx * 0.88, b.ry * 0.8, 0, 0, TAU); ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+        if (stirN > 0.15) {
+          /* vortex dip around the whisk */
+          const vg = ctx.createRadialGradient(b.x, b.y, b.rx * 0.02, b.x, b.y, b.rx * 0.5);
+          vg.addColorStop(0, rgba(mixc(base, '#6a3c12', 0.5), 0.45 * stirN));
+          vg.addColorStop(1, rgba(base, 0));
+          ell(ctx, b.x, b.y, b.rx * 0.5, b.ry * 0.42, vg);
+          ctx.globalAlpha = 0.4 * stirN;
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 3 * App.S;
+          ctx.beginPath();
+          for (let sp2 = 0; sp2 <= 20; sp2++) {
+            const t = sp2 / 20;
+            const a = phase * 1.2 + t * 4.5;
+            const rr2 = b.rx * (0.06 + t * 0.42);
+            const px = b.x + Math.cos(a) * rr2, py = b.y + Math.sin(a) * rr2 * 0.7;
+            sp2 ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+          }
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+        grainRect(ctx, b.x - b.rx, b.y - b.ry, b.rx * 2, b.ry * 2, 0.25);
+        ctx.restore();
+        ctx.restore();
+        bowlFront(ctx, x, y, r, '#8ecbe8');
+        ctx.restore();
+      }
+
+      /* ---- pancake blob on the pan: extruded 2.5D volume ---- */
+      function drawBlob(ctx, b) {
+        const S = App.S;
+        let sy = 1, lift = 0;
+        if (b.flipping) {
+          sy = Math.abs(Math.cos(Math.PI * b.flipT));
+          lift = Math.sin(Math.PI * b.flipT) * 95 * S;
+        }
+        /* shadow stays on the pan while the pancake is airborne */
+        ctx.save();
+        ctx.globalAlpha = 0.28 * (1 - lift / (140 * S));
+        blobPathO(ctx, b.x, b.y + 6 * S, b.r * 1.02, 0.07, b.seed, 0.7);
+        ctx.fillStyle = '#141418'; ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.restore();
+        ctx.save();
+        ctx.translate(b.x, b.y - lift);
+        const land = b.land || 0;
+        ctx.scale(1 + land * 0.1, (1 - land * 0.16) * Math.max(sy, 0.06));
+        const rise = (1 + b.rise * 0.1);
+        /* thickness grows as the pancake puffs up */
+        const h = (6 + b.rise * 15) * S;
+        const sideBase = bakeColor(clamp(Math.max(b.bot, b.top * 0.4) * 0.95, 0, 1));
+        extrudeBlob(ctx, 0, -h, b.r * rise, 0.07, b.seed, 0.74, h,
+          mixc(sideBase, '#ffffff', 0.06), mixc(sideBase, '#5a2c10', 0.4),
+          makeTop => {
+            bakeSurface(ctx, makeTop, 0, -h, b.r * rise, b.top, b.seed, { blotches: 6 });
+          });
+        /* pores from popped bubbles */
+        ctx.fillStyle = 'rgba(110,60,15,0.4)';
+        for (const po of b.pores) {
+          circle(ctx, po.dx * b.r, po.dy * b.r * 0.74 - h, 2.6 * S);
+        }
+        ctx.fillStyle = 'rgba(255,240,200,0.25)';
+        for (const po of b.pores) {
+          circle(ctx, po.dx * b.r - 1 * S, po.dy * b.r * 0.74 - h - 1 * S, 1.1 * S);
+        }
+        /* live bubbles — glossy domes */
+        for (const bu of b.bub) {
+          const k = clamp(bu.age / bu.life, 0, 1);
+          const br = bu.r * (0.5 + k * 0.6);
+          const bx2 = bu.dx * b.r, by2 = bu.dy * b.r * 0.74 - h;
+          ctx.fillStyle = 'rgba(255,246,220,0.95)';
+          circle(ctx, bx2, by2, br);
+          ctx.fillStyle = 'rgba(200,150,80,0.3)';
+          circle(ctx, bx2, by2 + br * 0.3, br * 0.55);
+          ctx.fillStyle = 'rgba(255,255,255,0.85)';
+          circle(ctx, bx2 - br * 0.3, by2 - br * 0.35, br * 0.3);
+        }
+        ctx.restore();
+      }
+
+      /* ================= step 1 : ingredients ================= */
+      let pouring = false;
+      const itemsAt = () => {
+        const { W, H } = App;
+        return {
+          flour: { x: W * 0.2, y: H * 0.24 },
+          egg: { x: W * 0.5, y: H * 0.22 },
+          milk: { x: W * 0.8, y: H * 0.24 }
+        };
+      };
+      const s1 = {
+        hint: 'tap',
+        hintAt() { const it = itemsAt(); return !F.flour ? it.flour : (F.eggStage < 2 ? it.egg : it.milk); },
+        update(dt) {
+          if (pouring && App.pointer.down) {
+            F.milk = Math.min(1, F.milk + dt * 0.5);
+            if (Math.random() < 0.3) {
+              const b = bowlAt();
+              sc.parts.add({ x: b.x + rnd(-20, 20) * App.S, y: b.y - 10 * App.S, color: '#fdfdf6', r: 4 * App.S, vy: 60 * App.S, life: 0.3 });
+            }
+          } else pouring = false;
+        },
+        draw(ctx) {
+          const S = App.S, it = itemsAt(), b = bowlAt();
+          /* shelf board behind the ingredients */
+          const shelfY = App.H * 0.24 + 56 * S;
+          softShadow(ctx, App.W / 2, shelfY + 12 * S, App.W * 0.42, 10 * S, 0.16);
+          clay(ctx, () => rr(ctx, App.W * 0.06, shelfY, App.W * 0.88, 14 * S, 7 * S),
+            { x: App.W / 2, y: shelfY + 7 * S, r: 10 * S, base: '#dda86c', gloss: 0 });
+          drawBatterBowl(ctx, b.x, b.y, b.r);
+          if (!F.flour) drawFlourBag(ctx, it.flour.x, it.flour.y, S);
+          if (F.eggStage < 2) drawEggCup(ctx, it.egg.x, it.egg.y, S, F.eggStage);
+          if (pouring && App.pointer.down) {
+            drawPitcher(ctx, b.x - 60 * S, b.y - b.r - 60 * S, S * 1.15, -0.9);
+            drawStream(ctx, b.x - 95 * S, b.y - b.r - 75 * S, b.x - 20 * S, b.y - 20 * S, 10 * S, '#fdfdf6');
+          } else {
+            drawPitcher(ctx, it.milk.x, it.milk.y, S * 1.15, 0);
+          }
+        },
+        down(p) {
+          const S = App.S, it = itemsAt(), b = bowlAt();
+          if (!F.flour && dist(p.x, p.y, it.flour.x, it.flour.y) < 92 * S) {
+            F.flour = true; Snd.plop();
+            flourPuff(sc.parts, b.x, b.y - 20 * S, 14);
+            return;
+          }
+          if (F.eggStage < 2 && dist(p.x, p.y, it.egg.x, it.egg.y) < 92 * S) {
+            F.eggStage++;
+            if (F.eggStage >= 2) {
+              Snd.plop();
+              sparkleBurst(sc.parts, b.x, b.y - 30 * S, '#f7b53a', 6);
+              for (const d of [-1, 1]) {
+                sc.parts.add({
+                  x: it.egg.x, y: it.egg.y, color: '#faeed6', r: 12 * S, kind: 'dot',
+                  vx: d * rnd(100, 200) * S, vy: -rnd(140, 240) * S, g: 900 * S, life: 0.7
+                });
+              }
+            } else Snd.crunch();
+            return;
+          }
+          /* a rough press anywhere near the pitcher counts */
+          if (dist(p.x, p.y, it.milk.x, it.milk.y) < 105 * S ||
+            (p.x > App.W * 0.62 && p.y < App.H * 0.42) ||
+            (pouring === false && F.milk > 0 && dist(p.x, p.y, b.x - 60 * S, b.y - b.r - 60 * S) < 100 * S)) {
+            pouring = true; Snd.tick();
+          }
+        },
+        up() { pouring = false; },
+        done: () => F.flour && F.eggStage >= 2 && F.milk > 0.2
+      };
+
+      /* ================= step 2 : mix ================= */
+      let prevRevs = 0;
+      const s2 = {
+        hint: 'stir',
+        hintAt() { const b = bowlAt(); return { x: b.x, y: b.y }; },
+        update(dt) {
+          const b = bowlAt();
+          const sp = stir.feed(App.pointer, b.x, b.y, b.r * 1.3, dt);
+          const dR = stir.revs - prevRevs; prevRevs = stir.revs;
+          if (dR > 0) {
+            F.lump = Math.max(0, F.lump - dR * 0.12);
+            F.air = Math.min(1, F.air + dR * (sp < 8 ? 0.09 : 0.035));
+            if (Math.random() < dR * 2) Snd.tick();
+          }
+          if (sp > 15 && Math.random() < 0.3) {
+            const a = rnd(TAU);
+            sc.parts.add({
+              x: b.x + Math.cos(a) * b.r * 0.7, y: b.y + Math.sin(a) * b.r * 0.45,
+              color: '#f6dfa6', r: rnd(3, 6) * App.S,
+              vx: Math.cos(a) * rnd(100, 240) * App.S, vy: -rnd(60, 180) * App.S,
+              g: 500 * App.S, life: 0.6
+            });
+            Snd.tick();
+          }
+        },
+        /* scrubbing back and forth works too — circles aren't required */
+        move(p) {
+          const b = bowlAt();
+          if (dist(p.x, p.y, b.x, b.y) < b.r * 1.1) {
+            const d = dist(p.px, p.py, p.x, p.y);
+            F.lump = Math.max(0, F.lump - d * 0.00028);
+            F.air = Math.min(1, F.air + d * 0.0001);
+          }
+        },
+        draw(ctx) {
+          const b = bowlAt();
+          drawMixedBowl(ctx, b.x, b.y, b.r);
+          const p = App.pointer;
+          if (p.down) {
+            /* whisk with motion blur arcs when fast */
+            if (stir.speed > 8) {
+              ctx.save();
+              ctx.globalAlpha = clamp((stir.speed - 8) / 20, 0, 0.35);
+              ctx.strokeStyle = '#fff';
+              ctx.lineWidth = 5 * App.S;
+              ctx.beginPath();
+              ctx.arc(b.x, b.y, dist(p.x, p.y, b.x, b.y), Math.atan2(p.y - b.y, p.x - b.x) - 0.8, Math.atan2(p.y - b.y, p.x - b.x) - 0.15);
+              ctx.stroke();
+              ctx.restore();
+            }
+            drawWhisk(ctx, p.x, p.y, App.S * 1.1, Math.sin(App.time * 6) * 0.15);
+          } else drawWhisk(ctx, b.x + b.r * 1.15, b.y - 30 * App.S, App.S, 0.4);
+        },
+        done: () => F.lump < 0.45
+      };
+
+      /* ================= step 3 : pour on pan ================= */
+      const s3 = {
+        hint: 'hold',
+        bgMode: 'stove',
+        hintAt() { const pn = panAt(); return { x: pn.x, y: pn.y }; },
+        enter() { Snd.setSizzle(0.15); },
+        update(dt) {
+          const p = App.pointer, pn = panAt();
+          const dd0 = dist(p.x, p.y, pn.x, pn.y);
+          if (p.down && F.batter > 0 && dd0 < pn.r * 1.2) {
+            /* a finger near the edge still pours — snap the landing point into the pan */
+            let tx = p.x, ty = p.y;
+            if (dd0 > pn.r * 0.78) {
+              tx = pn.x + (p.x - pn.x) / dd0 * pn.r * 0.78;
+              ty = pn.y + (p.y - pn.y) / dd0 * pn.r * 0.78;
+            }
+            const v = visc();
+            let target = null;
+            for (const b of F.blobs) {
+              if (dist(tx, ty, b.x, b.y) < b.r + 26 * App.S) { target = b; break; }
+            }
+            if (!target) {
+              target = { x: tx, y: ty, r: 12 * App.S, seed: rnd(10), top: 0, bot: 0, rise: 0, flipping: false, flipT: 0, flippedOnce: false, land: 0, pores: [], bub: [] };
+              F.blobs.push(target);
+              Snd.plop();
+            }
+            const grow = dt * (52 / (0.35 + v)) * App.S;
+            const maxR = Math.min(pn.r * 0.62, (150 / v) * App.S * 0.8);
+            if (target.r < maxR) target.r += grow;
+            const dd = dist(target.x, target.y, pn.x, pn.y);
+            const lim = pn.r * 0.8 - target.r * 0.6;
+            if (dd > lim && dd > 0) {
+              target.x = pn.x + (target.x - pn.x) / dd * lim;
+              target.y = pn.y + (target.y - pn.y) / dd * lim;
+            }
+            F.batter = Math.max(0, F.batter - dt * 0.24);
+            if (Math.random() < 0.2) Snd.tick();
+          }
+        },
+        draw(ctx) {
+          const pn = panAt(), S = App.S;
+          drawStoveTop(ctx, pn.x, pn.y, pn.r);
+          drawPan(ctx, pn.x, pn.y, pn.r);
+          for (const b of F.blobs) drawBlob(ctx, b);
+          drawHeatMark(ctx, pn.x - pn.r * 1.08, pn.y - pn.r * 0.8, S);
+          const p = App.pointer;
+          if (p.down && F.batter > 0 && dist(p.x, p.y, pn.x, pn.y) < pn.r * 1.2) {
+            drawLadle(ctx, p.x, p.y - 60 * S, S);
+            drawStream(ctx, p.x, p.y - 48 * S, p.x, p.y, 9 * S * (0.6 + visc() * 0.5), '#f6dfa6');
+          }
+          /* small bowl showing batter left */
+          const bx = App.W * 0.13, by = App.H * 0.85;
+          drawBowl(ctx, bx, by, 62 * S, '#8ecbe8');
+          if (F.batter > 0.02) {
+            ctx.save(); bowlClip(ctx, bx, by, 62 * S);
+            ell(ctx, bx, by + 8 * S, 52 * S * F.batter + 6 * S, 32 * S * F.batter + 4 * S, '#f6dfa6');
+            ell(ctx, bx - 14 * S, by + 2 * S, 12 * S, 5 * S, 'rgba(255,255,255,0.4)');
+            ctx.restore();
+          }
+        },
+        done: () => F.blobs.length > 0 && F.batter < 0.92
+      };
+
+      /* ================= step 4 : cook & flip =================
+         フリップは「なぞるだけ」: 指の軌跡がパンケーキを通ればその場で返る。
+         返せない子には段階アシスト(光る→フライ返しが差し込まれてタップでもOK)。
+         ちょんとつつく(タップ)だけは「あちち」で優しく教える。 */
+      let popCool = 0;
+      let turnerAnims = [];
+      let assistT = 0;
+      let strokeFlipped = false;
+      /* oblique-aware distance from finger to a blob */
+      const distO = (px, py, b) => Math.hypot(px - b.x, (py - b.y) / 0.74);
+      function startFlip(b, dir) {
+        b.flipping = true; b.flipT = 0; b.swapped = false;
+        turnerAnims.push({ x: b.x, y: b.y, t: 0, dir: dir || 1 });
+        if (turnerAnims.length > 3) turnerAnims.shift();
+        strokeFlipped = true;
+        assistT = 0;
+        Snd.flip();
+      }
+      const s4 = {
+        hint: 'drag',
+        hintOpt: { dx: 1, dy: 0 },
+        bgMode: 'stove',
+        hintAt() {
+          const b = F.blobs.find(b => !b.flippedOnce) || F.blobs[0];
+          return b ? { x: b.x, y: b.y - 20 * App.S } : { x: App.W / 2, y: App.H / 2 };
+        },
+        enter() { Snd.setSizzle(0.7); assistT = 0; turnerAnims = []; },
+        assistStage() { return assistT > 10 ? 2 : assistT > 5 ? 1 : 0; },
+        assistBlob() { return F.blobs.find(b => !b.flippedOnce && !b.flipping); },
+        update(dt) {
+          popCool -= dt;
+          if (F.blobs.some(b => !b.flippedOnce)) {
+            assistT += dt;
+            /* keep the "なぞってね" hint on screen while assisting, even mid-touch */
+            if (this.assistStage() >= 1) sc.lastAct = Math.min(sc.lastAct, App.time - 2.3);
+          }
+          for (const a of turnerAnims) a.t += dt * 2.8;
+          turnerAnims = turnerAnims.filter(a => a.t < 1);
+          for (const b of F.blobs) {
+            b.land = Math.max(0, (b.land || 0) - dt * 5);
+            b.flipCool = Math.max(0, (b.flipCool || 0) - dt);
+            if (b.flipping) {
+              b.flipT += dt * 2.6;
+              if (b.flipT >= 0.5 && !b.swapped) {
+                const t = b.top; b.top = b.bot; b.bot = t;
+                b.swapped = true; b.flippedOnce = true;
+                Snd.plop();
+              }
+              if (b.flipT >= 1) {
+                b.flipping = false; b.flipT = 0; b.swapped = false;
+                b.land = 1;
+                b.flipCool = 0.6;
+                for (let k = 0; k < 4; k++) {
+                  sc.parts.add({
+                    x: b.x + rnd(-b.r, b.r) * 0.7, y: b.y + rnd(0, 10) * App.S,
+                    kind: 'glow', color: '#ffb054', r: rnd(8, 14) * App.S,
+                    vy: -rnd(30, 80) * App.S, life: 0.4, alpha: 0.7
+                  });
+                }
+              }
+              continue;
+            }
+            b.bot = Math.min(1.15, b.bot + dt * 0.085);
+            b.rise = Math.min(1, b.rise + dt * F.air * 0.22);
+            if (b.top < 0.15 && b.bub.length < 3 + F.air * 8 && Math.random() < dt * (1.5 + F.air * 4)) {
+              const a = rnd(TAU), rd = rnd(0.15, 0.75);
+              b.bub.push({ dx: Math.cos(a) * rd, dy: Math.sin(a) * rd, r: rnd(3, 6) * App.S, age: 0, life: rnd(0.9, 1.6) });
+            }
+            for (let i = b.bub.length - 1; i >= 0; i--) {
+              const bu = b.bub[i];
+              bu.age += dt;
+              if (bu.age > bu.life) {
+                b.bub.splice(i, 1);
+                if (b.pores.length < 22) b.pores.push({ dx: bu.dx, dy: bu.dy });
+                sc.parts.add({
+                  x: b.x + bu.dx * b.r, y: b.y + bu.dy * b.r * 0.74,
+                  kind: 'ring', color: '#fff6dc', r: 3 * App.S, grow: 60 * App.S, life: 0.3, alpha: 0.8
+                });
+                if (popCool <= 0) { Snd.pop(); popCool = 0.18; }
+              }
+            }
+            if (Math.random() < dt * 2) steamPuff(sc.parts, b.x, b.y - 20 * App.S);
+            if (Math.random() < dt * 1.6) {
+              const a = rnd(TAU);
+              sc.parts.add({
+                x: b.x + Math.cos(a) * (b.r + 12 * App.S), y: b.y + Math.sin(a) * (b.r + 12 * App.S) * 0.74,
+                kind: 'glow', color: '#ffd070', r: rnd(4, 8) * App.S,
+                vx: Math.cos(a) * rnd(30, 90) * App.S, vy: -rnd(40, 110) * App.S,
+                g: 300 * App.S, life: rnd(0.25, 0.45), alpha: 0.8
+              });
+            }
+          }
+        },
+        draw(ctx) {
+          const pn = panAt(), S = App.S;
+          drawStoveTop(ctx, pn.x, pn.y, pn.r);
+          drawPan(ctx, pn.x, pn.y, pn.r);
+          for (const b of F.blobs) drawBlob(ctx, b);
+          drawHeatMark(ctx, pn.x - pn.r * 1.08, pn.y - pn.r * 0.8, S);
+          const stage = this.assistStage(), ab = this.assistBlob();
+          /* assist 1: the pancake that still needs flipping glows */
+          if (stage >= 1) {
+            for (const b of F.blobs) {
+              if (b.flippedOnce || b.flipping) continue;
+              ctx.save();
+              ctx.globalAlpha = 0.45 + 0.3 * Math.sin(App.time * 5);
+              ctx.strokeStyle = '#ffffff';
+              ctx.lineWidth = 5 * S;
+              blobPathO(ctx, b.x, b.y - 8 * S, b.r + (14 + 4 * Math.sin(App.time * 4)) * S, 0.07, b.seed, 0.74);
+              ctx.stroke();
+              ctx.restore();
+            }
+          }
+          /* assist 2: turner slides halfway under — now even a touch flips it */
+          if (stage >= 2 && ab) {
+            drawTurner(ctx, ab.x - ab.r * 0.55, ab.y + 6 * S, S, -0.08);
+            if (Math.random() < 0.06) sparkleBurst(sc.parts, ab.x, ab.y - 20 * S, '#fff', 2);
+          }
+          /* flip animations + turner following the finger */
+          const p = App.pointer;
+          let animDrawn = false;
+          for (const a of turnerAnims) {
+            const k = clamp(a.t, 0, 1);
+            drawTurner(ctx, a.x - a.dir * (1 - k) * 34 * S, a.y - Math.sin(k * Math.PI) * 54 * S, S,
+              -0.1 * a.dir, Math.sin(k * Math.PI));
+            animDrawn = true;
+          }
+          if (!animDrawn && !(stage >= 2 && ab)) {
+            if (p.down) drawTurner(ctx, p.x, p.y - 6 * S, S, -0.1);
+            else drawTurner(ctx, pn.x + pn.r * 1.05, pn.y + pn.r * 0.75, S * 0.92, 0.5);
+          }
+        },
+        down(p) {
+          strokeFlipped = false;
+          const ab = this.assistBlob();
+          if (this.assistStage() >= 2 && ab && distO(p.x, p.y, ab) < ab.r + 60 * App.S) {
+            startFlip(ab, 1);
+          }
+        },
+        move(p) {
+          if (p.moved < 26 * App.S) return;
+          for (const b of F.blobs) {
+            if (b.flipping || (b.flipCool || 0) > 0) continue;
+            if (distO(p.x, p.y, b) < b.r + 40 * App.S) {
+              startFlip(b, Math.sign(p.vx) || 1);
+            }
+          }
+        },
+        up(p, tap) {
+          if (tap && !strokeFlipped) {
+            for (const b of F.blobs) {
+              if (distO(p.x, p.y, b) < b.r + 24 * App.S) {
+                Ouch.trigger(p.x, p.y);
+                break;
+              }
+            }
+          }
+        },
+        done: () => F.blobs.length > 0 && F.blobs.every(b => b.flippedOnce)
+      };
+
+      /* ================= step 5 : plate & decorate (final) ================= */
+      let stack = [];
+      const plateAt = () => ({ x: App.W / 2, y: App.H * 0.62 });
+      function stackTop() {
+        const pl = plateAt();
+        let y = pl.y;
+        for (const b of stack) y -= b.h;
+        return { x: pl.x, y };
+      }
+      const s5 = {
+        hint: 'drag',
+        hintAt() { const t = stackTop(); return { x: t.x, y: t.y - 30 * App.S }; },
+        hintOpt: { dx: 1, dy: 0.2 },
+        enter() {
+          stack = F.blobs.slice().sort((a, b) => b.r - a.r).map(b => ({
+            r: clamp(b.r * 1.15, 58 * App.S, App.W * 0.3),
+            h: (14 + b.rise * 24) * App.S,
+            c: (clamp(b.top, 0, 1) + clamp(b.bot, 0, 1)) / 2,
+            pores: b.pores, seed: b.seed
+          }));
+          confettiBurst(sc.parts);
+          Snd.tada();
+        },
+        draw(ctx) {
+          const S = App.S, pl = plateAt();
+          drawPlate(ctx, pl.x, pl.y + 14 * S, Math.min(App.W * 0.42, 250 * S));
+          /* true cylinder stack: top ellipse joined to a curved side wall */
+          let y = pl.y;
+          stack.forEach((b, i) => {
+            const c = bakeColor(b.c);
+            const ry = b.r * 0.26;
+            const yTop = y - b.h, yBot = y;
+            /* contact shadow of this layer on the one below (or the plate) */
+            ell(ctx, pl.x, yBot + 3 * S, b.r * 1.0, ry * 0.9, 'rgba(100,55,15,0.22)');
+            /* side wall */
+            ctx.beginPath();
+            ctx.moveTo(pl.x - b.r, yTop);
+            ctx.lineTo(pl.x - b.r, yBot);
+            ctx.ellipse(pl.x, yBot, b.r, ry, 0, Math.PI, 0, true);
+            ctx.lineTo(pl.x + b.r, yTop);
+            ctx.ellipse(pl.x, yTop, b.r, ry, 0, 0, Math.PI, false);
+            ctx.closePath();
+            const g = ctx.createLinearGradient(0, yTop, 0, yBot + ry);
+            g.addColorStop(0, mixc(c, '#ffffff', 0.1));
+            g.addColorStop(0.55, c);
+            g.addColorStop(1, mixc(c, '#5a2c10', 0.35));
+            ctx.fillStyle = g;
+            ctx.fill();
+            /* moist crumb line along the middle of the side */
+            ctx.save();
+            ctx.globalAlpha = 0.3;
+            ctx.strokeStyle = mixc(c, '#ffffff', 0.4);
+            ctx.lineWidth = b.h * 0.22;
+            ctx.beginPath();
+            ctx.ellipse(pl.x, (yTop + yBot) / 2, b.r * 0.99, ry * 0.9, 0, Math.PI * 0.15, Math.PI * 0.85);
+            ctx.stroke();
+            ctx.restore();
+            /* top face — paler than the sides, like a real pancake */
+            const tg = ctx.createRadialGradient(pl.x - b.r * 0.2, yTop - 3 * S, b.r * 0.1, pl.x, yTop, b.r);
+            tg.addColorStop(0, mixc(c, '#ffffff', 0.4));
+            tg.addColorStop(1, mixc(c, '#ffffff', 0.14));
+            ell(ctx, pl.x, yTop, b.r, ry, tg);
+            /* browning blotches on the top face */
+            ctx.fillStyle = rgba(mixc(c, '#5a2c10', 0.3), 0.35);
+            for (let k = 0; k < 5; k++) {
+              ell(ctx, pl.x + (n1(b.seed + k * 3) - 0.5) * b.r * 1.3,
+                yTop + (n1(b.seed + k * 7) - 0.5) * ry * 1.4,
+                b.r * (0.08 + n1(b.seed + k) * 0.09), b.r * 0.035);
+            }
+            /* inner rim occlusion on the top face */
+            ctx.save();
+            ctx.globalAlpha = 0.18;
+            ctx.strokeStyle = mixc(c, '#5a2c10', 0.4);
+            ctx.lineWidth = b.r * 0.06;
+            ctx.beginPath(); ctx.ellipse(pl.x, yTop, b.r * 0.93, ry * 0.8, 0, 0, TAU); ctx.stroke();
+            ctx.restore();
+            if (i === stack.length - 1) {
+              ctx.fillStyle = 'rgba(110,60,15,0.35)';
+              for (const po of b.pores) {
+                if (Math.abs(po.dy) < 0.8) circle(ctx, pl.x + po.dx * b.r * 0.8, yTop + po.dy * ry * 0.9, 2.4 * S);
+              }
+            }
+            y -= b.h;
+          });
+          /* butter with a soft melt glow */
+          if (F.butter) {
+            ctx.save();
+            ctx.globalCompositeOperation = 'lighter';
+            ctx.globalAlpha = 0.25 + 0.1 * Math.sin(App.time * 3);
+            ell(ctx, pl.x, y - 4 * S, 40 * S, 14 * S, '#ffdf90');
+            ctx.restore();
+            drawButterCube(ctx, pl.x, y - 8 * S, S, 0.25);
+          }
+          /* syrup trail follows exactly where the finger went —
+             drawn as a pooling amber ribbon with wavering width */
+          if (F.syrup.length > 1) {
+            ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+            const segs = (wBase, color, dy = 0) => {
+              ctx.strokeStyle = color;
+              for (let i = 1; i < F.syrup.length; i++) {
+                const a = F.syrup[i - 1], b = F.syrup[i];
+                ctx.lineWidth = wBase * (0.7 + n1(i * 5.3) * 0.7);
+                ctx.beginPath();
+                ctx.moveTo(a.x, a.y + dy); ctx.lineTo(b.x, b.y + dy);
+                ctx.stroke();
+              }
+            };
+            segs(15 * S, 'rgba(150,84,20,0.55)', 2 * S);
+            segs(12 * S, 'rgba(224,146,44,0.9)');
+            /* pooled blobs along the trail */
+            for (let i = 0; i < F.syrup.length; i += 3) {
+              const pt = F.syrup[i];
+              ell(ctx, pt.x, pt.y + 1 * S, (8 + n1(i * 7.7) * 7) * S, (5 + n1(i * 2.3) * 4) * S, 'rgba(224,146,44,0.85)');
+            }
+            /* drips hanging off the trail */
+            ctx.strokeStyle = 'rgba(178,102,24,0.9)'; ctx.lineWidth = 6.5 * S;
+            for (let i = 3; i < F.syrup.length; i += 5) {
+              const pt = F.syrup[i];
+              const len = (6 + n1(i * 3.1) * 15) * S;
+              ctx.beginPath(); ctx.moveTo(pt.x, pt.y); ctx.lineTo(pt.x, pt.y + len); ctx.stroke();
+              circle(ctx, pt.x, pt.y + len, 4 * S, 'rgba(178,102,24,0.9)');
+            }
+            /* glossy light streak */
+            ctx.save();
+            ctx.translate(-2 * S, -2.5 * S);
+            segs(3.5 * S, 'rgba(255,232,180,0.75)');
+            ctx.restore();
+          }
+          for (const be of F.berries) drawStrawberry(ctx, be.x, be.y, S * be.s);
+          /* topping buttons */
+          const bb = this.btns();
+          clayButton(ctx, bb.butter.x, bb.butter.y, 44 * S, '#ffffff');
+          drawButterCube(ctx, bb.butter.x, bb.butter.y, S * 0.9);
+          clayButton(ctx, bb.berry.x, bb.berry.y, 44 * S, '#ffffff');
+          drawStrawberry(ctx, bb.berry.x, bb.berry.y, S * 0.9);
+          /* syrup bottle at finger while dragging */
+          const p = App.pointer;
+          if (p.down && this.dripping) {
+            ctx.save();
+            ctx.translate(p.x, p.y - 70 * S);
+            ctx.rotate(0.35);
+            clay(ctx, () => rr(ctx, -17 * S, -30 * S, 34 * S, 62 * S, 12 * S),
+              { x: 0, y: 0, r: 34 * S, base: '#c9803a', bot: '#8a5620', gloss: 0.7, glossX: -7 * S, glossY: -18 * S });
+            clay(ctx, () => rr(ctx, -7 * S, -48 * S, 14 * S, 20 * S, 5 * S),
+              { x: 0, y: -38 * S, r: 12 * S, base: '#8a5620', gloss: 0 });
+            ctx.restore();
+            drawStream(ctx, p.x + 12 * S, p.y - 36 * S, p.x, p.y, 6 * S, 'rgba(186,108,20,0.9)');
+          }
+          drawEndBtns(ctx);
+        },
+        btns() {
+          const S = App.S;
+          return {
+            butter: { x: App.W * 0.14, y: App.H * 0.28, r: 44 * S },
+            berry: { x: App.W * 0.86, y: App.H * 0.28, r: 44 * S }
+          };
+        },
+        /* syrup lands on the dish: project the finger point into the plate area */
+        syrupPt(p) {
+          const pl = plateAt(), S = App.S;
+          const top = stackTop();
+          const cx = pl.x, cy = (pl.y + top.y) / 2 - 4 * S;
+          const rx = Math.min(App.W * 0.36, 215 * S), ry = (pl.y - top.y) / 2 + 26 * S;
+          let dx = (p.x - cx) / rx, dy = (p.y - cy) / ry;
+          const d = Math.hypot(dx, dy);
+          if (d > 1) { dx /= d; dy /= d; }
+          return { x: cx + dx * rx, y: cy + dy * ry };
+        },
+        down(p) {
+          if (handleEndBtns(sc, p)) return;
+          const S = App.S, bb = this.btns(), pl = plateAt();
+          if (hitCircle(p, bb.butter)) {
+            F.butter = true; Snd.plop();
+            sparkleBurst(sc.parts, stackTop().x, stackTop().y, '#f7d878', 6);
+            return;
+          }
+          if (hitCircle(p, bb.berry)) {
+            if (F.berries.length < 6) {
+              F.berries.push({ x: pl.x + rnd(-1, 1) * App.W * 0.22, y: pl.y + rnd(-10, 26) * S, s: rnd(0.8, 1.1) });
+              Snd.plop();
+            }
+            return;
+          }
+          this.dripping = true;
+          this._tapStart = { len: F.syrup.length };
+          F.syrup.push(this.syrupPt(p));
+        },
+        move(p) {
+          if (this.dripping && F.syrup.length < 220) {
+            const pt = this.syrupPt(p);
+            const last = F.syrup[F.syrup.length - 1];
+            if (!last || dist(pt.x, pt.y, last.x, last.y) > 8 * App.S) F.syrup.push(pt);
+          }
+        },
+        up(p, tap) {
+          this.dripping = false;
+          /* a simple tap places a strawberry right where the finger touched */
+          if (tap && this._tapStart) {
+            F.syrup.length = this._tapStart.len;
+            if (F.berries.length < 6) {
+              const pt = this.syrupPt(p);
+              F.berries.push({ x: pt.x, y: pt.y, s: rnd(0.85, 1.1) });
+              Snd.plop();
+              sparkleBurst(sc.parts, pt.x, pt.y, '#ff9db2', 4);
+            }
+          }
+          this._tapStart = null;
+        },
+        done: () => false
+      };
+
+      return [s1, s2, s3, s4, s5];
+    }
+  };
+
+  DISHES.push(def);
+})();

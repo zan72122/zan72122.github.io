@@ -1,0 +1,2738 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta name="robots" content="noindex,nofollow">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#f5ecd9">
+<title>こねこのバレエ劇場</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#f5ecd9;
+  overscroll-behavior:none;touch-action:none;-webkit-user-select:none;user-select:none;
+  -webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;-webkit-text-size-adjust:none}
+canvas{position:fixed;left:0;top:0;display:block;touch-action:none;-webkit-user-select:none;user-select:none;
+  -webkit-touch-callout:none;outline:none}
+#sa{position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;
+  padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);
+  padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left)}
+</style>
+
+<script src="../../gf-playlog.js" defer></script>
+
+<script src="/gf-nav.js" defer></script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+'use strict';
+(function(){
+/* ============================================================
+   こねこのバレエ劇場！ぽんぽん舞台がえ
+   版画（リソグラフ）調の一画面舞台。3つの楽器が状態系をつなぐ。
+   座標系: 舞台ボックス 600x640（床 y=560）。楽器はボックス下に並ぶ。
+   ============================================================ */
+const TAU = Math.PI * 2, PI = Math.PI;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = a => a[(Math.random() * a.length) | 0];
+const sm = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+const eob = t => { t = clamp(t, 0, 1); const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+const appr = (v, t, k, dt) => v + (t - v) * (1 - Math.exp(-k * dt));
+const hyp = Math.hypot;
+
+/* ---------- 刷り色（インク）と版ずれ ---------- */
+const INK = {
+  paper: '#f5ecd9', cream: '#fffaf0', pink: '#f29fa3', red: '#e5553b', teal: '#2f9d94',
+  navy: '#2b3772', gold: '#d8a43e', yellow: '#f4cd62', sky: '#8fc3cf', plum: '#b46f8f'
+};
+let OFF = {};
+function setRegistration() {
+  const j = () => rand(-0.6, 0.6);
+  OFF = {
+    pink: [1.5 + j(), -1.0 + j()], red: [-1.2 + j(), 1.3 + j()], teal: [-1.6 + j(), 0.6 + j()],
+    navy: [0.9 + j(), 1.2 + j()], gold: [1.3 + j(), 0.9 + j()], yellow: [-0.7 + j(), -1.2 + j()],
+    sky: [0.6, -0.8], plum: [-0.8, 0.9], cream: [0, 0], paper: [0, 0]
+  };
+}
+setRegistration();
+
+/* ============================================================
+   音（Web Audio 合成）
+   ============================================================ */
+const AU = { c: null, m: null, rv: null, ok: false, nb: null };
+function audioStart() {
+  if (AU.c) {
+    if (AU.c.state === 'suspended') { try { AU.c.resume(); } catch (e) { /* 無音でも続行 */ } }
+    return;
+  }
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const c = new AC();
+    AU.c = c;
+    const comp = c.createDynamicsCompressor();
+    comp.threshold.value = -16; comp.ratio.value = 4; comp.attack.value = 0.004; comp.release.value = 0.2;
+    comp.connect(c.destination);
+    const m = c.createGain(); m.gain.value = 0.75; m.connect(comp); AU.m = m;
+    // 残響（ふたつのディレイの帰還）
+    const rin = c.createGain(); rin.gain.value = 0.5;
+    const d1 = c.createDelay(1.0); d1.delayTime.value = 0.17;
+    const d2 = c.createDelay(1.0); d2.delayTime.value = 0.29;
+    const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3200;
+    const fb = c.createGain(); fb.gain.value = 0.42;
+    const rout = c.createGain(); rout.gain.value = 0.55;
+    rin.connect(d1); d1.connect(lp); lp.connect(d2); d2.connect(fb); fb.connect(d1);
+    lp.connect(rout); d2.connect(rout); rout.connect(m);
+    AU.rv = rin;
+    const nb = c.createBuffer(1, Math.floor(c.sampleRate * 1.2), c.sampleRate);
+    const ch = nb.getChannelData(0);
+    for (let i = 0; i < ch.length; i++) ch[i] = Math.random() * 2 - 1;
+    AU.nb = nb;
+    const b = c.createBuffer(1, 1, 22050), s = c.createBufferSource();
+    s.buffer = b; s.connect(c.destination); s.start(0);
+    if (c.state === 'suspended') c.resume();
+    AU.ok = true;
+  } catch (e) { AU.ok = false; }
+}
+function osc(type, f, t0, dur, vol, o) {
+  o = o || {};
+  const c = AU.c, os = c.createOscillator(), g = c.createGain();
+  os.type = type; os.frequency.setValueAtTime(f, t0);
+  if (o.f2) os.frequency.exponentialRampToValueAtTime(Math.max(20, o.f2), t0 + (o.fd || dur));
+  if (o.det) os.detune.setValueAtTime(o.det, t0);
+  const a = o.a || 0.004;
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.linearRampToValueAtTime(vol, t0 + a);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  os.connect(g); g.connect(AU.m);
+  if (o.rv) { const s = c.createGain(); s.gain.value = o.rv; g.connect(s); s.connect(AU.rv); }
+  os.start(t0); os.stop(t0 + dur + 0.05);
+}
+function noi(t0, dur, vol, type, freq, q, o) {
+  o = o || {};
+  const c = AU.c, s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+  s.buffer = AU.nb; f.type = type; f.frequency.setValueAtTime(freq, t0);
+  if (o.f2) f.frequency.exponentialRampToValueAtTime(o.f2, t0 + dur);
+  f.Q.value = q || 1;
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.linearRampToValueAtTime(vol, t0 + (o.a || 0.003));
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  s.connect(f); f.connect(g); g.connect(AU.m);
+  if (o.rv) { const r = c.createGain(); r.gain.value = o.rv; g.connect(r); r.connect(AU.rv); }
+  s.start(t0, Math.random() * 0.4); s.stop(t0 + dur + 0.05);
+}
+function sfx(fn) {
+  if (!AU.ok || !AU.c || AU.c.state === 'closed') return;
+  try { fn(AU.c.currentTime + 0.004); } catch (e) { /* 再生拒否でも視覚は止めない */ }
+}
+const PENT = [523.25, 587.33, 659.25, 783.99, 880.0, 1046.5, 1174.66, 1318.51, 1567.98, 1760.0, 2093.0, 2349.3];
+const SND = {
+  drum(c) {
+    sfx(t => {
+      const f = 122 - c * 17;
+      osc('sine', f * 1.7, t, 0.45 + 0.12 * c, 0.9, { f2: f * 0.55, fd: 0.26 });
+      osc('triangle', f * 2.4, t, 0.1, 0.22, { f2: f * 1.1 });
+      noi(t, 0.16, 0.32, 'lowpass', 650, 0.7);
+      noi(t, 0.03, 0.12, 'bandpass', 1500, 1.2);
+    });
+  },
+  xylo(start, count) {
+    sfx(t => {
+      for (let k = 0; k < count; k++) {
+        const f = PENT[clamp(start + k, 0, PENT.length - 1)], t0 = t + k * 0.085;
+        osc('sine', f, t0, 0.6, 0.36);
+        osc('sine', f * 3.99, t0, 0.08, 0.1);
+        noi(t0, 0.025, 0.12, 'bandpass', 2400, 3);
+      }
+    });
+  },
+  bell(p) {
+    sfx(t => {
+      const b = 1318.5 * (p || 1);
+      osc('sine', b, t, 2.6, 0.24, { rv: 0.9, a: 0.002 });
+      osc('sine', b * 2.756, t, 1.3, 0.08, { rv: 0.9 });
+      osc('sine', b * 5.404, t, 0.6, 0.04, { rv: 0.9 });
+      osc('sine', b * 0.5, t, 1.8, 0.07, { rv: 0.5 });
+    });
+  },
+  success(big) {
+    sfx(t => {
+      const ns = big ? [1046.5, 1318.5, 1568, 2093, 2637] : [1568, 2093, 2637];
+      ns.forEach((f, i) => osc('triangle', f, t + i * 0.07, 0.5, 0.17, { rv: 0.7 }));
+      if (big) {
+        [523.25, 659.25, 783.99].forEach(f => osc('sine', f, t + 0.05, 1.3, 0.09, { a: 0.08, rv: 0.4 }));
+        for (let i = 0; i < 6; i++) osc('sine', rand(2600, 4200), t + 0.3 + i * 0.06, 0.25, 0.04, { rv: 0.9 });
+      }
+    });
+  },
+  squeak() {
+    sfx(t => {
+      osc('sine', 1700, t, 0.1, 0.13, { f2: 2500, fd: 0.07 });
+      osc('sine', 1900, t + 0.13, 0.1, 0.11, { f2: 2800, fd: 0.07 });
+    });
+  },
+  mew() { sfx(t => { osc('triangle', 720, t, 0.22, 0.12, { f2: 980, fd: 0.12 }); }); },
+  land(v) {
+    sfx(t => {
+      noi(t, 0.16, 0.25 * (v || 1), 'lowpass', 420, 0.8);
+      osc('sine', 95, t, 0.15, 0.16 * (v || 1), { f2: 55 });
+    });
+  },
+  clack(i) {
+    sfx(t => {
+      noi(t, 0.035, 0.22, 'bandpass', 1500 + i * 160, 4);
+      osc('square', 260 + i * 35, t, 0.035, 0.035);
+    });
+  },
+  boing() { sfx(t => { osc('sine', 170, t, 0.5, 0.35, { f2: 430, fd: 0.14 }); osc('sine', 340, t + 0.12, 0.35, 0.12, { f2: 180 }); }); },
+  whoosh() { sfx(t => { noi(t, 0.5, 0.16, 'bandpass', 500, 1.5, { f2: 2600, a: 0.15 }); }); },
+  tiny() { sfx(t => { noi(t, 0.06, 0.07, 'bandpass', 3200, 2); }); },
+  pop() { sfx(t => { osc('sine', 640, t, 0.12, 0.2, { f2: 320 }); noi(t, 0.05, 0.1, 'highpass', 2000, 1); }); },
+  mbox(seq) {
+    sfx(t => {
+      seq.forEach((n, i) => {
+        const f = PENT[clamp(n, 0, PENT.length - 1)] * 2;
+        osc('sine', f, t + i * 0.14, 0.7, 0.1, { rv: 0.8, a: 0.002 });
+        osc('sine', f * 2.01, t + i * 0.14, 0.2, 0.03);
+      });
+    });
+  },
+  magic() {
+    sfx(t => {
+      for (let i = 0; i < 12; i++) osc('triangle', PENT[i % 12], t + i * 0.06, 0.6, 0.12, { rv: 0.8 });
+      [261.6, 329.6, 392, 523.25].forEach(f => osc('sine', f, t + 0.2, 2.4, 0.08, { a: 0.3, rv: 0.5 }));
+      for (let i = 0; i < 10; i++) osc('sine', rand(2400, 4600), t + 0.6 + i * 0.09, 0.3, 0.035, { rv: 1 });
+    });
+  },
+  fanfare() {
+    sfx(t => {
+      const m = [0, 2, 4, 5, 7, 9, 8, 10];
+      m.forEach((n, i) => osc('triangle', PENT[n], t + i * 0.16, 0.45, 0.15, { rv: 0.6 }));
+      [523.25, 659.25, 783.99, 1046.5].forEach(f => osc('sine', f, t + 1.3, 1.6, 0.07, { a: 0.05, rv: 0.6 }));
+    });
+  }
+};
+
+/* ============================================================
+   キャンバスと配置
+   ============================================================ */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const saEl = document.getElementById('sa');
+let X = ctx, SIL = null;
+let W = 1, H = 1, DPR = 1, S = 1, BX = 0, BY = 0, WW = 600, WH = 840, LAND = false, OS = 1.5;
+const SAFE = { t: 0, r: 0, b: 0, l: 0 };
+let EXT = { l: 0, r: 600, t: 0, b: 840 };
+const FLOOR = 560;
+const INST = {
+  drum: { k: 'drum', x: 104, y: 740, r: 96 },
+  xylo: { k: 'xylo', x: 300, y: 740, r: 100 },
+  bell: { k: 'bell', x: 496, y: 740, r: 96 }
+};
+const MBOX = { x: 46, y: 604, r: 58 };
+let ISC = 1, shadowCv = null, screenDotPat = null;
+let bgIndoor = null, bgBall = null, grainPat = null, dotPat = null, dotCanvas = null, grainCanvas = null;
+
+function readSafe() {
+  try {
+    const cs = getComputedStyle(saEl);
+    SAFE.t = parseFloat(cs.paddingTop) || 0; SAFE.r = parseFloat(cs.paddingRight) || 0;
+    SAFE.b = parseFloat(cs.paddingBottom) || 0; SAFE.l = parseFloat(cs.paddingLeft) || 0;
+  } catch (e) { SAFE.t = SAFE.r = SAFE.b = SAFE.l = 0; }
+}
+function layout() {
+  W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight);
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  cv.style.width = W + 'px'; cv.style.height = H + 'px';
+  readSafe();
+  const aw = Math.max(50, W - SAFE.l - SAFE.r), ah = Math.max(50, H - SAFE.t - SAFE.b);
+  S = Math.min(aw / 600, ah / 936);
+  WW = W / S; WH = H / S;
+  OS = clamp(1.25 / S, 0.9, 2.2);
+  const st = SAFE.t / S, sl = SAFE.l / S;
+  const uw = aw / S, uh = ah / S, extra = Math.max(0, uh - 936);
+  LAND = uw > 760;
+  BX = sl + uw / 2 - 300;
+  BY = st + 96 + extra * 0.8;
+  const bandY = st + uh - 104 - BY;
+  ISC = 1 + Math.min(0.28, extra / 900);
+  for (const k in INST) INST[k].r = (k === 'xylo' ? 100 : 96) * ISC;
+  const spread = LAND ? Math.min(285, uw / 2 - 128) : 196;
+  INST.drum.x = 300 - spread; INST.xylo.x = 300; INST.bell.x = 300 + spread;
+  INST.drum.y = INST.xylo.y = INST.bell.y = bandY;
+  EXT = { l: -BX, r: WW - BX, t: -BY, b: WH - BY };
+  buildTextures();
+  buildBackgrounds();
+}
+function toBox(cx, cy) { return { x: cx / S - BX, y: cy / S - BY }; }
+
+/* ---------- 版画の描画プリミティブ ---------- */
+function bp() { X.beginPath(); }
+function pc(x, y, r) { X.moveTo(x + r, y); X.arc(x, y, r, 0, TAU); }
+function pe(x, y, rx, ry, rot) {
+  rot = rot || 0;
+  X.moveTo(x + rx * Math.cos(rot), y + rx * Math.sin(rot));
+  X.ellipse(x, y, Math.max(0.01, rx), Math.max(0.01, ry), rot, 0, TAU);
+}
+function pr(x, y, w, h) { X.rect(x, y, w, h); }
+function prr(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  X.moveTo(x + r, y); X.arcTo(x + w, y, x + w, y + h, r); X.arcTo(x + w, y + h, x, y + h, r);
+  X.arcTo(x, y + h, x, y, r); X.arcTo(x, y, x + w, y, r); X.closePath();
+}
+function pp(a) { X.moveTo(a[0], a[1]); for (let i = 2; i < a.length; i += 2) X.lineTo(a[i], a[i + 1]); X.closePath(); }
+function pl(a) { X.moveTo(a[0], a[1]); for (let i = 2; i < a.length; i += 2) X.lineTo(a[i], a[i + 1]); }
+function pstar(x, y, r1, r2, n, rot) {
+  n = n || 5; rot = rot || 0;
+  for (let i = 0; i < n * 2; i++) {
+    const a = rot - PI / 2 + i * PI / n, r = i % 2 ? r2 : r1;
+    if (i === 0) X.moveTo(x + Math.cos(a) * r, y + Math.sin(a) * r); else X.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r);
+  }
+  X.closePath();
+}
+/* インクで塗る（multiply＋版ずれ）。cream/paper は紙の白抜き */
+function F(col, path, al) {
+  if (SIL) { X.globalCompositeOperation = 'source-over'; X.fillStyle = SIL; bp(); path(); X.fill(); return; }
+  const o = OFF[col] || [0, 0], ko = (col === 'cream' || col === 'paper');
+  X.globalCompositeOperation = ko ? 'source-over' : 'multiply';
+  X.fillStyle = INK[col] || col;
+  let ga = 0;
+  if (al != null) { ga = X.globalAlpha; X.globalAlpha = ga * al; }
+  const ox = o[0] * OS, oy = o[1] * OS;
+  X.translate(ox, oy); bp(); path(); X.fill(); X.translate(-ox, -oy);
+  if (al != null) X.globalAlpha = ga;
+}
+/* 紺の主版線 */
+function Ln(path, w, col, al) {
+  if (SIL) return;
+  col = col || 'navy';
+  const o = OFF[col] || [0, 0];
+  X.globalCompositeOperation = (col === 'cream') ? 'source-over' : 'multiply';
+  X.strokeStyle = INK[col] || col; X.lineWidth = w || 2;
+  let ga = 0;
+  if (al != null) { ga = X.globalAlpha; X.globalAlpha = ga * al; }
+  const ox = o[0] * OS, oy = o[1] * OS;
+  X.translate(ox, oy); bp(); path(); X.stroke(); X.translate(-ox, -oy);
+  if (al != null) X.globalAlpha = ga;
+}
+function mulberry(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+/* ---------- 紙肌と網点 ---------- */
+function buildTextures() {
+  if (!grainCanvas) {
+    const n = 220;
+    grainCanvas = document.createElement('canvas'); grainCanvas.width = n; grainCanvas.height = n;
+    const g = grainCanvas.getContext('2d');
+    const id = g.createImageData(n, n), d = id.data;
+    for (let i = 0; i < n * n; i++) {
+      const r = Math.random();
+      let v = 255 - Math.pow(r, 6) * 70 - Math.random() * 10;
+      d[i * 4] = v; d[i * 4 + 1] = v - 2; d[i * 4 + 2] = v - 8; d[i * 4 + 3] = 255;
+    }
+    g.putImageData(id, 0, 0);
+    g.globalCompositeOperation = 'multiply';
+    for (let i = 0; i < 70; i++) {
+      g.strokeStyle = 'rgba(150,120,90,' + rand(0.05, 0.16) + ')'; g.lineWidth = rand(0.4, 1.0);
+      const x = rand(0, n), y = rand(0, n), a = rand(0, TAU), l = rand(3, 12);
+      g.beginPath(); g.moveTo(x, y); g.quadraticCurveTo(x + Math.cos(a + 0.5) * l * 0.6, y + Math.sin(a + 0.5) * l * 0.6, x + Math.cos(a) * l, y + Math.sin(a) * l); g.stroke();
+    }
+  }
+  grainPat = ctx.createPattern(grainCanvas, 'repeat');
+  if (!dotCanvas) {
+    dotCanvas = document.createElement('canvas'); dotCanvas.width = 9; dotCanvas.height = 9;
+    const g = dotCanvas.getContext('2d');
+    g.fillStyle = INK.navy; g.beginPath(); g.arc(4.5, 4.5, 2.7, 0, TAU); g.fill();
+  }
+  dotPat = ctx.createPattern(dotCanvas, 'repeat');
+  const sd = document.createElement('canvas'), sp = Math.max(5, Math.round(4.2 * DPR));
+  sd.width = sd.height = sp;
+  const sgx = sd.getContext('2d'); sgx.fillStyle = INK.navy; sgx.beginPath(); sgx.arc(sp / 2, sp / 2, sp * 0.36, 0, TAU); sgx.fill();
+  screenDotPat = ctx.createPattern(sd, 'repeat');
+}
+
+/* ============================================================
+   背景（静的部分は事前描画）
+   ============================================================ */
+function newLayer() { const c = document.createElement('canvas'); c.width = cv.width; c.height = cv.height; return c; }
+function boxTransform(g) { g.setTransform(DPR * S, 0, 0, DPR * S, DPR * S * BX, DPR * S * BY); }
+function buildBackgrounds() {
+  bgIndoor = newLayer(); bgBall = newLayer();
+  const keep = X;
+  let g = bgIndoor.getContext('2d'); X = g; boxTransform(g); g.lineCap = 'round'; g.lineJoin = 'round';
+  drawIndoorBG();
+  g = bgBall.getContext('2d'); X = g; boxTransform(g); g.lineCap = 'round'; g.lineJoin = 'round';
+  drawBallBG();
+  X = keep;
+}
+function fillExt(col, al) { F(col, () => pr(EXT.l - 4, EXT.t - 4, EXT.r - EXT.l + 8, EXT.b - EXT.t + 8), al); }
+function drawCloud(x, y, s) {
+  const blob = () => { pc(x, y, 26 * s); pc(x + 28 * s, y - 8 * s, 22 * s); pc(x + 54 * s, y + 2 * s, 20 * s); pc(x - 26 * s, y + 4 * s, 18 * s); X.rect(x - 26 * s, y, 80 * s, 20 * s); };
+  F('cream', blob); F('pink', blob, 0.22);
+  Ln(() => { X.moveTo(x - 40 * s, y + 20 * s); X.lineTo(x + 70 * s, y + 20 * s); }, 1.4, 'teal', 0.5);
+}
+function drawDrapes(x0, x1, col, rng) {
+  if (x1 - x0 < 8) return;
+  F('cream', () => pr(x0, EXT.t - 4, x1 - x0, EXT.b - EXT.t + 8));
+  F(col, () => pr(x0, EXT.t - 4, x1 - x0, EXT.b - EXT.t + 8));
+  const n = Math.max(2, Math.round((x1 - x0) / 34));
+  for (let i = 0; i < n; i++) {
+    const x = x0 + (i + 0.5) * (x1 - x0) / n;
+    F(col === 'gold' ? 'yellow' : 'plum', () => { X.moveTo(x - 5, EXT.t); X.quadraticCurveTo(x + 8, 300, x - 4, EXT.b); X.lineTo(x + 6, EXT.b); X.quadraticCurveTo(x + 16, 300, x + 5, EXT.t); X.closePath(); }, 0.45);
+  }
+  F('gold', () => pr(x0, 410, x1 - x0, 10));
+  Ln(() => { X.moveTo(x0, 415); X.lineTo(x1, 415); }, 1.5, 'navy', 0.6);
+}
+function drawPitBand() {
+  const yb = INST.xylo.y;
+  F('plum', () => pr(EXT.l - 4, 640, EXT.r - EXT.l + 8, EXT.b - 640 + 6), 0.42);
+  F('navy', () => pr(EXT.l - 4, 640, EXT.r - EXT.l + 8, EXT.b - 640 + 6), 0.18);
+  // 楽器の敷物
+  F('pink', () => pe(300, yb + 48, Math.min(380, (EXT.r - EXT.l) / 2 + 10), 78), 0.75);
+  F('cream', () => pe(300, yb + 48, Math.min(330, (EXT.r - EXT.l) / 2 - 30), 56), 0.55);
+  for (let i = 0; i < 40; i++) {
+    const a = i / 40 * TAU, rx = Math.min(355, (EXT.r - EXT.l) / 2 - 8);
+    F('gold', () => pc(300 + Math.cos(a) * rx, yb + 48 + Math.sin(a) * 67, 3));
+  }
+  // 手すり
+  F('gold', () => pr(EXT.l - 4, 640, EXT.r - EXT.l + 8, 6));
+  Ln(() => { X.moveTo(EXT.l, 646); X.lineTo(EXT.r, 646); }, 1.2, 'navy', 0.6);
+}
+function drawApron(goldish) {
+  F(goldish ? 'gold' : 'red', () => pr(-6, 578, 612, 62));
+  F('gold', () => pr(-6, 578, 612, 6));
+  for (let x = 14; x < 600; x += 30) F(goldish ? 'red' : 'gold', () => { X.moveTo(x - 12, 586); X.arc(x, 586, 12, PI, 0, true); X.closePath(); }, goldish ? 0.5 : 0.9);
+  for (let x = 40; x <= 560; x += 52) {
+    F('cream', () => { X.moveTo(x - 13, 640); X.arc(x, 640, 13, PI, 0); X.closePath(); });
+    F('yellow', () => { X.moveTo(x - 9, 640); X.arc(x, 640, 9, PI, 0); X.closePath(); }, 0.8);
+    Ln(() => { X.arc(x, 640, 13, PI, 0); }, 1.4);
+  }
+  Ln(() => { X.moveTo(-6, 578); X.lineTo(606, 578); }, 2);
+}
+function drawTurret(cx, rng) {
+  F('pink', () => pr(cx - 22, 42, 44, 66));
+  F('cream', () => prr(cx - 6, 60, 12, 24, 6));
+  F('navy', () => prr(cx - 4, 64, 8, 18, 4), 0.8);
+  Ln(() => pr(cx - 22, 42, 44, 66), 1.8);
+  for (let i = 0; i < 4; i++) F('red', () => pr(cx - 22 + i * 12, 36, 8, 8));
+  F('red', () => pp([cx - 30, 44, cx + 30, 44, cx, 4]));
+  for (let r = 0; r < 3; r++) for (let i = -2; i <= 2; i++) {
+    const y = 36 - r * 9, x = cx + i * (8 - r * 2.2);
+    if (Math.abs(i) <= 2 - r * 0.5) F('plum', () => { X.moveTo(x - 4, y); X.arc(x, y, 4, PI, 0, true); }, 0.5);
+  }
+  Ln(() => pp([cx - 30, 44, cx + 30, 44, cx, 4]), 1.8);
+  Ln(() => { X.moveTo(cx, 4); X.lineTo(cx, -10); }, 1.5);
+  F('yellow', () => pp([cx, -10, cx + 18, -5, cx, 0]));
+}
+function drawIndoorBG() {
+  const rng = mulberry(7);
+  fillExt('paper');
+  fillExt('sky', 0.5);
+  F('pink', () => pe(300, 600, 700, 260), 0.35);
+  F('yellow', () => pc(520, -40, 44), 0.6);
+  F('pink', () => pc(526, -36, 44), 0.35);
+  drawCloud(70, -50, 1.0); drawCloud(430, 20, 0.7); drawCloud(-160, 160, 1.1); drawCloud(700, 250, 1.0); drawCloud(-120, 470, 0.8); drawCloud(690, 520, 0.9);
+  for (let i = 0; i < 70; i++) {
+    const x = lerp(EXT.l, EXT.r, rng()), y = lerp(EXT.t, 640, rng());
+    if (x > -10 && x < 610 && y > 0) continue;
+    F('gold', () => pstar(x, y, 4 + rng() * 4, 2, 5, rng()));
+  }
+  // 外の幕（横長画面）
+  if (EXT.l < -40) drawDrapes(EXT.l - 4, Math.min(-14, EXT.l + 120), 'red', rng);
+  if (EXT.r > 640) drawDrapes(Math.max(614, EXT.r - 120), EXT.r + 4, 'red', rng);
+  // 城の箱
+  F('cream', () => pr(0, 100, 600, 480));
+  F('teal', () => pr(24, 120, 552, 444), 0.92);
+  // 壁紙の菱形格子
+  X.save(); X.beginPath(); X.rect(24, 120, 552, 444); X.clip();
+  Ln(() => {
+    for (let k = -12; k < 20; k++) {
+      X.moveTo(24 + k * 46, 120); X.lineTo(24 + k * 46 + 444, 564);
+      X.moveTo(24 + k * 46, 120); X.lineTo(24 + k * 46 - 444, 564);
+    }
+  }, 2, 'pink', 0.5);
+  for (let k = -12; k < 20; k++) for (let j = 0; j < 11; j++) {
+    const x = 24 + k * 46 + (j % 2) * 23, y = 120 + j * 46 + 0;
+    if (x > 30 && x < 570) F('gold', () => pstar(x + 23, y + 23, 4, 1.8, 4), 0.85);
+  }
+  X.restore();
+  // 中央の窓
+  F('cream', () => { X.moveTo(240, 330); X.lineTo(240, 210); X.arc(300, 210, 60, PI, 0); X.lineTo(360, 330); X.closePath(); });
+  F('sky', () => { X.moveTo(246, 324); X.lineTo(246, 212); X.arc(300, 212, 54, PI, 0); X.lineTo(354, 324); X.closePath(); }, 0.8);
+  F('yellow', () => pc(322, 200, 14), 0.9);
+  F('cream', () => pc(328, 196, 12));
+  for (let i = 0; i < 6; i++) F('gold', () => pstar(258 + rng() * 84, 180 + rng() * 130, 3.5, 1.5, 5));
+  Ln(() => { X.moveTo(240, 330); X.lineTo(240, 210); X.arc(300, 210, 60, PI, 0); X.lineTo(360, 330); X.closePath(); X.moveTo(300, 152); X.lineTo(300, 330); X.moveTo(240, 262); X.lineTo(360, 262); }, 2.2);
+  F('pink', () => pr(232, 330, 136, 10));
+  // 柱
+  F('red', () => pr(0, 100, 26, 478)); F('red', () => pr(574, 100, 26, 478));
+  for (const x of [0, 574]) {
+    F('gold', () => pr(x - 2, 120, 30, 10)); F('gold', () => pr(x - 2, 540, 30, 12));
+    for (let y = 150; y < 540; y += 34) F('plum', () => pc(x + 13, y, 4), 0.55);
+    Ln(() => pr(x, 100, 26, 478), 2);
+  }
+  // 天井の梁
+  F('navy', () => pr(0, 98, 600, 24), 0.82);
+  for (let x = 10; x < 600; x += 24) F('gold', () => { X.moveTo(x - 10, 122); X.arc(x, 122, 10, 0, PI); X.closePath(); });
+  for (let x = 40; x < 600; x += 80) F('gold', () => pstar(x, 110, 5, 2.2, 5), 0.9);
+  // レール
+  Ln(() => { X.moveTo(62, 130); X.lineTo(398, 130); }, 3, 'gold');
+  Ln(() => { X.moveTo(62, 131); X.lineTo(398, 131); }, 1, 'navy', 0.6);
+  F('gold', () => { pc(62, 130, 5); pc(398, 130, 5); });
+  drawTurret(20, rng); drawTurret(580, rng);
+  drawApron(false);
+  drawPitBand();
+}
+function drawBallBG() {
+  const rng = mulberry(19);
+  fillExt('paper');
+  fillExt('sky', 0.8);
+  for (let k = 0; k < 7; k++) F('navy', () => pr(EXT.l - 4, EXT.t - 4, EXT.r - EXT.l + 8, (420 - EXT.t) * (1 - k / 7)), 0.035);
+  F('pink', () => pe(300, 560, 720, 300), 0.5);
+  F('yellow', () => pe(300, 560, 420, 160), 0.25);
+  // 月
+  F('cream', () => pc(96, 150, 34)); F('yellow', () => pc(96, 150, 34), 0.75);
+  F('pink', () => { pc(86, 140, 6); pc(106, 162, 4); pc(108, 136, 3); }, 0.6);
+  Ln(() => pc(96, 150, 34), 1.6, 'gold');
+  for (let i = 0; i < 90; i++) {
+    const x = lerp(EXT.l, EXT.r, rng()), y = lerp(EXT.t, 470, rng()), r = 2 + rng() * 6;
+    if (r > 5) F('gold', () => pstar(x, y, r, r * 0.42, 5, rng())); else F('yellow', () => pc(x, y, r * 0.5));
+  }
+  for (let i = 0; i < 16; i++) {
+    const x = lerp(EXT.l, EXT.r, rng()), y = lerp(EXT.t, 420, rng());
+    F('cream', () => pstar(x, y, 7, 1.4, 4));
+  }
+  // 舞踏会の床
+  F('pink', () => pe(300, 540, 372, 160), 0.4); F('cream', () => pe(300, 540, 340, 140), 0.25);
+  for (let i = 0; i < 56; i++) { const a = i / 56 * TAU; F('gold', () => pc(300 + Math.cos(a) * 362, 540 + Math.sin(a) * 152, 2.6)); }
+  // 金の幕（左右と上のスワッグ）
+  const sideW = Math.max(46, Math.min(150, -EXT.l + 40));
+  drawDrapes(EXT.l - 4, EXT.l + sideW * 0.7, 'gold', rng);
+  drawDrapes(EXT.r - sideW * 0.7, EXT.r + 4, 'gold', rng);
+  const sw = 120, y0 = EXT.t;
+  for (let x = EXT.l - 40; x < EXT.r + 40; x += sw) {
+    F('cream', () => { X.moveTo(x, y0 - 4); X.lineTo(x + sw, y0 - 4); X.lineTo(x + sw, y0 + 14); X.quadraticCurveTo(x + sw / 2, y0 + 80, x, y0 + 14); X.closePath(); });
+    F('gold', () => { X.moveTo(x, y0 - 4); X.lineTo(x + sw, y0 - 4); X.lineTo(x + sw, y0 + 14); X.quadraticCurveTo(x + sw / 2, y0 + 80, x, y0 + 14); X.closePath(); });
+    F('yellow', () => { X.moveTo(x + 12, y0 + 16); X.quadraticCurveTo(x + sw / 2, y0 + 62, x + sw - 12, y0 + 16); X.quadraticCurveTo(x + sw / 2, y0 + 50, x + 12, y0 + 16); }, 0.7);
+    Ln(() => { X.moveTo(x + sw, y0 + 14); X.quadraticCurveTo(x + sw / 2, y0 + 80, x, y0 + 14); }, 1.6);
+    F('red', () => pc(x, y0 + 16, 6));
+  }
+  drawApron(true);
+  drawPitBand();
+}
+
+/* ============================================================
+   状態（ひとつの状態系）
+   ============================================================ */
+const G = {
+  t: 0, phase: 'indoor', trans: 0, tt: 0, cycle: 0, found: {}, anyTap: false, firstTapDone: false,
+  lastInst: null, lastInstT: -99, lastInputT: 0, lastRollT: -99, rollProp: -1, lastSuccT: -99,
+  style: 0, roofCool: 0, finale: null, replay: null, rec: null, fav: { indoor: null, ball: null },
+  hint: { target: 'drum', str: 0.5 }, hand: { t: -1, target: 'drum', shownIdle: false, shown0: false },
+  finger: { x: 300, y: 400, t: -9 }, ribbonCol: 'red', catPref: 0, ballSucc: 0, audienceT: -1,
+  curtain: { v: 0, dir: 0, cb: null, hold: 0 }, curtainSway: 0, curtainV: 0, mouseQuirks: [], stepCols: [],
+  successFlash: 0, bowPending: false, idleBowT: 0, peekStars: 0
+};
+const SP = { A: 0, V: 0, x: 260, charge: 0, lastT: -9, pending: 0 };
+const STEP_MAX = 9;
+const ST = { n: 2, grow: new Float32Array(STEP_MAX), bounce: 0, bv: 0, ghost: 0, gv: 0, jig: new Float32Array(STEP_MAX), jv: new Float32Array(STEP_MAX) };
+const DOOR = { o: 0, to: 0, rattle: 0, glint: 0 };
+const ROOF = { o: 0, to: 0, peek: 0, pv: 0 };
+const R = { mode: 'rolled', x: 220, tx: 220, len: 0, lenT: 0, tie: -1, prop: -1, peg: { x: 44, y: 420 }, orbit: 0, twirl: 0, tieT: 0, from: null, coil: 1, flutter: 0, sway: 0 };
+const B = { ang: 0, om: 0.3, L: 0, Lt: 0, lampT: 0, lamp: 0, bounce: 0, bv: 0, orbit: 0, grow: new Float32Array(12), shadowK: 0, lampSeen: 0 };
+const props = [];
+const mice = [];
+const P = [];
+const PMAX = 170;
+
+/* ---------- 階段 ---------- */
+function stepBase(i) {
+  if (i < 5) return [398 + i * 37, FLOOR - 42 * (i + 1)];
+  const k = i - 4; return [546 - k * 44, 350 - k * 48];
+}
+function stepTop(i) {
+  const b = stepBase(i);
+  return { x: b[0], y: FLOOR - (FLOOR - b[1]) * (1 + ST.bounce) + ST.jig[i] };
+}
+function stairLimit() { return DOOR.to > 0 ? STEP_MAX : 5; }
+
+/* ---------- 床（ばね） ---------- */
+function floorY(x) { return FLOOR - SP.A * Math.exp(-Math.pow((x - SP.x) / 78, 2)); }
+
+/* ---------- 回転舞台（舞踏会） ---------- */
+const DISC = { x: 300, y: 528, rx: 238, ry: 66 };
+function discY() { return DISC.y - B.bounce; }
+function rStepTop(k) {
+  const u = (k + 1) / 12;
+  const x0 = 470, y0 = 512, x1 = 600, y1 = 300, x2 = 380, y2 = 70;
+  const a = (1 - u) * (1 - u), b = 2 * u * (1 - u), c = u * u;
+  return { x: a * x0 + b * x1 + c * x2, y: a * y0 + b * y1 + c * y2 - B.bounce * (1 - u) };
+}
+
+/* ---------- リボン（ひも状の物理） ---------- */
+const RN = 18;
+const RP = { x: new Float32Array(RN), y: new Float32Array(RN), px: new Float32Array(RN), py: new Float32Array(RN) };
+let ropeA = { x: 220, y: 130 }, ropeB = null, ropeMid = null, ropeLen = 10, ropeEndW = 1.5, ropeWind = 0;
+function ropeReset(x0, y0, x1, y1) {
+  for (let i = 0; i < RN; i++) {
+    const t = i / (RN - 1);
+    RP.x[i] = RP.px[i] = lerp(x0, x1, t) + Math.sin(t * 6) * 2;
+    RP.y[i] = RP.py[i] = lerp(y0, y1, t);
+  }
+}
+function ropeStep(h) {
+  const g = 1300 * h * h, rest = Math.max(0.5, ropeLen / (RN - 1));
+  for (let i = 1; i < RN; i++) {
+    const vx = (RP.x[i] - RP.px[i]) * 0.986, vy = (RP.y[i] - RP.py[i]) * 0.986;
+    RP.px[i] = RP.x[i]; RP.py[i] = RP.y[i];
+    RP.x[i] += vx + Math.sin(G.t * 2.3 + i * 0.7) * ropeWind * h; RP.y[i] += vy + g;
+  }
+  RP.x[0] = ropeA.x; RP.y[0] = ropeA.y;
+  for (let it = 0; it < 12; it++) {
+    for (let i = 0; i < RN - 1; i++) {
+      const dx = RP.x[i + 1] - RP.x[i], dy = RP.y[i + 1] - RP.y[i];
+      const d = Math.sqrt(dx * dx + dy * dy) || 0.001, diff = (d - rest) / d;
+      let wa = i === 0 ? 0 : 1, wb = (i + 1 === RN - 1) ? 1 / ropeEndW : 1;
+      if (ropeB && i + 1 === RN - 1) wb = 0;
+      if (ropeMid && ropeMid.i === i) wa = 0;
+      if (ropeMid && ropeMid.i === i + 1) wb = 0;
+      const s = wa + wb; if (s === 0) continue;
+      RP.x[i] += dx * diff * wa / s; RP.y[i] += dy * diff * wa / s;
+      RP.x[i + 1] -= dx * diff * wb / s; RP.y[i + 1] -= dy * diff * wb / s;
+    }
+    if (ropeB) { RP.x[RN - 1] = ropeB.x; RP.y[RN - 1] = ropeB.y; }
+    if (ropeMid) { RP.x[ropeMid.i] = ropeMid.x; RP.y[ropeMid.i] = ropeMid.y; }
+  }
+}
+function ropeEnd() { return { x: RP.x[RN - 1], y: RP.y[RN - 1] }; }
+function ropeKick(vx, vy) { for (let i = 1; i < RN; i++) { const k = i / (RN - 1); RP.px[i] -= vx * k; RP.py[i] -= vy * k; } }
+function drawRibbon(col, wd, al) {
+  wd = wd || 7;
+  const L = [], Rr = [];
+  for (let i = 0; i < RN; i++) {
+    const i0 = Math.max(0, i - 1), i1 = Math.min(RN - 1, i + 1);
+    let nx = -(RP.y[i1] - RP.y[i0]), ny = RP.x[i1] - RP.x[i0];
+    const d = Math.hypot(nx, ny) || 1; nx /= d; ny /= d;
+    const w = wd * (0.3 + 0.7 * Math.abs(Math.cos(i * 0.55 + G.t * 2.2 + R.twirl)));
+    L.push(RP.x[i] + nx * w * 0.5, RP.y[i] + ny * w * 0.5); Rr.push(RP.x[i] - nx * w * 0.5, RP.y[i] - ny * w * 0.5);
+  }
+  const path = () => { X.moveTo(L[0], L[1]); for (let i = 2; i < L.length; i += 2) X.lineTo(L[i], L[i + 1]); for (let i = Rr.length - 2; i >= 0; i -= 2) X.lineTo(Rr[i], Rr[i + 1]); X.closePath(); };
+  F('cream', path, al);
+  F(col, path, al);
+  Ln(() => { X.moveTo(RP.x[0], RP.y[0]); for (let i = 1; i < RN; i++) X.lineTo(RP.x[i], RP.y[i]); }, 1.1, 'gold', al == null ? 0.9 : al);
+}
+
+/* ---------- 小道具 ---------- */
+const PROP_KINDS = ['ball', 'box', 'star', 'crown'];
+function makeProps() {
+  props.length = 0;
+  const kinds = PROP_KINDS.slice().sort(() => Math.random() - 0.5);
+  const slots = [rand(326, 360), rand(440, 520), rand(86, 150)];
+  for (let i = 0; i < 3; i++) {
+    const k = kinds[i];
+    props.push({ k, x: slots[i], y: FLOOR, r: k === 'ball' ? 15 : (k === 'star' ? 16 : 14), vx: 0, rot: 0, hop: 0, hv: 0, tied: false, spin: 0, wig: 0, home: slots[i] });
+  }
+}
+function propY(p) { return floorY(p.x) - p.r - p.hop; }
+
+/* ---------- 粒子 ---------- */
+function addP(o) { if (P.length >= PMAX) P.shift(); o.life = 0; P.push(o); }
+const CONF_COLS = ['red', 'pink', 'teal', 'yellow', 'gold'];
+function confetti(x, y, n, spd, up) {
+  for (let i = 0; i < n; i++) {
+    const a = (up ? -PI / 2 : 0) + rand(-1.2, 1.2) * (up ? 1 : PI);
+    const v = rand(0.4, 1) * spd;
+    addP({ ty: 'conf', x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, rot: rand(0, TAU), vr: rand(-9, 9), col: pick(CONF_COLS), w: rand(4, 8), h: rand(3, 6), max: rand(1.2, 2.0) });
+  }
+}
+function stars(x, y, n, spd, col) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, TAU), v = rand(0.3, 1) * spd;
+    addP({ ty: 'star', x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - spd * 0.2, r: rand(4, 8), rot: rand(0, TAU), col: col || 'gold', max: rand(0.8, 1.5) });
+  }
+}
+function ring(x, y, r, col, max, vr) { addP({ ty: 'ring', x, y, r, vr: vr || 90, col: col || 'gold', max: max || 0.8 }); }
+function dust(x, y, n) {
+  for (let i = 0; i < n; i++) addP({ ty: 'dust', x: x + rand(-14, 14), y: y - 2, vx: rand(-60, 60), vy: rand(-30, -6), r: rand(5, 10), max: rand(0.4, 0.7) });
+}
+function note(x, y, col) { addP({ ty: 'note', x, y, vx: rand(-20, 20), vy: rand(-70, -40), col: col || 'navy', max: 1.1, rot: rand(-0.3, 0.3) }); }
+function updParticles(dt) {
+  for (let i = P.length - 1; i >= 0; i--) {
+    const p = P[i]; p.life += dt;
+    if (p.life >= p.max) { P.splice(i, 1); continue; }
+    if (p.ty === 'conf') { p.vy += 260 * dt; p.vx *= Math.exp(-1.6 * dt); p.vy *= Math.exp(-1.2 * dt); p.x += p.vx * dt + Math.sin(p.life * 7 + p.rot) * 20 * dt; p.y += p.vy * dt; p.rot += p.vr * dt; }
+    else if (p.ty === 'star') { p.vy += 60 * dt; p.vx *= Math.exp(-2 * dt); p.vy *= Math.exp(-1.5 * dt); p.x += p.vx * dt; p.y += p.vy * dt; p.rot += dt * 2; }
+    else if (p.ty === 'ring') { p.r += p.vr * dt; }
+    else if (p.ty === 'dust') { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= Math.exp(-3 * dt); p.r += 14 * dt; }
+    else if (p.ty === 'note') { p.x += p.vx * dt + Math.sin(p.life * 6) * 18 * dt; p.y += p.vy * dt; }
+  }
+}
+function drawParticles() {
+  for (const p of P) {
+    const k = p.life / p.max, al = k < 0.75 ? 1 : (1 - k) / 0.25;
+    if (p.ty === 'conf') {
+      const c = Math.cos(p.rot), s = Math.sin(p.rot), w = p.w * Math.abs(Math.cos(p.life * 8 + p.rot)) + 1, h = p.h;
+      F(p.col, () => pp([p.x - c * w + s * h, p.y - s * w - c * h, p.x + c * w + s * h, p.y + s * w - c * h, p.x + c * w - s * h, p.y + s * w + c * h, p.x - c * w - s * h, p.y - s * w + c * h]), al);
+    } else if (p.ty === 'star') {
+      const r = p.r * (k < 0.2 ? k / 0.2 : 1);
+      F(p.col, () => pstar(p.x, p.y, r, r * 0.42, 5, p.rot), al);
+      F('cream', () => pc(p.x, p.y, r * 0.22), al);
+    } else if (p.ty === 'ring') {
+      Ln(() => pc(p.x, p.y, p.r), 2.2 * (1 - k) + 0.6, p.col, al * 0.9);
+    } else if (p.ty === 'dust') {
+      F('cream', () => pc(p.x, p.y, p.r), al * 0.85);
+      Ln(() => pc(p.x, p.y, p.r), 1, 'navy', al * 0.3);
+    } else if (p.ty === 'note') {
+      X.save(); X.translate(p.x, p.y); X.rotate(p.rot);
+      F(p.col, () => { pe(0, 0, 5, 3.6, -0.4); X.rect(3.4, -16, 2, 16); }, al);
+      F(p.col, () => { X.moveTo(5.4, -16); X.quadraticCurveTo(12, -12, 10, -6); X.lineTo(9, -7); X.quadraticCurveTo(10, -11, 5.4, -12); X.closePath(); }, al);
+      X.restore();
+    }
+  }
+}
+
+/* ============================================================
+   こねこ（ポーズ合成）
+   ============================================================ */
+const BASEP = { lean: 0, rise: 0, lh1: 0.12, lh2: 0, rh1: 0.12, rh2: 0, la1: 0.45, la2: -0.8, ra1: 0.45, ra2: -0.8, tutu: 1, happy: 0, mo: 0 };
+const PK = Object.keys(BASEP);
+const POSES = {};
+function defPose(n, o) { POSES[n] = Object.assign({}, BASEP, o); }
+defPose('stand', {});
+defPose('releve', { rise: 7, lh1: 0.05, rh1: 0.05, la1: 2.45, la2: 0.6, ra1: 2.45, ra2: 0.6 });
+defPose('crouch', { lh1: 0.6, lh2: -0.95, rh1: 0.6, rh2: -0.95, la1: 1.15, la2: 0.4, ra1: 1.15, ra2: 0.4 });
+defPose('jete', { lh1: 1.3, lh2: 0.12, rh1: 1.3, rh2: 0.12, la1: 1.95, la2: 0.25, ra1: 1.95, ra2: 0.25, tutu: 1.4, happy: 1 });
+defPose('star', { lh1: 0.7, rh1: 0.7, la1: 2.35, la2: 0, ra1: 2.35, ra2: 0, tutu: 1.35, happy: 1 });
+defPose('tuck', { lh1: 0.4, lh2: -1.6, rh1: 0.4, rh2: -1.6, la1: 2.85, la2: 0.45, ra1: 2.85, ra2: 0.45, tutu: 1.2 });
+defPose('arab', { lean: 0.14, rise: 6, lh1: 0.04, rh1: 1.6, rh2: 0.05, la1: 1.6, la2: 0.1, ra1: 2.35, ra2: 0.1, happy: 1 });
+defPose('reach', { rise: 9, lh1: 0.05, rh1: 0.05, la1: 0.5, la2: -0.5, ra1: 3.0, ra2: 0.05, mo: 0.5 });
+defPose('hang', { lh1: 0.06, lh2: 0.18, rh1: 0.06, rh2: 0.18, la1: 2.95, la2: 0.04, ra1: 2.95, ra2: 0.04, tutu: 1.25, happy: 1 });
+defPose('sit', { lh1: 0.95, lh2: -1.35, rh1: 0.95, rh2: -1.35, la1: 2.85, la2: 0.08, ra1: 2.85, ra2: 0.08, happy: 1 });
+defPose('bow', { lean: 0, lh1: 0.32, lh2: -0.55, rh1: 0.6, rh2: 0.1, la1: 1.05, la2: 0.35, ra1: 0.75, ra2: 0.5, happy: 1 });
+defPose('beckon', { ra1: 2.15, ra2: 0.9, happy: 0.6 });
+defPose('balance', { rise: 5, la1: 1.55, la2: 0, ra1: 1.55, ra2: 0 });
+defPose('fall', { lh1: 0.5, lh2: 0.3, rh1: 0.5, rh2: 0.3, la1: 2.1, la2: 0.3, ra1: 2.1, ra2: 0.3, mo: 1 });
+defPose('clap', { la1: 1.0, la2: 1.2, ra1: 1.0, ra2: 1.2, happy: 1 });
+defPose('point', { ra1: 1.45, ra2: 0, la1: 0.45 });
+defPose('look', { rise: 3 });
+defPose('walk', {});
+const STYLE_AIR = ['jete', 'star', 'tuck', 'arab'];
+
+const cat = {
+  x: 260, y: FLOOR, sup: { t: 'floor' }, p: Object.assign({}, BASEP), pose: 'stand', act: null, queue: [],
+  ground: 1, spin: 0, rot: 0, anchor: -30, sq: 1, sqv: 0, lx: 0, ly: 0, blink: 0, blinkT: 2, idleT: 0, walkPh: 0,
+  lookAt: null, lookT: 0, mood: 0, nextIdle: 2, wave: 0, climbT: 0, under: 0, sc: 1
+};
+function limb(pts, w, col) {
+  const path = () => { X.moveTo(pts[0], pts[1]); for (let i = 2; i < pts.length; i += 2) X.lineTo(pts[i], pts[i + 1]); };
+  if (SIL) { X.globalCompositeOperation = 'source-over'; X.strokeStyle = SIL; X.lineWidth = w + 2; bp(); path(); X.stroke(); return; }
+  Ln(path, w + 3.2, 'navy');
+  X.globalCompositeOperation = 'source-over'; X.strokeStyle = INK[col || 'cream']; X.lineWidth = w; bp(); path(); X.stroke();
+}
+function drawCat(c) {
+  const p = c.p, g = c.ground;
+  const dl = 15 * Math.cos(p.lh1) + 15 * Math.cos(p.lh1 + p.lh2), dr = 15 * Math.cos(p.rh1) + 15 * Math.cos(p.rh1 + p.rh2);
+  const hipY = lerp(-31, -Math.max(dl, dr, 8) - p.rise, g);
+  X.save();
+  X.translate(c.x, c.y);
+  X.scale(c.sc, c.sc);
+  if (c.rot) { const a = c.anchor != null ? c.anchor : hipY; X.translate(0, a); X.rotate(c.rot); X.translate(0, -a); }
+  let sx = Math.cos(c.spin); if (Math.abs(sx) < 0.2) sx = sx < 0 ? -0.2 : 0.2;
+  X.scale(sx / Math.sqrt(c.sq), c.sq);
+  const lean = p.lean + Math.sin(G.t * 1.7) * 0.02;
+  const dx = Math.sin(lean), dy = -Math.cos(lean);
+  const hx = 0, hy = hipY;
+  const cx = hx + dx * 22, cy = hy + dy * 22;
+  const breath = Math.sin(G.t * 2.4) * 0.6;
+  const hdx = cx + dx * (16 + breath * 0.3), hdy = cy + dy * (16 + breath * 0.3);
+  // しっぽ
+  const tw = Math.sin(G.t * 2.1 + c.x * 0.01) * 5;
+  limb([hx + 4, hy + 4, hx + 18, hy + 2, hx + 25 + tw * 0.5, hy - 10, hx + 22 + tw, hy - 24], 5.2);
+  F('pink', () => pc(hx + 22 + tw, hy - 24, 3.2), 0.9);
+  // 脚
+  const legs = [[-1, p.lh1, p.lh2], [1, p.rh1, p.rh2]];
+  const feet = [];
+  for (const [s, a1, a2] of legs) {
+    const jx = hx + s * 5, jy = hy + 2;
+    const kx = jx + s * Math.sin(a1) * 15, ky = jy + Math.cos(a1) * 15;
+    const fx = kx + s * Math.sin(a1 + a2) * 15, fy = ky + Math.cos(a1 + a2) * 15;
+    limb([jx, jy, kx, ky, fx, fy], 6.2);
+    feet.push([fx, fy, a1 + a2, s]);
+  }
+  for (const [fx, fy, a, s] of feet) {
+    X.save(); X.translate(fx, fy); X.rotate(-s * a);
+    F('pink', () => pe(0, 1, 3.6, 5.2));
+    F('red', () => pe(0, 3.5, 3, 2.4), 0.8);
+    Ln(() => pe(0, 1, 3.6, 5.2), 1.2);
+    X.restore();
+  }
+  // 胴（レオタード）
+  const mx = (hx + cx) / 2, my = (hy + cy) / 2;
+  F('cream', () => pe(mx, my, 10.5, 15, lean));
+  F('teal', () => pe(mx, my + 1, 10.5, 13.5, lean), 0.92);
+  F('gold', () => { pc(mx, my - 6, 1.6); pc(mx, my, 1.6); }, 0.9);
+  Ln(() => pe(mx, my, 10.5, 15, lean), 1.6);
+  // チュチュ
+  const tr = 25 * p.tutu, tcx = hx + dx * 2, tcy = hy + dy * 2;
+  const tutuPath = () => {
+    for (let i = 0; i <= 24; i++) {
+      const a = i / 24 * TAU, r = 1 + 0.09 * Math.sin(a * 9 + G.t * 3);
+      const ex = Math.cos(a) * tr * r, ey = Math.sin(a) * 7.5 * r;
+      const x = tcx + ex * Math.cos(lean) - ey * Math.sin(lean), y = tcy + ex * Math.sin(lean) + ey * Math.cos(lean);
+      if (i === 0) X.moveTo(x, y); else X.lineTo(x, y);
+    }
+    X.closePath();
+  };
+  F('cream', tutuPath); F('pink', tutuPath, 0.95);
+  F('red', () => { for (let i = 0; i < 7; i++) { const a = (i / 7) * PI + 0.2; pc(tcx + Math.cos(a) * tr * 0.82, tcy + Math.sin(a) * 4.5, 1.4); } }, 0.8);
+  Ln(tutuPath, 1.5);
+  // 腕
+  for (const [s, a1, a2] of [[-1, p.la1, p.la2], [1, p.ra1, p.ra2 + c.wave]]) {
+    const sx2 = cx + s * 8 - dx * 2, sy2 = cy + 3;
+    const ex = sx2 + s * Math.sin(a1) * 12, ey = sy2 + Math.cos(a1) * 12;
+    const wx = ex + s * Math.sin(a1 + a2) * 12, wy = ey + Math.cos(a1 + a2) * 12;
+    limb([sx2, sy2, ex, ey, wx, wy], 5.2);
+    F('cream', () => pc(wx, wy, 3.4)); Ln(() => pc(wx, wy, 3.4), 1.2);
+  }
+  // 頭
+  const er = [[-1], [1]];
+  for (const [s] of er) {
+    const ear = [hdx + s * 5, hdy - 12, hdx + s * 15, hdy - 22, hdx + s * 15, hdy - 6];
+    F('cream', () => pp(ear)); F('pink', () => pp([hdx + s * 7.5, hdy - 11, hdx + s * 13.5, hdy - 18, hdx + s * 13.5, hdy - 8]), 0.9);
+    Ln(() => pp(ear), 1.6);
+  }
+  F('cream', () => pe(hdx, hdy, 16.5, 15));
+  F('yellow', () => { X.moveTo(hdx - 9, hdy - 13); X.quadraticCurveTo(hdx - 2, hdy - 4, hdx + 3, hdy - 14.5); X.closePath(); }, 0.75);
+  F('red', () => { X.moveTo(hdx - 9, hdy - 13); X.quadraticCurveTo(hdx - 2, hdy - 4, hdx + 3, hdy - 14.5); X.closePath(); }, 0.25);
+  Ln(() => pe(hdx, hdy, 16.5, 15), 1.8);
+  // 顔
+  if (!SIL) {
+    const lx = c.lx * 2.6, ly = c.ly * 2.2;
+    F('pink', () => { pc(hdx - 10, hdy + 4, 3.6); pc(hdx + 10, hdy + 4, 3.6); }, 0.85);
+    const closed = c.blink > 0 || p.happy > 0.6;
+    for (const s of [-1, 1]) {
+      const ex = hdx + s * 6 + lx, ey = hdy - 1 + ly;
+      if (closed) {
+        if (p.happy > 0.6) Ln(() => { X.arc(ex, ey + 1.5, 3.2, PI * 1.1, PI * 1.9); }, 1.8);
+        else Ln(() => { X.moveTo(ex - 3, ey); X.lineTo(ex + 3, ey); }, 1.8);
+      } else {
+        F('navy', () => pe(ex, ey, 2.7, 3.5));
+        F('cream', () => pc(ex + 0.9, ey - 1.2, 1.0));
+      }
+    }
+    F('pink', () => pp([hdx - 2.2, hdy + 3.4, hdx + 2.2, hdy + 3.4, hdx, hdy + 5.6]));
+    if (p.mo > 0.5) { F('red', () => pe(hdx, hdy + 8.5, 2.2, 2.6), 0.85); }
+    else Ln(() => { X.moveTo(hdx - 3.5, hdy + 7); X.quadraticCurveTo(hdx - 1.7, hdy + 9, hdx, hdy + 6.6); X.quadraticCurveTo(hdx + 1.7, hdy + 9, hdx + 3.5, hdy + 7); }, 1.3);
+    Ln(() => { for (const s of [-1, 1]) { X.moveTo(hdx + s * 9, hdy + 6); X.lineTo(hdx + s * 20, hdy + 4); X.moveTo(hdx + s * 9, hdy + 8); X.lineTo(hdx + s * 19, hdy + 9.5); } }, 0.9, 'navy', 0.7);
+  }
+  // リボン飾り
+  F('red', () => { pp([hdx + 9, hdy - 13, hdx + 17, hdy - 19, hdx + 17, hdy - 9]); pp([hdx + 9, hdy - 13, hdx + 3, hdy - 21, hdx + 2, hdy - 11]); });
+  F('gold', () => pc(hdx + 9, hdy - 13, 2.2));
+  X.restore();
+  c.headX = c.x + hdx * c.sc; c.headY = c.y + hdy * c.sc;
+}
+
+/* ============================================================
+   ねずみ
+   ============================================================ */
+function makeMouse(id, home, quirk, col) {
+  const m = { id, home, st: 'hidden', x: 0, y: FLOOR, face: 1, t: 0, hops: [], hop: null, jump: null, quirk, beck: 0, phi: id * 2.1, sup: 'floor', col, ear: 0, spin: 0, sq: 1, slot: 0, happy: 0, peekT: 0, wig: 0, dance: 0 };
+  homePos(m);
+  return m;
+}
+function homePos(m) {
+  if (m.home === 'curtain') { m.x = 26; m.y = FLOOR; }
+  else if (m.home === 'door') { m.x = 594; m.y = stepTop(4).y; }
+  else { m.x = 300; m.y = -60; }
+}
+function drawMouse(m) {
+  X.save();
+  X.translate(m.x, m.y);
+  let sx = Math.cos(m.spin); if (Math.abs(sx) < 0.2) sx = sx < 0 ? -0.2 : 0.2;
+  X.scale(sx * m.face, m.sq);
+  const bob = Math.sin(G.t * 9 + m.id) * (m.st === 'joined' ? 0.6 : 0.2);
+  // しっぽ
+  limb([-8, -6, -18, -4, -22, -14, -16, -20], 2.2, 'pink');
+  // 脚
+  F('pink', () => { pe(-4, -1.5, 3.4, 2.2); pe(5, -1.5, 3.4, 2.2); });
+  // 体
+  F('cream', () => pe(0, -12 + bob, 10, 11.5));
+  F('teal', () => pe(0, -12 + bob, 10, 11.5), 0.3);
+  F(m.col, () => pe(0, -9 + bob, 13, 3.6), 0.95);
+  Ln(() => pe(0, -12 + bob, 10, 11.5), 1.4);
+  // 頭
+  const hy = -27 + bob, ew = Math.sin(m.ear) * 0.25;
+  for (const s of [-1, 1]) {
+    F('cream', () => pc(s * 7.5, hy - 7 + ew * s * 4, 6.2)); F('pink', () => pc(s * 7.5, hy - 7 + ew * s * 4, 4), 0.9);
+    Ln(() => pc(s * 7.5, hy - 7 + ew * s * 4, 6.2), 1.2);
+  }
+  F('cream', () => pe(1.5, hy, 9.5, 8.4)); F('teal', () => pe(1.5, hy, 9.5, 8.4), 0.25);
+  Ln(() => pe(1.5, hy, 9.5, 8.4), 1.4);
+  if (!SIL) {
+    if (m.happy > 0.5) Ln(() => { X.arc(-1, hy - 1, 2, PI * 1.1, PI * 1.9); X.moveTo(6, hy - 1); X.arc(5, hy - 0.5, 2, PI * 1.1, PI * 1.9); }, 1.4);
+    else F('navy', () => { pc(-1, hy - 1, 1.8); pc(5, hy - 1, 1.8); });
+    F('pink', () => pc(10.5, hy + 2, 2.2));
+    Ln(() => { X.moveTo(9, hy + 3); X.lineTo(17, hy + 1); X.moveTo(9, hy + 4); X.lineTo(17, hy + 5); }, 0.8, 'navy', 0.7);
+  }
+  X.restore();
+}
+
+/* ============================================================
+   動く舞台の描画
+   ============================================================ */
+const IA = {
+  drum: { dent: 0.3, dv: 0, sq: 0, sqv: 0, hitT: -9, bob: 0, wig: 0 },
+  xylo: { v: new Float32Array(6), d: new Float32Array(6), hitT: -9, bob: 0, wig: 0 },
+  bell: { ang: 0, av: 0, clap: 0, cv: 0, hitT: -9, bob: 0, wig: 0 }
+};
+G.mb = { ready: 0, readyT: -99, lid: 0, lidT: 0, wig: 0, play: 0 };
+
+function halftone(path, al) {
+  if (SIL) return;
+  const ga = X.globalAlpha;
+  X.globalCompositeOperation = 'multiply'; X.globalAlpha = ga * al; X.fillStyle = dotPat;
+  bp(); path(); X.fill(); X.globalAlpha = ga;
+}
+function drawDeck() {
+  const pts = [];
+  for (let x = 22; x <= 578; x += 12) pts.push(x, Math.min(576, floorY(x)));
+  const path = () => { X.moveTo(pts[0], pts[1]); for (let i = 2; i < pts.length; i += 2) X.lineTo(pts[i], pts[i + 1]); X.lineTo(578, 579); X.lineTo(22, 579); X.closePath(); };
+  F('cream', path); F('pink', path, 0.7);
+  F('yellow', () => { X.moveTo(pts[0], pts[1]); for (let i = 2; i < pts.length; i += 2) X.lineTo(pts[i], pts[i + 1] + 1); for (let i = pts.length - 2; i >= 0; i -= 2) X.lineTo(pts[i], pts[i + 1] + 5); X.closePath(); }, 0.8);
+  Ln(() => { for (let x = 40; x < 578; x += 44) { const y = Math.min(576, floorY(x)); X.moveTo(x, y + 6); X.lineTo(x - 7, 578); } }, 1.1, 'navy', 0.35);
+  Ln(() => { X.moveTo(pts[0], pts[1]); for (let i = 2; i < pts.length; i += 2) X.lineTo(pts[i], pts[i + 1]); }, 2);
+  // ばね床の印（中央のマット）
+  for (let x = 176; x <= 344; x += 24) {
+    const y = Math.min(576, floorY(x));
+    F('teal', () => pe(x, y + 9, 7, 2.6), 0.75);
+  }
+}
+const STEP_COLS = ['red', 'teal', 'yellow', 'pink', 'red', 'teal', 'yellow', 'pink', 'red'];
+function stepDrawPos(i) {
+  const g = ST.grow[i], s = stepTop(i);
+  if (g >= 0.999) return { x: s.x, y: s.y, k: 1 };
+  const pv = i > 0 ? stepTop(i - 1) : { x: s.x - 20, y: FLOOR };
+  const e = eob(g);
+  return { x: lerp(pv.x, s.x, e), y: lerp(pv.y, s.y, e), k: lerp(0.35, 1, sm(g)) };
+}
+function zig(x0, y0, x1, y1, n, amp, horiz) {
+  const pts = [x0, y0];
+  for (let k = 1; k < n; k++) {
+    const t = k / n, s = k % 2 ? 1 : -1;
+    if (horiz) pts.push(lerp(x0, x1, t), lerp(y0, y1, t) + s * amp);
+    else pts.push(lerp(x0, x1, t) + s * amp, lerp(y0, y1, t));
+  }
+  pts.push(x1, y1);
+  return pts;
+}
+function drawStairs() {
+  // 蛇腹の支え
+  for (let i = 0; i < STEP_MAX; i++) {
+    if (ST.grow[i] < 0.02) continue;
+    const s = stepDrawPos(i);
+    if (i < 5) {
+      const y0 = s.y + 30, n = Math.max(2, Math.round((578 - y0) / 20));
+      const z = zig(s.x, y0, s.x, 578, n, 15 * s.k);
+      Ln(() => pl(z), 3.4, 'red'); Ln(() => pl(z), 1.1, 'navy', 0.8);
+    } else {
+      const y0 = s.y + 18, z = zig(s.x + 18, y0, 574, y0 + 26, 4, 7 * s.k, true);
+      Ln(() => pl(z), 3.2, 'red'); Ln(() => pl(z), 1.1, 'navy', 0.8);
+    }
+  }
+  // 「伸びかけ」の蛇腹（まだ届かない）
+  if (ST.ghost > 0.02) {
+    const s = stepTop(4), gg = ST.ghost;
+    const z = zig(s.x, s.y - 4, s.x - 70 * gg, s.y - 70 * gg, 5, 8, false);
+    Ln(() => pl(z), 3, 'red', 0.7 * gg); Ln(() => pl(z), 1, 'navy', 0.6 * gg);
+  }
+  for (let i = 0; i < STEP_MAX; i++) {
+    if (ST.grow[i] < 0.02) continue;
+    const s = stepDrawPos(i), w = 48 * s.k, col = G.stepCols[i] || STEP_COLS[i];
+    const top = () => prr(s.x - w / 2, s.y - 2, w, 10, 3);
+    const ris = () => pr(s.x - w / 2 + 2, s.y + 8, w - 4, 24 * s.k);
+    F('cream', ris); F(col, ris, 0.35);
+    F('gold', () => { pc(s.x - w / 2 + 7, s.y + 20, 1.8); pc(s.x + w / 2 - 7, s.y + 20, 1.8); });
+    Ln(ris, 1.4);
+    F('cream', top); F(col, top, 0.95); Ln(top, 1.6);
+    if (i === ST.n - 1 && ST.n < stairLimit() && ST.grow[i] > 0.98) {
+      // 切れた端（ぎざぎざ）
+      Ln(() => { const x = s.x + (i < 4 ? w / 2 : -w / 2); X.moveTo(x, s.y - 2); X.lineTo(x + (i < 4 ? 5 : -5), s.y + 3); X.lineTo(x, s.y + 8); }, 1.6, 'navy', 0.8);
+    }
+  }
+}
+function drawDoor() {
+  const s = stepTop(4), x0 = 576, y1 = s.y - 1, y0 = y1 - 60, o = DOOR.o;
+  const rat = Math.sin(G.t * 40) * DOOR.rattle * 1.5;
+  if (o < 0.02) {
+    Ln(() => { X.moveTo(x0 + rat, y1); X.lineTo(x0 + rat, y0 + 10); X.quadraticCurveTo(x0 + 11, y0 - 4, 598, y0 + 4); }, 1.2, 'navy', 0.45);
+    F('gold', () => pstar(x0 + 16 + rat, y0 + 34, 2.4 + DOOR.glint * 2, 1, 4), 0.7 + DOOR.glint * 0.3);
+    return;
+  }
+  const hole = () => { X.moveTo(x0, y1); X.lineTo(x0, y0 + 10); X.quadraticCurveTo(x0 + 11, y0 - 4, 600, y0 + 4); X.lineTo(600, y1); X.closePath(); };
+  F('navy', hole, 0.9 * o); F('yellow', () => pe(590, y1 - 16, 9, 16), 0.6 * o);
+  // 開いた扉板（ちょうつがいは右）
+  const w = 24 * (1 - o * 0.85);
+  const panel = () => prr(600 - w, y0 + 2, w, y1 - y0 - 2, 3);
+  F('red', panel); F('gold', () => pc(600 - w + 4, y0 + 34, 2));
+  Ln(panel, 1.4); Ln(hole, 1.4);
+}
+function drawProps() {
+  for (const p of props) {
+    const y = p.tied ? p.y : propY(p);
+    const x = p.x + Math.sin(G.t * 30) * p.wig * 2;
+    X.save(); X.translate(x, y); X.rotate(p.rot + p.spin);
+    if (p.k === 'ball') {
+      F('cream', () => pc(0, 0, p.r)); F('red', () => { X.moveTo(0, 0); X.arc(0, 0, p.r, 0, PI / 2); X.closePath(); X.moveTo(0, 0); X.arc(0, 0, p.r, PI, PI * 1.5); X.closePath(); });
+      F('teal', () => { X.moveTo(0, 0); X.arc(0, 0, p.r, PI / 2, PI); X.closePath(); }, 0.8);
+      Ln(() => pc(0, 0, p.r), 1.6);
+    } else if (p.k === 'box') {
+      F('cream', () => prr(-p.r, -p.r * 0.9, p.r * 2, p.r * 1.8, 4)); F('teal', () => prr(-p.r, -p.r * 0.9, p.r * 2, p.r * 1.8, 4), 0.85);
+      F('pink', () => pr(-p.r - 1, -p.r * 0.95, p.r * 2 + 2, 6)); F('yellow', () => pr(-2, -p.r * 0.9, 4, p.r * 1.8), 0.9);
+      Ln(() => prr(-p.r, -p.r * 0.9, p.r * 2, p.r * 1.8, 4), 1.5);
+    } else if (p.k === 'star') {
+      F('cream', () => pstar(0, 0, p.r + 2, p.r * 0.55, 5)); F('yellow', () => pstar(0, 0, p.r + 2, p.r * 0.55, 5));
+      F('red', () => pc(0, 0, 3), 0.7); Ln(() => pstar(0, 0, p.r + 2, p.r * 0.55, 5), 1.5);
+    } else {
+      const c = () => pp([-p.r, p.r * 0.7, -p.r, -p.r * 0.4, -p.r * 0.5, 0, 0, -p.r * 0.8, p.r * 0.5, 0, p.r, -p.r * 0.4, p.r, p.r * 0.7]);
+      F('cream', c); F('gold', c); F('red', () => { pc(0, p.r * 0.25, 2.6); }); F('teal', () => { pc(-p.r * 0.55, p.r * 0.3, 2); pc(p.r * 0.55, p.r * 0.3, 2); });
+      Ln(c, 1.5);
+    }
+    X.restore();
+  }
+}
+function drawRoof() {
+  const o = ROOF.o, pk = ROOF.peek, fl = Math.sin(G.t * 2.2) * 0.12 * o;
+  for (const s of [-1, 1]) {
+    X.save();
+    const hx = 300 + s * 100, hy = 100;
+    X.translate(hx, hy); X.rotate(s * (o * 1.05 + pk * 0.2 + fl)); const sc = 1 + o * 0.55; X.scale(sc, sc); X.translate(-hx, -hy);
+    const tri = [300 + s * 100, 100, 300, 100, 300, 10];
+    F('cream', () => pp(tri)); F('red', () => pp(tri), 0.95);
+    for (let r = 0; r < 5; r++) {
+      const y = 92 - r * 17, half = (100 - (100 - y)) * 0, w = (y - 10) / 90 * 100;
+      for (let x = 0; x < w; x += 13) {
+        const px = 300 + s * (x + 6);
+        F('plum', () => { X.moveTo(px - 6, y); X.arc(px, y, 6, PI, 0, true); }, 0.4);
+      }
+    }
+    if (o > 0.05) {
+      // 紙細工の羽：折り目と縁
+      Ln(() => { for (let k = 1; k < 5; k++) { X.moveTo(300 + s * 100, 100); X.lineTo(300, 100 - k * 22); } }, 1.3, 'cream', o);
+      F('pink', () => { for (let k = 0; k < 5; k++) { const t = k / 4; pc(lerp(300 + s * 100, 300, t), lerp(100, 10, t), 9); } }, 0.85 * o);
+      F('gold', () => { for (let k = 0; k < 5; k++) { const t = k / 4; pstar(lerp(300 + s * 100, 300, t), lerp(100, 10, t), 5, 2, 5); } }, o);
+    }
+    Ln(() => pp(tri), 2);
+    F('gold', () => pr(Math.min(300, 300 + s * 100), 96, 100, 5));
+    X.restore();
+  }
+  if (o < 0.5) {
+    const a = 1 - o * 2;
+    F('cream', () => pc(300, 64, 11), a); F('yellow', () => pc(300, 64, 11), (0.5 + pk * 0.5) * a);
+    Ln(() => { pc(300, 64, 11); X.moveTo(289, 64); X.lineTo(311, 64); X.moveTo(300, 53); X.lineTo(300, 75); }, 1.4, 'navy', a);
+    F('gold', () => pstar(300, 2 - pk * 6, 8, 3.4, 5), a);
+  }
+}
+function drawSpool() {
+  const x = R.x, y = 132;
+  if (R.mode === 'rolled' || R.mode === 'seek') {
+    const tail = 10 + Math.sin(G.t * 2) * 2;
+    F(G.ribbonCol, () => { X.moveTo(x - 3, y + 6); X.quadraticCurveTo(x + 3 + Math.sin(G.t * 2.4) * 3, y + 6 + tail / 2, x - 1, y + 8 + tail); X.lineTo(x + 4, y + 7 + tail); X.quadraticCurveTo(x + 7, y + 6 + tail / 2, x + 3, y + 6); X.closePath(); });
+  }
+  const cr = 6 + 5 * R.coil;
+  F('cream', () => pc(x, y, cr)); F(G.ribbonCol, () => pc(x, y, cr), 0.95);
+  Ln(() => { pc(x, y, cr); X.moveTo(x - cr * 0.6, y - cr * 0.3); X.lineTo(x + cr * 0.6, y + cr * 0.3); }, 1.3);
+  F('gold', () => pc(x, y, 3.2));
+}
+function drawPeg() {
+  if (R.mode !== 'bridge' && R.mode !== 'tieing') return;
+  F('gold', () => pc(R.peg.x, R.peg.y, 6)); Ln(() => pc(R.peg.x, R.peg.y, 6), 1.3);
+}
+function drawInnerCurtain() {
+  let lift = 0;
+  for (const m of mice) if (m.home === 'curtain' && (m.st === 'peek' || m.st === 'hidden')) lift = Math.max(lift, clamp((m.x - 26) / 40, 0, 1) * 10);
+  const sw = G.curtainSway;
+  const e = 56 + sw * 9;
+  const path = () => { X.moveTo(-2, 100); X.lineTo(60, 100); X.quadraticCurveTo(e + 4, 300, e - 2 + lift * 0.4, 470); X.quadraticCurveTo(e - 6 - lift, 540, e + 2 - lift, 579); X.lineTo(-2, 579); X.closePath(); };
+  F('red', path);
+  F('plum', () => { for (let k = 0; k < 3; k++) { const x = 10 + k * 15 + sw * (3 + k * 2); X.moveTo(x, 104); X.quadraticCurveTo(x + 8, 320, x + 2, 578); X.lineTo(x + 7, 578); X.quadraticCurveTo(x + 13, 320, x + 6, 104); X.closePath(); } }, 0.45);
+  F('gold', () => { prr(-2, 352, 52 + sw * 4, 9, 4); pc(46 + sw * 4, 372, 6); });
+  Ln(path, 1.8);
+  // 上のスワッグ（右側）
+  F('cream', () => { X.moveTo(470, 100); X.lineTo(602, 100); X.lineTo(602, 170); X.quadraticCurveTo(560, 168, 470, 104); X.closePath(); });
+  F('red', () => { X.moveTo(470, 100); X.lineTo(602, 100); X.lineTo(602, 170); X.quadraticCurveTo(560, 168, 470, 104); X.closePath(); });
+  F('gold', () => pc(588, 168, 6));
+  Ln(() => { X.moveTo(602, 170); X.quadraticCurveTo(560, 168, 470, 104); }, 1.6);
+}
+function drawMBox() {
+  const m = G.mb, x = MBOX.x, y = MBOX.y + Math.sin(G.t * 30) * m.wig * 2;
+  const rdy = (G.fav[G.phase === 'ball' ? 'ball' : 'indoor'] && !G.replay) ? 1 : 0;
+  const hot = m.ready;
+  const bob = hot > 0 ? Math.abs(Math.sin(G.t * 4)) * 4 * hot : 0;
+  if (rdy) {
+    for (let i = 0; i < 6; i++) {
+      const a = G.t * (1.2 + hot) + i * TAU / 6;
+      F('gold', () => pstar(x + Math.cos(a) * (30 + hot * 6), y - 6 - bob + Math.sin(a) * 16, 3 + hot * 2, 1.3, 5), 0.5 + hot * 0.5);
+    }
+  }
+  const yy = y - bob;
+  halftone(() => pe(x, y + 20, 30, 6), 0.35);
+  const box = () => prr(x - 25, yy - 12, 50, 28, 4);
+  F('cream', box); F('gold', box); F('red', () => pr(x - 25, yy - 1, 50, 6), 0.9);
+  F('yellow', () => prr(x - 21, yy - 9, 18, 4, 2), 0.8);
+  Ln(box, 1.6);
+  // ふた
+  X.save(); X.translate(x - 25, yy - 12); X.rotate(-m.lid);
+  F('cream', () => prr(0, -7, 50, 8, 3)); F('gold', () => prr(0, -7, 50, 8, 3)); Ln(() => prr(0, -7, 50, 8, 3), 1.4);
+  X.restore();
+  // 小さな踊り子の星
+  if (m.lid > 0.15) { const a = G.t * 6; F('pink', () => pstar(x, yy - 18 - m.lid * 10, 6, 2.6, 5, a), m.lid); }
+  // ハンドル
+  const ca = G.t * (m.play > 0 ? 9 : 0);
+  Ln(() => { X.moveTo(x + 25, yy + 2); X.lineTo(x + 31, yy + 2); X.lineTo(x + 31 + Math.cos(ca) * 6, yy + 2 + Math.sin(ca) * 6); }, 2.2);
+  F('red', () => pc(x + 31 + Math.cos(ca) * 6, yy + 2 + Math.sin(ca) * 6, 2.6));
+}
+/* ---------- 楽器 ---------- */
+function drawDrum(I, a) {
+  const x = I.x, y = I.y - a.bob + Math.sin(G.t * 30) * a.wig * 2;
+  halftone(() => pe(x, I.y + 58, 84, 15), 0.4);
+  const sq = a.sq;
+  X.save(); X.translate(x, y + 48); X.scale(1 + sq * 0.06, 1 - sq * 0.1); X.translate(-x, -(y + 48));
+  const top = y - 16, bot = y + 44;
+  const body = () => { X.moveTo(x - 70, top); X.lineTo(x - 70, bot); X.ellipse(x, bot, 70, 20, 0, PI, 0, true); X.lineTo(x + 70, top); X.closePath(); };
+  F('cream', body); F('red', body);
+  F('yellow', () => pr(x - 70, bot - 10, 140, 6), 0.85);
+  const z = []; for (let k = 0; k <= 9; k++) z.push(x - 63 + k * 14, k % 2 ? bot - 14 : top + 14);
+  Ln(() => pl(z), 2.6, 'gold'); Ln(() => pl(z), 0.8, 'navy', 0.6);
+  Ln(body, 2);
+  F('gold', () => pe(x, top, 75, 25)); Ln(() => pe(x, top, 75, 25), 1.6);
+  F('cream', () => pe(x, top - 1, 64, 19));
+  const d = a.dent;
+  if (d > 0) F('pink', () => pe(x, top - 1 + d * 5, 18 + d * 26, 5 + d * 8), 0.3 + 0.45 * clamp(d, 0, 1));
+  else F('yellow', () => pe(x, top - 3, 18 - d * 30, 5 - d * 8), clamp(-d * 1.5, 0, 0.7));
+  F('pink', () => { pc(x - 54, top + 2, 3); pc(x + 54, top + 2, 3); pc(x, top + 17, 3); }, 0.9);
+  Ln(() => pe(x, top - 1, 64, 19), 1.4);
+  X.restore();
+}
+const XCOLS = ['red', 'yellow', 'teal', 'pink', 'red', 'teal'];
+function drawXylo(I, a) {
+  const x = I.x, y = I.y - a.bob + Math.sin(G.t * 30) * a.wig * 2;
+  halftone(() => pe(x, I.y + 58, 100, 14), 0.4);
+  const rail = (yy, dy) => pp([x - 100, yy, x + 100, yy + dy, x + 100, yy + dy + 9, x - 100, yy + 9]);
+  F('cream', () => rail(y - 32, 12)); F('red', () => rail(y - 32, 12)); Ln(() => rail(y - 32, 12), 1.5);
+  F('cream', () => rail(y + 26, -12)); F('red', () => rail(y + 26, -12)); Ln(() => rail(y + 26, -12), 1.5);
+  for (let i = 0; i < 6; i++) {
+    const bx = x - 80 + i * 32, len = 92 - i * 9, v = a.v[i] * Math.sin(G.t * 60 + i * 1.3) * 3.5 - a.v[i] * 3;
+    const by = y - len / 2 + 2 + v;
+    const bar = () => prr(bx - 12.5, by, 25, len, 6);
+    F('cream', bar); F(XCOLS[i], bar, 0.95);
+    F('cream', () => prr(bx - 7, by + 5, 5, len - 18, 2.5), 0.5);
+    F('gold', () => { pc(bx, by + 9, 2.4); pc(bx, by + len - 9, 2.4); });
+    Ln(bar, 1.6);
+  }
+  F('red', () => { pc(x - 100, y + 44, 6); pc(x + 100, y + 32, 6); });
+}
+function drawBell(I, a) {
+  const x = I.x, y = I.y - a.bob + Math.sin(G.t * 30) * a.wig * 2;
+  halftone(() => pe(x, I.y + 58, 74, 13), 0.4);
+  const arch = () => { X.moveTo(x - 52, y + 56); X.lineTo(x - 52, y - 40); X.quadraticCurveTo(x - 52, y - 72, x, y - 72); X.quadraticCurveTo(x + 52, y - 72, x + 52, y - 40); X.lineTo(x + 52, y + 56); };
+  Ln(arch, 11, 'navy'); Ln(arch, 7, 'gold');
+  F('red', () => { pe(x - 52, y + 57, 14, 5); pe(x + 52, y + 57, 14, 5); });
+  F('gold', () => pstar(x, y - 76, 9, 4, 5));
+  X.save(); X.translate(x, y - 66); X.rotate(a.ang);
+  const bell = () => { X.moveTo(-9, 2); X.bezierCurveTo(-34, 6, -28, 44, -44, 68); X.quadraticCurveTo(0, 82, 44, 68); X.bezierCurveTo(28, 44, 34, 6, 9, 2); X.closePath(); };
+  F('cream', bell); F('gold', bell);
+  F('yellow', () => { X.moveTo(-16, 12); X.bezierCurveTo(-26, 30, -26, 50, -34, 64); X.lineTo(-24, 66); X.bezierCurveTo(-18, 48, -14, 30, -10, 14); X.closePath(); }, 0.85);
+  F('red', () => pr(-30, 46, 60, 7), 0.8);
+  Ln(bell, 2);
+  F('gold', () => pe(0, 70, 44, 8)); Ln(() => pe(0, 70, 44, 8), 1.4);
+  F('red', () => pc(Math.sin(a.clap) * 14, 78, 7)); Ln(() => pc(Math.sin(a.clap) * 14, 78, 7), 1.3);
+  F('red', () => { pp([0, 2, -16, -10, -14, 8]); pp([0, 2, 16, -10, 14, 8]); }); F('gold', () => pc(0, 2, 4));
+  X.restore();
+}
+function drawInstruments() {
+  const fns = { drum: drawDrum, xylo: drawXylo, bell: drawBell };
+  for (const k of ['drum', 'xylo', 'bell']) {
+    const I = INST[k];
+    X.save(); X.translate(I.x, I.y); X.scale(ISC, ISC); X.translate(-I.x, -I.y);
+    fns[k](I, IA[k]);
+    X.restore();
+  }
+}
+function drawHand() {
+  const h = G.hand; if (h.t < 0) return;
+  const I = h.target === 'mbox' ? { x: MBOX.x, y: MBOX.y - 4 } : INST[h.target];
+  const k = h.t, al = k < 0.3 ? k / 0.3 : (k > 2.2 ? Math.max(0, (2.6 - k) / 0.4) : 1);
+  let press = 0; for (const tp of [0.8, 1.5]) press = Math.max(press, Math.max(0, 1 - Math.abs(k - tp) / 0.18));
+  const hx = I.x + 30, hy = I.y + 6 + press * 12 - (1 - press) * 4;
+  X.save(); X.translate(hx, hy); X.rotate(-0.45); X.globalAlpha *= al;
+  const hand = () => { prr(-11, 0, 24, 30, 10); prr(-6, -26, 10, 32, 5); };
+  F('cream', hand); F('pink', hand, 0.35); Ln(() => { prr(-11, 0, 24, 30, 10); }, 1.6); Ln(() => prr(-6, -26, 10, 32, 5), 1.6);
+  X.restore();
+  if (press > 0.6) ring(I.x, I.y - 10, 10, 'gold', 0.4, 60);
+}
+/* ---------- 舞踏会の舞台 ---------- */
+function drawDisc() {
+  const y = discY(), rx = DISC.rx, ry = DISC.ry;
+  F('cream', () => { X.moveTo(300 - rx, y); X.lineTo(300 - rx, y + 18); X.ellipse(300, y + 18, rx, ry, 0, PI, 0, true); X.lineTo(300 + rx, y); X.closePath(); });
+  F('red', () => { X.moveTo(300 - rx, y); X.lineTo(300 - rx, y + 18); X.ellipse(300, y + 18, rx, ry, 0, PI, 0, true); X.lineTo(300 + rx, y); X.closePath(); });
+  for (let k = 0; k < 16; k++) {
+    const a = B.ang + k * TAU / 16, c = Math.cos(a), s = Math.sin(a);
+    if (s > 0.05) F('gold', () => pc(300 + c * rx, y + 10 + s * ry, 3.2));
+  }
+  F('cream', () => pe(300, y, rx, ry));
+  for (let k = 0; k < 12; k++) {
+    const a0 = B.ang + k * TAU / 12, a1 = a0 + TAU / 12;
+    F(k % 2 ? 'pink' : 'yellow', () => { X.moveTo(300, y); for (let j = 0; j <= 4; j++) { const a = lerp(a0, a1, j / 4); X.lineTo(300 + Math.cos(a) * rx, y + Math.sin(a) * ry); } X.closePath(); }, 0.75);
+  }
+  F('gold', () => pstar(300, y, 30, 12, 5, B.ang), 0.7);
+  Ln(() => pe(300, y, rx, ry), 2);
+  Ln(() => pe(300, y, rx * 0.62, ry * 0.62), 1.2, 'gold', 0.8);
+}
+function drawRStair() {
+  for (let k = 0; k < 12; k++) {
+    const g = B.grow[k]; if (g < 0.02) continue;
+    const s = rStepTop(k), pv = k > 0 ? rStepTop(k - 1) : { x: 460, y: DISC.y };
+    const e = eob(g), x = lerp(pv.x, s.x, e), y = lerp(pv.y, s.y, e), w = 40 * lerp(0.4, 1, sm(g));
+    if (k > 0) Ln(() => { X.moveTo(pv.x, pv.y + 6); X.quadraticCurveTo((pv.x + x) / 2 + 10, (pv.y + y) / 2 + 14, x, y + 6); }, 3, 'gold', g);
+    const top = () => prr(x - w / 2, y - 2, w, 9, 3);
+    F('cream', top); F(k % 2 ? 'teal' : 'pink', top); F('gold', () => pstar(x, y + 14, 4, 1.8, 5), 0.9);
+    Ln(top, 1.5);
+  }
+}
+function lampPos() { return ropeEnd(); }
+function drawLamp() {
+  if (B.lamp <= 0.01) return;
+  const a = B.lamp;
+  drawRibbon(G.ribbonCol, 6, a);
+  const e = lampPos();
+  if (B.orbit > 0.02) {
+    const o = B.orbit;
+    Ln(() => pe(e.x, e.y, 46 + o * 30, 14 + o * 10, Math.sin(G.t) * 0.2), 5, G.ribbonCol, 0.8 * o);
+    Ln(() => pe(e.x, e.y, 46 + o * 30, 14 + o * 10, Math.sin(G.t) * 0.2), 1, 'gold', 0.8 * o);
+  }
+  X.globalCompositeOperation = 'screen';
+  const ga = X.globalAlpha;
+  X.fillStyle = INK.yellow; X.globalAlpha = ga * 0.28 * a; bp(); pc(e.x, e.y + 6, 64); X.fill();
+  X.globalAlpha = ga * 0.25 * a; bp(); pc(e.x, e.y + 6, 36); X.fill();
+  X.globalAlpha = ga;
+  const r = 24;
+  F('cream', () => pstar(e.x, e.y + 8, r, r * 0.48, 5, Math.sin(G.t * 1.5) * 0.15), a);
+  F('gold', () => pstar(e.x, e.y + 8, r, r * 0.48, 5, Math.sin(G.t * 1.5) * 0.15), a);
+  F('yellow', () => pc(e.x, e.y + 8, 7), a);
+  Ln(() => pstar(e.x, e.y + 8, r, r * 0.48, 5, Math.sin(G.t * 1.5) * 0.15), 1.6, 'navy', a);
+}
+/* 影：ランプから床へ投影（網点） */
+function shadowXf(gx, gz, h0, hf, lx, lz, Hl) {
+  let dx = gx - lx, dz = gz - lz;
+  let d = Math.hypot(dx, dz);
+  if (d < 1) { dx = 0; dz = -1; d = 1; } else { dx /= d; dz /= d; }
+  const k = 0.62;
+  const off = Math.min(150, d * h0 / Math.max(40, Hl - h0) * 0.6);
+  const stretch = clamp(2.3 * Hl / Math.max(55, Hl - h0 - hf * 0.5), 2.0, 5.6);
+  const bx = clamp(gx + dx * off, 150, 450), bz = clamp(gz + dz * off, -120, 120);
+  const px = -dz, pz = dx; // 横方向
+  const wid = 1.8 + (stretch - 2.0) * 0.25;
+  return { a: px * wid, b: pz * wid * k, c: -dx * stretch, d: -dz * stretch * k, e: bx, f: DISC.y + bz * k, stretch };
+}
+function drawShadows() {
+  if (B.lamp < 0.3) return;
+  const lam = lampPos();
+  const Hl = DISC.y - lam.y, lx = lam.x, lz = 70;
+  const vis = clamp((B.lamp - 0.3) / 0.7, 0, 1);
+  // 影はいったんべた塗りで別紙に描き、あとから画面空間の網点で刷る
+  if (!shadowCv || shadowCv.width !== cv.width || shadowCv.height !== cv.height) { shadowCv = document.createElement('canvas'); shadowCv.width = cv.width; shadowCv.height = cv.height; }
+  const main = X, sg = shadowCv.getContext('2d');
+  sg.setTransform(1, 0, 0, 1, 0, 0); sg.globalCompositeOperation = 'source-over'; sg.globalAlpha = 1;
+  sg.clearRect(0, 0, shadowCv.width, shadowCv.height);
+  boxTransform(sg); sg.lineCap = 'round'; sg.lineJoin = 'round';
+  X = sg;
+  X.save();
+  bp(); pe(300, 540, 372, 160); X.clip();
+  const ga = 1;
+  SIL = '#000';
+  // 屋上階段の影
+  const top = rTop();
+  if (top >= 0) {
+    const pts = [];
+    for (let k = 0; k <= top; k++) {
+      const s = rStepTop(k), h = DISC.y - s.y;
+      const gx = 470 + (s.x - 470) * 0.3, gz = -40;
+      let dx = gx - lx, dz = gz - lz; const d = Math.hypot(dx, dz) || 1; dx /= d; dz /= d;
+      const L = h * Hl / Math.max(70, Hl - h * 0.55) * 0.55;
+      pts.push(gx + dx * L, DISC.y + (gz + dz * L) * 0.62);
+    }
+    X.globalCompositeOperation = 'source-over'; X.strokeStyle = SIL; X.lineWidth = 16;
+    bp(); X.moveTo(470, DISC.y - 40 * 0.62); for (let i = 0; i < pts.length; i += 2) X.lineTo(pts[i], pts[i + 1]); X.stroke();
+  }
+  const figs = [];
+  figs.push({ o: cat, gx: cat.x, gz: catGZ(), h0: Math.max(0, discY() - cat.y), hf: 92, isCat: true });
+  for (const m of mice) if (m.st === 'disc' || m.st === 'joined') figs.push({ o: m, gx: m.x, gz: (m.y - DISC.y) * DISC.rx / DISC.ry, h0: Math.max(0, discY() - m.y), hf: 40 });
+  let maxS = 0;
+  for (const f of figs) {
+    const T = shadowXf(f.gx, f.gz, f.h0, f.hf, lx, lz, Hl);
+    if (f.isCat) maxS = T.stretch;
+    X.save();
+    X.transform(T.a, T.b, T.c, T.d, T.e, T.f);
+    const o = f.o, sx = o.x, sy = o.y, ss = o.sq;
+    o.x = 0; o.y = 0;
+    if (f.isCat) drawCat(o); else drawMouse(o);
+    o.x = sx; o.y = sy; o.sq = ss;
+    X.restore();
+  }
+  B.shadowK = maxS;
+  SIL = null;
+  X.restore();
+  sg.setTransform(1, 0, 0, 1, 0, 0);
+  sg.globalCompositeOperation = 'source-in'; sg.fillStyle = screenDotPat; sg.fillRect(0, 0, shadowCv.width, shadowCv.height);
+  X = main;
+  const keep = X.getTransform();
+  X.setTransform(1, 0, 0, 1, 0, 0);
+  const ga0 = X.globalAlpha;
+  X.globalCompositeOperation = 'multiply'; X.globalAlpha = ga0 * 0.85 * vis;
+  X.drawImage(shadowCv, 0, 0);
+  X.globalAlpha = ga0; X.setTransform(keep);
+}
+function catGZ() { return cat.sup.t === 'rstair' ? -40 : 0; }
+function drawFrontCurtain() {
+  const v = G.curtain.v; if (v <= 0.001) return;
+  const e = sm(v);
+  for (const s of [-1, 1]) {
+    const edge = s < 0 ? lerp(EXT.l - 20, 304, e) : lerp(EXT.r + 20, 296, e);
+    const outer = s < 0 ? EXT.l - 30 : EXT.r + 30;
+    const path = () => { X.moveTo(outer, EXT.t - 10); X.lineTo(edge, EXT.t - 10); X.quadraticCurveTo(edge - s * 18, (EXT.t + EXT.b) / 2, edge, EXT.b + 10); X.lineTo(outer, EXT.b + 10); X.closePath(); };
+    X.globalCompositeOperation = 'source-over'; X.fillStyle = INK.paper; bp(); path(); X.fill();
+    F('red', path);
+    const n = 6;
+    for (let k = 0; k < n; k++) {
+      const fx = lerp(outer, edge, (k + 0.5) / n);
+      F('plum', () => { X.moveTo(fx - 4, EXT.t); X.quadraticCurveTo(fx + 10, 400, fx - 3, EXT.b); X.lineTo(fx + 7, EXT.b); X.quadraticCurveTo(fx + 18, 400, fx + 5, EXT.t); X.closePath(); }, 0.45);
+    }
+    Ln(() => { X.moveTo(edge, EXT.t - 10); X.quadraticCurveTo(edge - s * 18, (EXT.t + EXT.b) / 2, edge, EXT.b + 10); }, 5, 'gold');
+    for (let y = EXT.t + 40; y < EXT.b; y += 90) F('gold', () => pstar(edge + s * 30, y, 7, 3, 5));
+  }
+}
+
+/* ============================================================
+   こねこの動作（行動キュー）
+   ============================================================ */
+function setAct(a, keep) { cat.act = a; a.t = 0; if (!keep) cat.queue.length = 0; if (a.init) a.init(); }
+function seq(list) { setAct(list[0]); cat.queue = list.slice(1); }
+function catFree() { return !cat.act || cat.act.intr; }
+function catStanding() { return !cat.act && ['floor', 'step', 'bridge', 'disc', 'rstair', 'roof'].includes(cat.sup.t); }
+function supPos(s) {
+  switch (s.t) {
+    case 'floor': { const x = s.x != null ? s.x : cat.x; return { x, y: floorY(x) }; }
+    case 'step': { const p = stepTop(s.i); return { x: p.x + (s.dx || 0), y: p.y }; }
+    case 'bridge': return bridgePt(s.u);
+    case 'roof': return { x: 300, y: 8 - ROOF.peek * 8 };
+    case 'disc': { const x = s.x != null ? s.x : cat.x; return { x, y: discY() }; }
+    case 'rstair': return rStepTop(s.k);
+  }
+  return { x: cat.x, y: cat.y };
+}
+function landFx(soft) { dust(cat.x, cat.y, soft ? 8 : 5); SND.land(soft ? 0.6 : 1); }
+function aJump(o) {
+  return {
+    kind: 'jump', intr: false, spring: !!o.spring, c: o.c || 0, o, landX: o.landX,
+    init() { this.cr = o.crouch != null ? o.crouch : 0.08; this.dur = o.dur || 0.7; this.lift = false; this.apex = false; },
+    retarget(to, sup, land) {
+      this.x0 = cat.x; this.y0 = cat.y; this.t = this.cr; this.dur = 0.55;
+      o.to = to; o.sup = sup; o.peak = Math.min(cat.y, to().y) - 26; if (land) o.land = land;
+    },
+    upd() {
+      const t = this.t;
+      if (t < this.cr) { cat.pose = 'crouch'; cat.sq = 1 - 0.14 * (t / this.cr); return false; }
+      if (!this.lift) { this.lift = true; this.x0 = cat.x; this.y0 = cat.y; cat.sup = { t: 'air' }; if (o.onLift) o.onLift(); }
+      const u = clamp((t - this.cr) / this.dur, 0, 1);
+      const tg = o.to();
+      const pk = o.peak != null ? o.peak : Math.min(this.y0, tg.y) - (o.ph || 40);
+      const D = tg.y - this.y0, A = Math.max(1, this.y0 - pk);
+      const q = 8 * D + 16 * A, h = (q + Math.sqrt(Math.max(0, q * q - 64 * D * D))) / 32;
+      cat.x = lerp(this.x0, tg.x, u); cat.y = this.y0 + (D - 4 * h) * u + 4 * h * u * u;
+      cat.ground = 0;
+      cat.pose = (u > 0.84 && !o.keepPose) ? 'crouch' : (o.pose || 'jete');
+      cat.spin = (o.spins || 0) * TAU * sm(u); cat.rot = (o.flip || 0) * TAU * sm(u); cat.anchor = -42;
+      cat.sq = appr(cat.sq, 1.06, 10, 1 / 60);
+      if (!this.apex && u >= 0.5) { this.apex = true; if (o.onApex) o.onApex(); }
+      if (u >= 1) {
+        cat.spin = 0; cat.rot = 0;
+        cat.sup = typeof o.sup === 'function' ? o.sup() : o.sup;
+        if (cat.sup.t === 'floor' || cat.sup.t === 'disc') { cat.x = tg.x; delete cat.sup.x; }
+        cat.ground = 1; cat.sq = 0.8; cat.sqv = 0; landFx(o.soft);
+        if (o.land) o.land();
+        return true;
+      }
+      return false;
+    }
+  };
+}
+function aWalk(tx, sp) {
+  return {
+    kind: 'walk', intr: true,
+    upd(dt) {
+      const d = tx - cat.x;
+      if (Math.abs(d) < 2) { cat.pose = 'stand'; return true; }
+      cat.face = Math.sign(d); cat.x += Math.sign(d) * Math.min(Math.abs(d), (sp || 95) * dt);
+      cat.walkPh += dt * 11; cat.pose = 'walk';
+      return false;
+    }
+  };
+}
+function aPose(name, dur, fn, intr) {
+  return { kind: 'pose', intr: intr !== false, upd(dt) { cat.pose = name; if (fn) fn(this.t, dt); return this.t >= dur; } };
+}
+function aCall(fn) { return { kind: 'call', intr: true, upd() { fn(); return true; } }; }
+function aHop(sup, o) {
+  o = o || {};
+  return aJump(Object.assign({ to: () => supPos(sup), sup, ph: 18, dur: 0.3, pose: 'releve', crouch: 0.04, keepPose: true, soft: true, land: () => SND.clack(sup.i || 0) }, o));
+}
+/* 階段をのぼる・おりる道のり */
+function climbPlan(target) {
+  const list = [];
+  let cur = cat.sup.t === 'step' ? cat.sup.i : -1;
+  if (cur < 0) { if (Math.abs(cat.x - 352) > 3) list.push(aWalk(352)); }
+  while (cur < target) { cur++; list.push(aHop({ t: 'step', i: cur })); }
+  while (cur > target && cur >= 0) {
+    cur--;
+    if (cur >= 0) list.push(aHop({ t: 'step', i: cur }));
+    else list.push(aHop({ t: 'floor', x: 345 }, { land: () => SND.land(0.5) }));
+  }
+  return list;
+}
+function goDown() { const l = climbPlan(-1); if (l.length) seq(l); }
+function topBuilt() { let t = -1; for (let i = 0; i < ST.n; i++) if (ST.grow[i] > 0.97) t = i; return t; }
+function softFall(tx) {
+  tx = clamp(tx != null ? tx : cat.x, 70, 370);
+  setAct(aJump({ to: () => ({ x: tx, y: floorY(tx) }), sup: { t: 'floor' }, ph: 12, dur: 1.2, pose: 'fall', keepPose: true, soft: true, crouch: 0.02, land: () => { stars(cat.x, cat.y - 20, 5, 100, 'pink'); } }));
+}
+
+/* ============================================================
+   成功と演出
+   ============================================================ */
+const MAJOR = ['d1', 'd2', 'd3', 'd4', 'd5', 'd6'];
+function success(id, x, y, score) {
+  const first = !G.found[id];
+  G.found[id] = true;
+  if (G.rec && !G.replay && !G.rec.ended) G.rec.score += (score || 1) + (first ? 1 : 0);
+  G.lastSuccT = G.t; G.successFlash = 1;
+  SND.success(first || MAJOR.includes(id));
+  stars(x, y, first ? 14 : 7, first ? 210 : 140);
+  confetti(x, y, first ? 22 : 9, 250, true);
+  if (G.phase === 'ball') G.ballSucc++;
+  cat.mood = 1;
+  if (['d1', 'd2b', 'd4', 'd4b', 'd3b', 'land', 'propbat', 'leap', 'flip'].includes(id)) curtainMouseCurious();
+  if (window.__kbLog) window.__kbLog.push({ id, t: +G.t.toFixed(2), first });
+  return first;
+}
+function majorCount() { let n = 0; for (const k of ['d1', 'd2', 'd3', 'd4', 'd5']) if (G.found[k]) n++; return n; }
+
+/* ============================================================
+   楽器の入力
+   ============================================================ */
+function instFx(k) {
+  const I = INST[k], a = IA[k];
+  a.hitT = G.t;
+  if (k === 'drum') { a.dent = 1.35; a.dv = 0; a.sq = 1; confetti(I.x, I.y - 26, 7, 220, true); }
+  else if (k === 'xylo') { for (let i = 0; i < 6; i++) a.d[i] = i * 0.05; }
+  else { a.av += (a.ang > 0 ? -1 : 1) * 4.5; a.cv += 14; ring(I.x, I.y - 20, 22, 'gold', 0.9, 110); ring(I.x, I.y - 20, 12, 'pink', 1.1, 70); }
+  note(I.x + rand(-20, 20), I.y - 70, pick(['navy', 'red', 'teal']));
+}
+function play(k, fromReplay) {
+  const a = IA[k];
+  if (!fromReplay && G.t - a.lastT < 0.06) return;
+  if (!fromReplay) { if (G.lastSuccT > (G.hintTapT || -1)) G.hintMiss = 0; else if (k === G.hint.target) G.hintMiss = (G.hintMiss || 0) + 1; G.hintTapT = G.t; }
+  a.lastT = G.t;
+  G.lastInputT = G.t;
+  if (window.__kbTaps) window.__kbTaps.push(k + (fromReplay ? 'R' : '') + '@' + cat.sup.t + (cat.sup.i != null ? cat.sup.i : '') + '/' + R.mode + '/' + ST.n);
+  if (!fromReplay) {
+    G.hand.shownIdle = false; G.hand.t = -1;
+    if (G.replay) { G.replay = null; G.mb.play = 0; }
+    G.anyTap = true; G.firstTapDone = true;
+    if (G.phase === 'indoor' || G.phase === 'ball') recTap(k);
+  }
+  if (G.mb.ready > 0) G.mb.ready = 0;
+  instFx(k);
+  if (G.curtain.dir !== 0 || G.finale || G.phase === 'toBall') {
+    // 幕間：音と小さな反応だけ
+    if (k === 'drum') SND.drum(1); else if (k === 'xylo') SND.xylo(3, 3); else SND.bell(1);
+    if (G.finale) cat.mood = 1;
+  } else if (G.phase === 'indoor') {
+    if (k === 'drum') drumIn(); else if (k === 'xylo') xyloIn(); else bellIn();
+  } else if (G.phase === 'ball') {
+    if (k === 'drum') drumBall(); else if (k === 'xylo') xyloBall(); else bellBall();
+  }
+  G.lastInst = k; G.lastInstT = G.t;
+}
+IA.drum.lastT = IA.xylo.lastT = IA.bell.lastT = -9;
+
+/* ---------- 太鼓（室内） ---------- */
+const JUMP_H = [0, 110, 232, 335];
+function drumIn() {
+  const now = G.t;
+  const chained = now - SP.lastT < 2.4 && SP.charge > 0;
+  SP.charge = chained ? Math.min(3, SP.charge + 1) : 1; SP.lastT = now;
+  const c = SP.charge;
+  SND.drum(c);
+  const onFloor = cat.sup.t === 'floor';
+  const airSpring = cat.sup.t === 'air' && cat.act && cat.act.spring;
+  SP.x = onFloor ? cat.x : (airSpring && cat.act.landX != null ? cat.act.landX : 262);
+  SP.A = -(5 + 4 * c); SP.V = 210 + 75 * c;
+  for (const p of props) if (!p.tied && Math.abs(p.x - SP.x) < 130) p.hv = 110 + 35 * c;
+  dust(SP.x, FLOOR, 3);
+  const afterXylo = G.lastInst === 'xylo' && now - G.lastInstT < 6 && ST.n >= 1;
+  if (cat.sup.t === 'swing') { swingPump(); return; }
+  if (afterXylo) stairsBoing();
+  if ((R.mode === 'bridge') && onFloor && catFree()) { jumpToBridge(); miceJump(1); return; }
+  if (onFloor && catFree()) { springJump(c); return; }
+  if (airSpring) { SP.pending = Math.max(SP.pending, c); cat.lookAt = { x: cat.x, y: FLOOR + 30 }; cat.lookT = 0.6; miceJump(c); return; }
+  if (cat.sup.t === 'step' && catFree() && !afterXylo && (!G.found.d1 || cat.sup.i <= 1) && !mice.some(m => m.st === 'joined')) {
+    // ばね床に呼ばれて、段からぽんと降りる（続けて叩くと床で高く跳ねる）
+    setAct(aJump({ to: () => ({ x: 262, y: floorY(262) }), sup: { t: 'floor' }, ph: 30, dur: 0.6, pose: 'star', crouch: 0.04, spring: true, c, landX: 262, land: () => afterSpringLand(c) }));
+    SP.x = 262;
+  } else if (cat.sup.t === 'step' && catFree() && !afterXylo) {
+    const sup = { t: 'step', i: cat.sup.i };
+    setAct(aJump({ to: () => supPos(sup), sup, ph: 26 + 10 * c, dur: 0.42, pose: 'star', crouch: 0.04 }));
+    if (miceJump(c) > 0) success('d5b', cat.x, cat.y - 80, 2);
+  }
+  if (cat.sup.t === 'bridge' && catFree()) {
+    const sup = { t: 'bridge', u: cat.sup.u };
+    setAct(aJump({ to: () => bridgePt(sup.u), sup, ph: 40, dur: 0.5, pose: 'star', spins: 1, crouch: 0.04 }));
+    ropeKick(0, -5);
+  }
+  if (miceJump(c) > 0 && cat.act && cat.act.kind === 'jump') success('d5b', cat.x, cat.y - 80, 2);
+}
+function springJump(c) {
+  const h = JUMP_H[c], style = G.style;
+  let target = -1;
+  if (c >= 2) {
+    for (let i = topBuilt(); i >= 1; i--) { const p = stepBase(i); if (FLOOR - p[1] <= h - 12) { target = i; break; } }
+  }
+  const tp = (R.mode === 'tiedProp' && R.prop >= 0) ? props[R.prop] : null;
+  if (target >= 0) {
+    const sup = { t: 'step', i: target };
+    setAct(aJump({ to: () => supPos(sup), sup, peak: FLOOR - h, dur: 0.66 + c * 0.08, pose: STYLE_AIR[style], spins: c >= 3 ? 2 : 1, spring: true, c, land: () => success('land', cat.x, cat.y - 50, target >= 3 ? 2 : 1) }));
+  } else if (tp && Math.abs(tp.x - cat.x) < 120) {
+    const tx = clamp(tp.x - 6, 70, 380);
+    setAct(aJump({
+      to: () => ({ x: tx, y: floorY(tx) }), sup: { t: 'floor' }, peak: Math.min(FLOOR - h, tp.y + 70), dur: 0.8, pose: 'reach', keepPose: true, spring: true, c, landX: tx,
+      onApex: () => { ropeKick((cat.x < tp.x ? 1 : -1) * 6, -4); tp.spin += 8; stars(tp.x, tp.y, 9, 170); SND.bell(1.6); success('propbat', tp.x, tp.y - 10, 2); },
+      land: () => afterSpringLand(c)
+    }));
+  } else {
+    const tx = clamp(cat.x + rand(-14, 14), 70, 380);
+    const pose = c === 1 ? (style === 2 ? 'tuck' : 'star') : STYLE_AIR[style];
+    setAct(aJump({ to: () => ({ x: tx, y: floorY(tx) }), sup: { t: 'floor' }, peak: FLOOR - h, dur: 0.5 + c * 0.13, pose, spins: c === 1 ? (style === 3 ? 1 : 0) : c - 1, flip: (c === 3 && style % 2) ? 1 : 0, spring: true, c, landX: tx, land: () => afterSpringLand(c) }));
+  }
+  if (c >= 2) success('d1', cat.x, FLOOR - h + 20, 2);
+  const n = miceJump(c);
+  if (n > 0) success('d5b', cat.x, FLOOR - 120, 2);
+}
+function afterSpringLand(c) {
+  if (SP.pending > 0) {
+    const p = Math.min(3, Math.max(SP.pending, c));
+    SP.pending = 0; SP.charge = p; SP.lastT = G.t;
+    SP.x = cat.x; SP.A = -(5 + 4 * p); SP.V = 210 + 75 * p;
+    springJump(p);
+  }
+}
+function stairsBoing() {
+  ST.bv += 1.7; SND.boing();
+  let best = -1, bv = 0;
+  for (let i = 0; i < props.length; i++) {
+    const p = props[i]; if (p.tied) continue;
+    const dir = p.x > 300 ? -1 : (p.x < 150 ? 1 : -1);
+    const v = (p.x > 300 ? 250 : 150) * rand(0.85, 1.15);
+    p.vx = dir * v; p.hv = 190;
+    if (v > bv) { bv = v; best = i; }
+  }
+  G.lastRollT = G.t; G.rollProp = best;
+  if (cat.sup.t === 'step') {
+    const sup = { t: 'step', i: cat.sup.i };
+    setAct(aJump({ to: () => supPos(sup), sup, ph: 64, dur: 0.62, pose: 'star', spins: 1, crouch: 0.03 }));
+  }
+  for (let i = 0; i < STEP_MAX; i++) ST.jv[i] += (i % 2 ? 1 : -1) * 120;
+  const s = stepTop(Math.max(0, ST.n - 1));
+  success('d3', s.x - 20, s.y - 10, 2);
+}
+function miceJump(c) {
+  let n = 0;
+  for (const m of mice) {
+    if (m.st !== 'joined' || m.sup !== 'floor' || m.jump || m.hop) continue;
+    const q = m.quirk;
+    const delay = q === 'bouncy' ? 0.06 : (q === 'shy' ? 0.32 : 0.18) + n * 0.08;
+    const hh = (q === 'bouncy' ? 1.15 : (q === 'shy' ? 0.55 : 0.85)) * (40 + 30 * c);
+    m.jump = { t: -delay, h: hh, dur: 0.42 + c * 0.08, spin: q === 'spinny' ? 2 : (c >= 2 ? 1 : 0) };
+    n++;
+  }
+  return n;
+}
+/* ---------- 木琴（室内） ---------- */
+function buildStep() {
+  if (ST.n >= stairLimit()) return false;
+  const i = ST.n; ST.n++; ST.grow[i] = 0.001;
+  SND.clack(i);
+  for (const p of props) if (!p.tied && p.x > 300) { p.vx -= rand(45, 85); p.hv = 70; }
+  const s = stepTop(i); confetti(s.x, s.y, 6, 140, true);
+  cat.lookAt = { x: s.x, y: s.y }; cat.lookT = 1.2;
+  if (i === 4) DOOR.glint = 1;
+  return true;
+}
+function xyloIn() {
+  SND.xylo(clamp(ST.n, 0, 9), 3);
+  const a = cat.act;
+  if (a && a.kind === 'jump' && a.spring && a.c >= 2 && !a.retargeted && cat.sup.t === 'air') {
+    buildStep();
+    const apex = FLOOR - JUMP_H[a.c];
+    let tg = -1;
+    for (let i = ST.n - 1; i >= 1; i--) if (stepBase(i)[1] >= apex - 34) { tg = i; break; }
+    if (tg >= 0) { const sup = { t: 'step', i: tg }; a.retarget(() => supPos(sup), sup, () => success('land', cat.x, cat.y - 50, 2)); a.retargeted = true; }
+    return;
+  }
+  if (cat.sup.t === 'swing') { buildStep(); if (ST.n >= 2) swingLeap(); return; }
+  if (R.mode === 'hanging' && R.len > 110) { buildStep(); makeBridge(); return; }
+  if (cat.sup.t === 'step' && cat.sup.i >= 3 && ST.n >= 5 && DOOR.to === 0) { openDoor(); return; }
+  if (ST.n < stairLimit()) { buildStep(); return; }
+  if (DOOR.to === 0) {
+    ST.gv += 6; DOOR.rattle = 0.8; DOOR.glint = 1; SND.boing();
+    cat.lookAt = { x: 560, y: 300 }; cat.lookT = 1.6; cat.climbNow = true;
+  } else {
+    for (let i = 0; i < STEP_MAX; i++) ST.jv[i] += (i % 2 ? 1 : -1) * 70;
+    const s = stepTop(STEP_MAX - 1); stars(s.x, s.y, 6, 120);
+    cat.climbNow = true;
+  }
+}
+function openDoor() {
+  DOOR.to = 1; SND.pop();
+  const s = stepTop(4);
+  success('d5', 586, s.y - 30, 3);
+  stars(588, s.y - 30, 10, 160);
+  const m = mice.find(mm => mm.home === 'door');
+  if (m && m.st === 'hidden') { m.st = 'peek'; m.t = 0; m.x = 600; m.y = s.y; m.face = -1; SND.squeak(); }
+  cat.lookAt = { x: 586, y: s.y - 20 }; cat.lookT = 2;
+  setAct(aPose('clap', 0.6));
+}
+/* ---------- 橋 ---------- */
+function bridgeEnds() { const s = stepTop(R.tie); return { ax: R.peg.x, ay: R.peg.y, bx: s.x - 24, by: s.y + 2 }; }
+function bridgePt(u) {
+  const e = bridgeEnds(), on = cat.sup.t === 'bridge' ? 10 : 0;
+  return { x: lerp(e.ax, e.bx, u), y: lerp(e.ay, e.by, u) + (22 + on) * 4 * u * (1 - u) };
+}
+function makeBridge() {
+  R.mode = 'tieing'; R.tie = ST.n - 1; R.tieT = 0;
+  const s = stepTop(R.tie);
+  R.peg.x = 44; R.peg.y = stepBase(R.tie)[1] + 2;
+  const e = ropeEnd();
+  R.from = { ax: R.x, ay: 132, bx: e.x, by: e.y };
+  SND.whoosh();
+  cat.lookAt = { x: s.x, y: s.y }; cat.lookT = 1.5;
+}
+function jumpToBridge() {
+  const e = bridgeEnds();
+  const u0 = clamp((cat.x - e.ax) / (e.bx - e.ax), 0.3, 0.72);
+  const sup = { t: 'bridge', u: u0 };
+  setAct(aJump({ to: () => bridgePt(u0), sup, ph: 46, dur: 0.72, pose: STYLE_AIR[G.style], spins: 1, land: () => ropeKick(0, -4) }));
+  cat.queue = [aBridgeWalk(1), aCall(() => {
+    const sup2 = { t: 'step', i: R.tie };
+    setAct(aHop(sup2, { ph: 22, land: () => success('d2b', cat.x, cat.y - 50, 3) }), true);
+  })];
+}
+function aBridgeWalk(u1) {
+  return {
+    kind: 'bwalk', intr: false,
+    upd(dt) {
+      if (cat.sup.t !== 'bridge') return true;
+      const u = cat.sup.u, d = u1 - u;
+      const mid = Math.abs(u - 0.6) < 0.08;
+      cat.sup.u += Math.sign(d) * Math.min(Math.abs(d), (mid ? 0.16 : 0.42) * dt);
+      const p = bridgePt(cat.sup.u); cat.x = p.x; cat.y = p.y;
+      cat.pose = mid ? 'arab' : 'balance'; cat.walkPh += dt * 8;
+      if (mid) cat.spin += dt * 9; else cat.spin = appr(cat.spin, Math.round(cat.spin / TAU) * TAU, 8, dt);
+      if (Math.abs(d) < 0.005) { cat.spin = 0; return true; }
+      return false;
+    }
+  };
+}
+function untieBridge() { R.mode = 'untie'; R.tieT = 0; ropeB = null; SND.whoosh(); }
+/* ---------- ぶらんこ ---------- */
+function startSwing() {
+  R.mode = 'swing';
+  const sw = cat.sw = { th: clamp((cat.x - R.x) / 260, -0.3, 0.3), om: 0, L: 300, Lt: 300, seat: false, grab: 0, x0: cat.x, y0: cat.y };
+  sw.om = (sw.th >= 0 ? 1 : -1) * 0.7;
+  setAct(aSwing());
+  success('d4', R.x, 330, 3);
+}
+function swingHold() {
+  const sw = cat.sw;
+  return { x: R.x + Math.sin(sw.th) * sw.L, y: 132 + Math.cos(sw.th) * sw.L };
+}
+function aSwing() {
+  return {
+    kind: 'swing', intr: false,
+    init() { cat.sup = { t: 'swing' }; this.since = G.t; },
+    upd(dt) {
+      const sw = cat.sw;
+      sw.om += (-(1500 / sw.L) * Math.sin(sw.th) - 0.1 * sw.om) * dt;
+      sw.th = clamp(sw.th + sw.om * dt, -1.15, 1.15);
+      sw.L = appr(sw.L, sw.Lt, 3, dt);
+      const hp = swingHold();
+      const k = sm(this.t / 0.28);
+      cat.ground = 0; cat.rot = -sw.th;
+      if (sw.seat) { cat.anchor = -31; cat.pose = 'sit'; cat.x = lerp(sw.x0, hp.x, k); cat.y = lerp(sw.y0, hp.y + 31, k); }
+      else { cat.anchor = -76; cat.pose = 'hang'; cat.x = lerp(sw.x0, hp.x, k); cat.y = lerp(sw.y0, hp.y + 76, k); }
+      ropeB = { x: lerp(cat.x, hp.x, k), y: lerp(cat.y - 76, hp.y, k) };
+      if (G.t - G.lastInputT > 9 && G.t - this.since > 5 && Math.abs(sw.th) < 0.5) { const x = cat.x; endSwing(); softFall(x); }
+      return false;
+    }
+  };
+}
+function endSwing() { if (R.mode === 'swing') { R.mode = 'hanging'; R.lenT = 255; } ropeB = null; cat.rot = 0; cat.anchor = -30; cat.ground = 0; }
+function swingPump() {
+  const sw = cat.sw; if (!sw) return;
+  sw.om += (sw.om >= 0 ? 1 : -1) * 1.05;
+  if (Math.abs(sw.om) < 0.4) sw.om += 1.05;
+  sw.om = clamp(sw.om, -3.2, 3.2);
+  sw.seat = !sw.seat; sw.Lt = sw.seat ? 232 : 300;
+  SP.x = clamp(cat.x, 60, 400); SP.A = -6; SP.V = 420;
+  dust(SP.x, FLOOR, 4);
+  success('d4b', cat.x, cat.y - 60, 2);
+  miceJump(1);
+}
+function swingRelease() {
+  const sw = cat.sw, vx = sw.om * sw.L * Math.cos(sw.th);
+  const tx = clamp(cat.x + vx * 0.4, 80, 370);
+  endSwing();
+  setAct(aJump({ to: () => ({ x: tx, y: floorY(tx) }), sup: { t: 'floor' }, ph: 70, dur: 0.85, pose: 'tuck', flip: 1, soft: true, crouch: 0, land: () => success('flip', cat.x, cat.y - 50, 1) }));
+}
+function swingLeap() {
+  const i = topBuilt() >= 1 ? topBuilt() : ST.n - 1;
+  const sup = { t: 'step', i };
+  endSwing();
+  setAct(aJump({ to: () => supPos(sup), sup, ph: 40, dur: 0.75, pose: 'jete', spins: 1, crouch: 0, land: () => success('leap', cat.x, cat.y - 50, 2) }));
+}
+/* ---------- 鈴（室内） ---------- */
+function bellIn() {
+  SND.bell(R.mode === 'rolled' ? 1 : 1.12);
+  R.twv = 6;
+  if (cat.sup.t === 'swing') { swingRelease(); return; }
+  const under = R.mode === 'hanging' && R.len > 150 && ((cat.sup.t === 'floor' && Math.abs(cat.x - R.x) < 150) || (cat.sup.t === 'step' && cat.sup.i <= 1));
+  if (under && catFree()) { startSwing(); return; }
+  if (R.mode === 'bridge' || R.mode === 'tieing') {
+    if (cat.sup.t === 'bridge' && catFree()) {
+      setAct(aPose('arab', 1.0, (t, dt) => { cat.spin += dt * 12.5; }, false));
+      cat.queue = [aCall(() => { cat.spin = 0; success('bspin', cat.x, cat.y - 60, 1); }), aBridgeWalk(1), aCall(() => { const s2 = { t: 'step', i: R.tie }; setAct(aHop(s2, { ph: 22, land: () => success('d2b', cat.x, cat.y - 50, 3) }), true); })];
+      ropeKick(0, -3);
+    } else if (cat.sup.t !== 'bridge' && !(cat.act && cat.act.kind === 'jump' && cat.act.o.sup && cat.act.o.sup.t === 'bridge')) untieBridge();
+    return;
+  }
+  if (R.mode === 'tiedProp') { R.mode = 'lower'; R.tieT = 0; R.lenT = FLOOR - 132 - props[R.prop].r * 2 + 6; props[R.prop].spin += 5; return; }
+  if ((R.mode === 'rolled' || R.mode === 'hanging') && G.t - G.lastRollT < 14 && G.rollProp >= 0 && !props[G.rollProp].tied) {
+    seekProp(G.rollProp); return;
+  }
+  if (R.mode === 'rolled') { unroll(); return; }
+  if (R.mode === 'hanging') {
+    R.lenT = Math.min(300, R.lenT + 35); ropeKick(rand(-4, 4), 0);
+    cat.lookAt = ropeEnd(); cat.lookT = 1;
+    if (cat.sup.t === 'floor' && catFree()) { setAct(aWalk(clamp(R.x + (cat.x < R.x ? -8 : 8), 70, 380), 140)); cat.queue = [aPose('reach', 1.3)]; }
+    return;
+  }
+}
+function unroll() {
+  R.mode = 'hanging'; R.len = 12; R.lenT = 250;
+  ropeReset(R.x, 132, R.x + 2, 144);
+  ropeKick(rand(-2, 2), -2);
+  SND.whoosh();
+  cat.lookAt = { x: R.x, y: 300 }; cat.lookT = 1.2;
+}
+function seekProp(i) {
+  if (R.mode === 'rolled') { ropeReset(R.x, 132, R.x, 146); R.len = 14; }
+  R.mode = 'seek'; R.prop = i; R.tieT = 0;
+  R.tx = clamp(props[i].x, 66, 394);
+  SND.whoosh();
+}
+
+/* ============================================================
+   舞踏会の入力
+   ============================================================ */
+function drumBall() {
+  SND.drum(2);
+  B.om = Math.min(3.3, B.om + 1.0); B.bv += 150;
+  confetti(300, discY(), 8, 200, true);
+  if (B.om > 2.2) success('whirl', 300, discY() - 90, 2);
+  if (cat.sup.t === 'disc' && catFree()) {
+    const sup = { t: 'disc' };
+    setAct(aJump({ to: () => ({ x: 300, y: discY() }), sup, ph: 110 + B.om * 30, dur: 0.78, pose: STYLE_AIR[G.style], spins: 1 + Math.round(B.om), crouch: 0.05 }));
+  } else if (cat.sup.t === 'rstair' && catFree()) {
+    const sup = { t: 'rstair', k: cat.sup.k };
+    setAct(aJump({ to: () => supPos(sup), sup, ph: 34, dur: 0.45, pose: 'star', spins: 1, crouch: 0.04 }));
+  }
+  let n = 0;
+  for (const m of mice) if (m.st === 'disc' && !m.jump && !m.hop) {
+    const q = m.quirk, d = (q === 'bouncy' ? 0.04 : q === 'shy' ? 0.3 : 0.16) + n * 0.07;
+    m.jump = { t: -d, h: (q === 'bouncy' ? 95 : q === 'shy' ? 50 : 75), dur: 0.5, spin: q === 'spinny' ? 2 : 1 }; n++;
+  }
+  if (n > 0 && B.lamp > 0.8) success('shadowhop', 300, discY() - 60, 1);
+}
+function xyloBall() {
+  SND.xylo(clamp(rTop() + 2, 0, 9), 3);
+  if (B.Lt < 0.999) {
+    B.Lt = Math.min(1, B.Lt + 2 / 12);
+    SND.clack(rTop() + 1);
+    cat.climbNow = true;
+    const s = rStepTop(clamp(Math.round(B.Lt * 12) - 1, 0, 11)); confetti(s.x, s.y, 6, 140, true);
+  } else {
+    const s = rStepTop(11); stars(s.x, s.y - 20, 10, 170);
+    if (cat.sup.t === 'rstair' && cat.sup.k >= 10) success('star', s.x, s.y - 40, 2);
+    else cat.climbNow = true;
+  }
+}
+function bellBall() {
+  SND.bell(1.25);
+  R.twv = 6;
+  if (B.lampT === 0) {
+    B.lampT = 1; G.lampAt = G.t + 1.5;
+    ropeReset(300, ropeTopY(), 300, ropeTopY() + 20); R.len = 20;
+    cat.lookAt = { x: 300, y: 200 }; cat.lookT = 2;
+    return;
+  }
+  ropeKick((Math.random() < 0.5 ? -1 : 1) * 7, 0);
+  B.orbit = 1;
+  if (cat.sup.t === 'rstair' && cat.sup.k >= 5 && catFree()) { orbitRide(); return; }
+  success('sweep', lampPos().x, lampPos().y + 30, 1);
+}
+function ropeTopY() { return Math.min(EXT.t, 0) - 30; }
+function orbitRide() {
+  const sx = cat.x, sy = cat.y;
+  setAct({
+    kind: 'orbit', intr: false,
+    init() { cat.sup = { t: 'air' }; cat.ground = 0; },
+    upd(dt) {
+      const e = lampPos(), k = sm(this.t / 0.4), a = this.t * 2.6;
+      const ox = e.x + Math.cos(a) * 74, oy = e.y + 40 + Math.sin(a) * 24;
+      cat.x = lerp(sx, ox, k); cat.y = lerp(sy, oy + 60, k);
+      cat.pose = 'hang'; cat.rot = Math.sin(a) * 0.4; cat.anchor = -76;
+      if (this.t > 3.0) {
+        cat.rot = 0; cat.anchor = -30;
+        setAct(aJump({ to: () => ({ x: 300, y: discY() }), sup: { t: 'disc' }, ph: 30, dur: 0.9, pose: 'jete', spins: 2, crouch: 0, soft: true }));
+        return false;
+      }
+      return false;
+    }
+  });
+  success('orbit', lampPos().x, lampPos().y, 3);
+}
+
+/* ============================================================
+   ねずみ
+   ============================================================ */
+function curtainMouseCurious() {
+  const m = mice.find(mm => mm.home === 'curtain' && mm.st === 'hidden' && !(mm.cool > 0));
+  if (m && G.phase === 'indoor') { m.st = 'peek'; m.t = 0; }
+}
+function startCome(m) {
+  m.st = 'come'; m.t = 0; m.hops = [];
+  if (m.home === 'door') {
+    for (let i = 4; i >= 0; i--) { const s = stepTop(i); m.hops.push({ x: s.x, y: s.y, dur: 0.3, h: 14 }); }
+    m.hops.push({ x: 335, y: FLOOR, dur: 0.34, h: 14, floor: true });
+  } else {
+    m.hops.push({ walk: true, x: 90 });
+  }
+  SND.squeak();
+}
+function slotX(m) {
+  const idx = mice.filter(mm => mm.st === 'joined').indexOf(m);
+  const offs = [-58, 56, -98, 96];
+  return offs[Math.max(0, idx) % 4];
+}
+function updMouse(m, dt) {
+  m.t += dt; m.ear += dt * (m.st === 'peek' ? 16 : 4);
+  m.happy = appr(m.happy, (m.st === 'joined' || m.st === 'disc') ? 1 : 0, 2, dt);
+  if (m.cool > 0) m.cool -= dt;
+  m.sq = appr(m.sq, 1, 9, dt);
+  let hy = 0;
+  if (m.jump) {
+    const j = m.jump; j.t += dt;
+    if (j.t > 0) {
+      const u = j.t / j.dur;
+      if (u >= 1) { m.jump = null; m.sq = 0.75; m.spin = 0; }
+      else { hy = 4 * j.h * u * (1 - u); m.spin = j.spin * TAU * u; }
+    }
+  }
+  if (m.hop) {
+    const h = m.hop; h.t += dt;
+    const u = clamp(h.t / h.dur, 0, 1);
+    m.x = lerp(h.x0, h.x1, u); m.y = lerp(h.y0, h.y1, u) - 4 * h.h * u * (1 - u);
+    if (u >= 1) { m.hop = null; m.sq = 0.8; if (h.fn) h.fn(); }
+    return;
+  }
+  switch (m.st) {
+    case 'hidden':
+      if (m.home === 'curtain') { m.x = appr(m.x, 26, 6, dt); m.y = floorY(m.x); m.face = 1; }
+      else if (m.home === 'door') { m.x = 600; m.y = stepTop(4).y; m.face = -1; }
+      if (m.repeek && m.cool <= 0) { m.repeek = false; m.st = 'peek'; m.t = 0; }
+      break;
+    case 'peek': {
+      const tx = m.home === 'curtain' ? 66 : 584;
+      m.x = appr(m.x, tx, 3, dt);
+      m.y = m.home === 'curtain' ? floorY(m.x) : stepTop(4).y;
+      m.face = m.home === 'curtain' ? 1 : -1;
+      if (m.t > (m.quirk === 'shy' ? 7 : 5)) { m.st = 'hidden'; m.cool = 5; }
+      break;
+    }
+    case 'come': {
+      if (!m.hops.length) { m.st = 'joined'; m.sup = 'floor'; m.t = 0; SND.squeak(); m.jump = { t: 0, h: 30, dur: 0.35, spin: 1 }; success('mouse', m.x, m.y - 40, 1); break; }
+      const nx = m.hops[0];
+      if (nx.walk) {
+        m.face = Math.sign(nx.x - m.x) || 1;
+        m.x = appr(m.x, nx.x, 4, dt); m.y = floorY(m.x) - hy;
+        if (Math.abs(m.x - nx.x) < 2) m.hops.shift();
+      } else {
+        m.hops.shift();
+        m.face = Math.sign(nx.x - m.x) || -1;
+        m.hop = { x0: m.x, y0: m.y, x1: nx.x, y1: nx.y, t: 0, dur: nx.dur, h: nx.h, fn: () => SND.clack(2) };
+      }
+      break;
+    }
+    case 'joined': {
+      m.sup = 'floor';
+      let tx;
+      if (cat.sup.t === 'floor' || (cat.sup.t === 'air' && cat.act && cat.act.spring)) tx = clamp(cat.x + slotX(m), 60, 385);
+      else if (cat.sup.t === 'swing') tx = clamp(R.x + slotX(m) * 1.4, 60, 385);
+      else tx = clamp(335 + slotX(m) * 0.5, 60, 385);
+      const d = tx - m.x;
+      if (Math.abs(d) > 3) { m.x += Math.sign(d) * Math.min(Math.abs(d), 85 * dt); m.face = Math.sign(d); }
+      else m.face = Math.sign(cat.x - m.x) || 1;
+      m.y = floorY(m.x) - hy;
+      break;
+    }
+    case 'disc': {
+      m.phi += B.om * dt * 0.9;
+      const R0 = 168 + m.id * 6;
+      m.x = 300 + Math.cos(m.phi) * R0; m.y = discY() + Math.sin(m.phi) * 44 - hy;
+      m.face = Math.cos(m.phi + PI / 2) > 0 ? 1 : -1;
+      break;
+    }
+    case 'skydrop': {
+      m.y += 70 * dt; m.x = 300 + Math.sin(m.t * 2) * 60;
+      m.spin += dt * 3;
+      const ty = discY() + Math.sin(m.phi) * 44;
+      if (m.y >= ty - 2) { m.st = 'disc'; m.spin = 0; m.sq = 0.7; SND.squeak(); stars(m.x, m.y - 20, 8, 120, 'pink'); }
+      break;
+    }
+  }
+  if (m.st !== 'disc' && m.st !== 'skydrop' && m.st !== 'come' && m.st !== 'peek' && m.st !== 'hidden') m.y = floorY(m.x) - hy;
+}
+
+/* ============================================================
+   こねこの自律（待つ間のしぐさ・自分で登る・招く）
+   ============================================================ */
+function standOnSup(dt) {
+  const s = cat.sup;
+  cat.ground = 1; cat.rot = appr(cat.rot, 0, 10, dt);
+  switch (s.t) {
+    case 'floor': cat.x = clamp(cat.x, 60, 390); cat.y = floorY(cat.x); break;
+    case 'step':
+      if (s.i >= ST.n || ST.grow[s.i] < 0.5) { softFall(340); return; }
+      { const p = stepTop(s.i); cat.x = appr(cat.x, p.x, 8, dt); cat.y = p.y; }
+      break;
+    case 'bridge':
+      if (R.mode !== 'bridge') { softFall(cat.x); return; }
+      { const p = bridgePt(s.u); cat.x = p.x; cat.y = p.y; }
+      break;
+    case 'roof': { const p = supPos(s); cat.x = p.x; cat.y = p.y; break; }
+    case 'disc': cat.y = discY(); if (B.om > 1.2) cat.spin += (B.om - 1.2) * dt * 2.2; break;
+    case 'rstair': {
+      if (s.k > rTop()) { setAct(aJump({ to: () => ({ x: 300, y: discY() }), sup: { t: 'disc' }, ph: 20, dur: 0.9, pose: 'fall', soft: true })); return; }
+      const p = rStepTop(s.k); cat.x = appr(cat.x, p.x, 8, dt); cat.y = p.y; break;
+    }
+    default:
+      softFall(cat.x);
+  }
+}
+function beckon(m) {
+  m.beckoned = true;
+  cat.lookAt = { x: m.x, y: m.y - 20 }; cat.lookT = 1.8;
+  cat.face = Math.sign(m.x - cat.x) || 1;
+  SND.mew();
+  setAct(aPose('beckon', 1.3));
+  cat.queue = [aCall(() => {
+    m.beck++;
+    if (m.st !== 'peek') { m.beckoned = false; return; }
+    if (m.quirk === 'shy' && m.beck < 2) { m.st = 'hidden'; m.cool = 1.0; m.repeek = true; m.beckoned = false; SND.squeak(); }
+    else startCome(m);
+  })];
+}
+function climbTarget(top) { if (top < 0) return -1; return DOOR.to ? Math.min(top, 8) : Math.min(top, 4); }
+function roofJump() {
+  return aJump({ to: () => supPos({ t: 'roof' }), sup: { t: 'roof' }, ph: 26, dur: 0.75, pose: 'jete', spins: 1, crouch: 0.08, land: onRoof });
+}
+function climbTail(tg) { return (tg === 8 && ST.n === STEP_MAX && G.t >= G.roofCool) ? [roofJump()] : []; }
+function onRoof() {
+  if (majorCount() >= 5 && Object.keys(G.found).length >= 10) startTransform();
+  else roofPeek();
+}
+function roofPeek() {
+  ROOF.pv += 5; SND.bell(1.5); stars(300, 50, 12, 160); G.roofCool = G.t + 14;
+  const tg = recommend(), I = INST[tg] || INST.drum;
+  seq([aPose('look', 1.2, () => { cat.lookAt = { x: I.x, y: I.y }; cat.lookT = 0.3; }), aCall(() => softFall(250))]);
+}
+function rClimbPlan(target) {
+  const list = [];
+  let cur = cat.sup.t === 'rstair' ? cat.sup.k : -1;
+  while (cur < target) {
+    cur++;
+    const sup = { t: 'rstair', k: cur };
+    list.push(aJump({ to: () => supPos(sup), sup, ph: cur === 0 ? 40 : 18, dur: cur === 0 ? 0.55 : 0.3, pose: 'releve', keepPose: true, crouch: 0.04, soft: true, land: () => SND.clack(sup.k % 8) }));
+  }
+  return list;
+}
+function think(dt) {
+  cat.idleT += dt;
+  const it = cat.idleT, idleIn = G.t - G.lastInputT;
+  if (G.phase === 'toBall' || G.finale || G.curtain.dir !== 0) return;
+  const pm = mice.find(m => m.st === 'peek' && m.t > 0.7 && !m.beckoned);
+  if (pm && ['floor', 'step', 'disc'].includes(cat.sup.t)) { beckon(pm); return; }
+  const s = cat.sup;
+  if (G.phase === 'ball') {
+    if (s.t === 'disc') {
+      cat.x = appr(cat.x, 300, 2, dt);
+      const top = rTop();
+      if (top >= 1 && (cat.climbNow || (it > 4 && G.catPref > 0.3))) { cat.climbNow = false; seq(rClimbPlan(top)); return; }
+    } else if (s.t === 'rstair') {
+      const top = rTop();
+      if (top > s.k && it > 0.3) { seq(rClimbPlan(top)); return; }
+      if (it > 10 && idleIn > 8) { setAct(aJump({ to: () => ({ x: 300, y: discY() }), sup: { t: 'disc' }, ph: 30, dur: 0.95, pose: 'tuck', flip: 1, soft: true })); return; }
+    }
+    idleAnim(it, idleIn);
+    return;
+  }
+  if (s.t === 'floor') {
+    if (R.mode === 'hanging' && it > 0.7 && Math.abs(cat.x - R.x) > 30) {
+      setAct(aWalk(clamp(R.x + (cat.x < R.x ? -8 : 8), 70, 380))); cat.queue = [aPose('reach', 1.2)]; return;
+    }
+    if (R.mode === 'tiedProp' && !G.found.propbat && it > 1 && R.prop >= 0) {
+      const p = props[R.prop];
+      if (Math.abs(cat.x - p.x) > 36) { setAct(aWalk(clamp(p.x - 10, 70, 380))); cat.queue = [aPose('reach', 1.2)]; return; }
+    }
+    const top = topBuilt();
+    const mj = mice.some(m => m.st === 'joined');
+    const hold = (R.mode === 'hanging' && it < 14) || (R.mode === 'bridge' && !G.found.d2b && it < 12) ||
+      (mj && !G.found.d5b && it < 10) || (R.mode === 'tiedProp' && !G.found.propbat && it < 12) ||
+      R.mode === 'tieing' || R.mode === 'seek' || R.mode === 'reach' || R.mode === 'lower';
+    const delay = cat.climbNow ? 0.6 : (2.0 + G.catPref * 1.2);
+    if (!hold && top >= 2 && it > delay) {
+      const tg = climbTarget(top);
+      if (tg >= 0) { cat.climbNow = false; seq(climbPlan(tg).concat(climbTail(tg))); return; }
+    }
+  } else if (s.t === 'step') {
+    const top = topBuilt(), tg = climbTarget(top);
+    const mjf = mice.some(m => m.st === 'joined' && m.sup === 'floor');
+    if (mjf && !G.found.d5b && it > 1.6 && !mice.some(m => m.st === 'come')) { goDown(); return; }
+    if (R.mode === 'hanging' && !G.found.d4 && it > 1.5) { goDown(); return; }
+    if (R.mode === 'tiedProp' && !G.found.propbat && it > 2) { goDown(); return; }
+    if (R.mode === 'bridge' && !G.found.d2b && it > 2.5 && s.i !== R.tie) { goDown(); return; }
+    if (tg > s.i && it > (cat.climbNow ? 0.4 : 1.0)) { cat.climbNow = false; seq(climbPlan(tg).concat(climbTail(tg))); return; }
+    if (s.i === 8 && ST.n === STEP_MAX && G.t >= G.roofCool && it > 1.2) { setAct(roofJump()); return; }
+    if (it > 12 && idleIn > 8) { goDown(); return; }
+  } else if (s.t === 'bridge') {
+    if (it > 0.5) { setAct(aBridgeWalk(1)); cat.queue = [aCall(() => setAct(aHop({ t: 'step', i: R.tie }), true))]; return; }
+  }
+  idleAnim(it, idleIn);
+}
+function idleAnim(it, idleIn) {
+  if (it < cat.nextIdle) return;
+  cat.nextIdle = it + rand(2.2, 4.2);
+  if (cat.sup.t === 'bridge' || cat.sup.t === 'roof') return;
+  if (idleIn > 10 && G.anyTap) {
+    const tg = G.hint.target, I = tg === 'mbox' ? MBOX : INST[tg];
+    if (I) {
+      cat.face = Math.sign(I.x - cat.x) || 1; cat.lookAt = { x: I.x, y: I.y }; cat.lookT = 2.4;
+      setAct(aPose(Math.random() < 0.6 ? 'point' : 'releve', 1.4));
+      return;
+    }
+  }
+  const r = Math.random();
+  if (r < 0.3) setAct(aPose('releve', 1.2));
+  else if (r < 0.52) setAct(aPose('arab', 1.1));
+  else if (r < 0.8) { const a = aPose('releve', 0.9, (t, dt) => { cat.spin += dt * 7; }); a.spinning = true; setAct(a); cat.queue = [aCall(() => { cat.spin = 0; })]; }
+  else setAct(aPose('look', 1.0));
+}
+function catUpdate(dt) {
+  if (cat.act) {
+    const a = cat.act;
+    a.t += dt;
+    const done = a.upd(dt);
+    if (done && cat.act === a) {
+      cat.act = null;
+      if (cat.queue.length) setAct(cat.queue.shift(), true);
+    }
+    cat.idleT = 0;
+    if (cat.act && cat.act.kind === 'pose' && cat.act.intr) {
+      const s = cat.sup;
+      if (s.t === 'floor') cat.y = floorY(cat.x);
+      else if (s.t === 'step' && s.i < ST.n) cat.y = stepTop(s.i).y;
+      else if (s.t === 'disc') cat.y = discY();
+      else if (s.t === 'rstair') cat.y = rStepTop(s.k).y;
+      else if (s.t === 'bridge' && R.mode === 'bridge') cat.y = bridgePt(s.u).y;
+    }
+    if (cat.act && cat.act.kind === 'walk') cat.y = floorY(cat.x);
+  } else {
+    if (cat.pose !== 'stand' && cat.pose !== 'look') cat.pose = 'stand';
+    standOnSup(dt);
+    if (!cat.act) think(dt);
+  }
+  // ポーズの合成
+  const tp = POSES[cat.pose] || POSES.stand;
+  for (const k of PK) cat.p[k] = appr(cat.p[k], tp[k], 14, dt);
+  if (cat.pose === 'walk') {
+    const w = Math.sin(cat.walkPh) * 0.32;
+    cat.p.lh1 = 0.12 + w; cat.p.rh1 = 0.12 - w; cat.p.rise = Math.abs(Math.sin(cat.walkPh)) * 2;
+  }
+  if (cat.pose === 'balance') { const w = Math.sin(cat.walkPh) * 0.18; cat.p.lh1 = 0.08 + w; cat.p.rh1 = 0.08 - w; cat.p.la1 = 1.55 + w; cat.p.ra1 = 1.55 - w; }
+  if (!cat.act || (cat.act.kind !== 'jump' && cat.act.kind !== 'bwalk' && !cat.act.spinning)) cat.spin = appr(cat.spin, Math.round(cat.spin / TAU) * TAU, 9, dt);
+  cat.wave = cat.pose === 'beckon' ? Math.sin(G.t * 10) * 0.7 : appr(cat.wave, 0, 8, dt);
+  if (!(cat.act && cat.act.kind === 'jump' && cat.act.t < cat.act.cr)) {
+    cat.sqv += (-(cat.sq - 1) * 320 - 15 * cat.sqv) * dt; cat.sq += cat.sqv * dt;
+  }
+  cat.blinkT -= dt;
+  if (cat.blinkT <= 0) { cat.blink = 0.14; cat.blinkT = rand(1.8, 4.5); }
+  cat.blink -= dt;
+  cat.mood = appr(cat.mood, 0, 0.5, dt);
+  if (cat.mood > 0.4 && cat.pose === 'stand') cat.p.happy = Math.max(cat.p.happy, cat.mood);
+  // 視線
+  cat.lookT -= dt;
+  let tg = null;
+  if (G.t - G.finger.t < 1.3) tg = G.finger;
+  else if (cat.lookAt && cat.lookT > 0) tg = cat.lookAt;
+  else {
+    const pm = mice.find(m => m.st === 'peek' || m.st === 'come');
+    if (pm) tg = { x: pm.x, y: pm.y - 15 };
+    else if (R.mode === 'hanging' && G.phase === 'indoor') tg = ropeEnd();
+    else if (R.mode === 'tiedProp' && R.prop >= 0) tg = props[R.prop];
+    else if (!G.anyTap || G.t - G.lastInputT > 10) { const t2 = G.hint.target, I = t2 === 'mbox' ? MBOX : INST[t2]; if (I) tg = I; }
+    else if (G.mb.ready > 0) tg = MBOX;
+    else if (G.phase === 'ball' && B.lamp > 0.5) tg = lampPos();
+  }
+  let lx = 0, ly = 0.2;
+  if (tg) {
+    const hx = cat.headX != null ? cat.headX : cat.x, hy = cat.headY != null ? cat.headY : cat.y - 80;
+    const dx = tg.x - hx, dy = tg.y - hy, d = Math.hypot(dx, dy) || 1;
+    lx = dx / d; ly = dy / d;
+  }
+  cat.lx = appr(cat.lx, lx, 7, dt); cat.ly = appr(cat.ly, ly, 7, dt);
+}
+
+/* ============================================================
+   リボンの更新
+   ============================================================ */
+function lampLen() { return 238 - ropeTopY(); }
+function updRibbon(dt) {
+  R.twv = R.twv || 0; R.twirl += R.twv * dt; R.twv *= Math.exp(-1.4 * dt);
+  ropeWind = 40; ropeMid = null; ropeEndW = 1.6;
+  switch (R.mode) {
+    case 'rolled': R.coil = appr(R.coil, 1, 4, dt); return;
+    case 'hanging': ropeA = { x: R.x, y: 132 }; ropeB = null; R.len = appr(R.len, R.lenT, 3.2, dt); R.coil = appr(R.coil, 0.35, 3, dt); break;
+    case 'seek': {
+      const p = props[R.prop]; R.tx = clamp(p.x, 66, 394);
+      const d = R.tx - R.x; R.x += Math.sign(d) * Math.min(Math.abs(d), 300 * dt);
+      ropeA = { x: R.x, y: 132 }; ropeB = null; R.len = appr(R.len, 16, 4, dt);
+      if (Math.abs(d) < 2) { R.mode = 'reach'; R.tieT = 0; }
+      break;
+    }
+    case 'reach': {
+      const p = props[R.prop]; R.tx = clamp(p.x, 66, 394); R.x = appr(R.x, R.tx, 4, dt);
+      ropeA = { x: R.x, y: 132 }; ropeB = null;
+      const tl = Math.max(40, propY(p) - p.r - 132 + 2);
+      R.len = appr(R.len, tl, 5, dt); R.tieT += dt;
+      const e = ropeEnd();
+      if (Math.hypot(e.x - p.x, e.y - (propY(p) - p.r)) < 14 || R.tieT > 1.2) {
+        p.tied = true; p.vx = 0; R.mode = 'tiedProp'; R.lenT = 228; ropeEndW = 4;
+        success('d3b', p.x, propY(p) - 30, 2); SND.bell(1.8);
+      }
+      R.coil = appr(R.coil, 0.35, 3, dt);
+      break;
+    }
+    case 'tiedProp': ropeA = { x: R.x, y: 132 }; ropeB = null; ropeEndW = 4; R.len = appr(R.len, R.lenT, 2.2, dt); break;
+    case 'lower': {
+      const p = props[R.prop];
+      ropeA = { x: R.x, y: 132 }; ropeEndW = 4; R.len = appr(R.len, R.lenT, 2.4, dt); R.tieT += dt;
+      if (ropeEnd().y + p.r * 2 >= FLOOR - 4 || R.tieT > 2.2) {
+        p.tied = false; p.x = clamp(ropeEnd().x, 40 + p.r, 560 - p.r); p.vx = 0; p.hop = 0; p.hv = 0;
+        R.mode = 'hanging'; R.lenT = 250; R.prop = -1; SND.tiny();
+      }
+      break;
+    }
+    case 'tieing': {
+      R.tieT += dt;
+      const k = sm(R.tieT / 0.7), e = bridgeEnds();
+      ropeA = { x: lerp(R.from.ax, e.ax, k), y: lerp(R.from.ay, e.ay, k) };
+      ropeB = { x: lerp(R.from.bx, e.bx, k), y: lerp(R.from.by, e.by, k) };
+      const dd = Math.hypot(e.bx - e.ax, e.by - e.ay) * 1.015;
+      R.len = lerp(R.len, dd, 0.08 + k * 0.3); R.coil = appr(R.coil, 0.15, 3, dt);
+      if (k >= 1) {
+        R.mode = 'bridge'; R.len = dd;
+        stars(e.bx, e.by, 8, 140); stars(e.ax, e.ay, 6, 120);
+        success('d2', (e.ax + e.bx) / 2, (e.ay + e.by) / 2, 2);
+      }
+      break;
+    }
+    case 'bridge': {
+      const e = bridgeEnds();
+      ropeA = { x: e.ax, y: e.ay }; ropeB = { x: e.bx, y: e.by };
+      R.len = Math.hypot(e.bx - e.ax, e.by - e.ay) * 1.015;
+      if (cat.sup.t === 'bridge') { const i = clamp(Math.round(cat.sup.u * (RN - 1)), 1, RN - 2); ropeMid = { i, x: cat.x, y: cat.y }; }
+      break;
+    }
+    case 'untie': {
+      R.tieT += dt;
+      const k = sm(R.tieT / 0.5);
+      ropeA = { x: lerp(R.peg.x, R.x, k), y: lerp(R.peg.y, 132, k) }; ropeB = null;
+      R.len = appr(R.len, 250, 3, dt);
+      if (k >= 1) { R.mode = 'hanging'; R.lenT = 250; }
+      break;
+    }
+    case 'swing': ropeA = { x: R.x, y: 132 }; R.len = cat.sw ? cat.sw.L : 300; break;
+    case 'ball': {
+      ropeA = { x: 300 + Math.sin(G.t * 0.4) * 8, y: ropeTopY() }; ropeB = null; ropeEndW = 7; ropeWind = 10;
+      B.lamp = appr(B.lamp, B.lampT, 1.3, dt);
+      R.len = lerp(10, lampLen(), B.lamp);
+      break;
+    }
+    default: return;
+  }
+  ropeLen = R.len;
+  const n = Math.max(1, Math.ceil(dt * 120)), h = dt / n;
+  for (let k = 0; k < n; k++) ropeStep(h);
+}
+function updProps(dt) {
+  for (const p of props) {
+    p.wig = appr(p.wig, 0, 5, dt);
+    if (p.tied) {
+      const e = ropeEnd(); p.x = e.x; p.y = e.y + p.r;
+      p.spin *= Math.exp(-1.2 * dt); p.rot = appr(p.rot, 0, 2, dt);
+      continue;
+    }
+    p.x += p.vx * dt;
+    if (p.x < 40 + p.r) { p.x = 40 + p.r; p.vx = Math.abs(p.vx) * 0.5; }
+    if (p.x > 560 - p.r) { p.x = 560 - p.r; p.vx = -Math.abs(p.vx) * 0.5; }
+    p.vx *= Math.exp(-0.9 * dt);
+    p.rot += p.vx / p.r * dt;
+    p.hv -= 900 * dt; p.hop += p.hv * dt;
+    if (p.hop < 0) { p.hop = 0; p.hv = p.hv < -90 ? -p.hv * 0.35 : 0; }
+    p.spin *= Math.exp(-2 * dt);
+  }
+}
+
+/* ============================================================
+   舞踏会・大変身・フィナーレ
+   ============================================================ */
+function updBall(dt) {
+  if (G.phase !== 'ball' && G.phase !== 'toBall') return;
+  B.ang += B.om * dt; B.om = appr(B.om, 0.35, 0.28, dt);
+  B.bv += (-260 * B.bounce - 9 * B.bv) * dt; B.bounce += B.bv * dt;
+  B.L = appr(B.L, B.Lt, 3, dt);
+  for (let k = 0; k < 12; k++) {
+    const on = (k + 1) / 12 <= B.Lt + 1e-3;
+    B.grow[k] = on ? Math.min(1, B.grow[k] + dt * 2.6) : Math.max(0, B.grow[k] - dt * 3);
+  }
+  B.orbit = appr(B.orbit, 0, 0.7, dt);
+  if (G.lampAt && G.t >= G.lampAt) { G.lampAt = 0; const e = lampPos(); success('d6', e.x, e.y + 40, 3); }
+  if (G.phase === 'ball' && B.lamp > 0.9 && cat.sup.t === 'rstair' && cat.sup.k >= 3 && B.shadowK > 2.2 && !G.found.d6b) success('d6b', cat.x, cat.y - 50, 3);
+}
+function rTop() { let t = -1; for (let k = 0; k < 12; k++) if (B.grow[k] > 0.97) t = k; return t; }
+function startTransform() {
+  G.phase = 'toBall'; G.tt = 0; G.tf = {};
+  SND.magic();
+  success('roof', 300, 40, 3);
+  if (Math.random() < 0.3) G.audienceT = G.t;
+}
+function updTransform(dt) {
+  if (G.phase !== 'toBall') return;
+  const tt = (G.tt += dt), f = G.tf;
+  ROOF.o = eob(clamp(tt / 1.6, 0, 1)); G.trans = sm((tt - 0.5) / 1.7);
+  if (tt > 0.2 && !f.a) { f.a = 1; stars(300, 40, 20, 260); confetti(300, 60, 30, 300, true); }
+  if (tt > 0.9 && !f.b) {
+    f.b = 1;
+    setAct(aJump({ to: () => ({ x: 300, y: discY() }), sup: { t: 'disc' }, ph: 50, dur: 1.3, pose: 'jete', spins: 2, crouch: 0.1, soft: true, land: () => stars(300, discY() - 30, 14, 200) }));
+  }
+  if (tt > 1.2 && !f.c) {
+    f.c = 1;
+    mice.forEach((m, i) => {
+      if (m.home === 'door' && m.st === 'hidden') { m.x = 590; m.y = stepTop(4).y; }
+      if (m.home === 'curtain' && m.st === 'hidden') { m.x = 60; }
+      m.st = 'disc'; m.phi = i * 2.4 + 0.5; m.jump = null;
+      const R0 = 168 + m.id * 6, tx = 300 + Math.cos(m.phi) * R0, ty = DISC.y + Math.sin(m.phi) * 44;
+      m.hop = { x0: m.x, y0: m.y, x1: tx, y1: ty, t: 0, dur: 0.9, h: 90 };
+    });
+    SND.squeak();
+  }
+  if (tt > 2.0 && !f.d) {
+    f.d = 1;
+    if (!mice.some(m => m.home === 'sky')) {
+      const m = makeMouse(2, 'sky', pick(['shy', 'bouncy', 'spinny']), 'pink');
+      m.st = 'skydrop'; m.y = Math.min(EXT.t, 0) - 20; m.phi = 4.4; mice.push(m);
+    }
+  }
+  if (tt > 2.7 && !f.e) {
+    f.e = 1; G.phase = 'ball'; R.mode = 'ball'; B.Lt = 2 / 12; ROOF.o = 1; G.trans = 1; G.lastInputT = G.t; G.rec = null;
+    for (const p of props) p.tied = false;
+  }
+}
+function startFinale() {
+  G.finale = { t: 0, f: {} }; SND.fanfare();
+  if (G.rec) G.rec.ended = true;
+  if (Math.random() < 0.3 || G.cycle >= 2) G.audienceT = G.t;
+  if (cat.sup.t !== 'disc') setAct(aJump({ to: () => ({ x: 300, y: discY() }), sup: { t: 'disc' }, ph: 40, dur: 0.9, pose: 'jete', spins: 1, soft: true }));
+}
+function updFinale(dt) {
+  const f = G.finale; if (!f) return;
+  f.t += dt;
+  for (const [k, tm] of [['j1', 1.0], ['j2', 1.8], ['j3', 2.6]]) {
+    if (f.t > tm && !f.f[k]) {
+      f.f[k] = 1;
+      if (catStanding() && cat.sup.t === 'disc') setAct(aJump({ to: () => ({ x: 300, y: discY() }), sup: { t: 'disc' }, ph: 100, dur: 0.7, pose: pick(STYLE_AIR), spins: 2 }));
+      let n = 0;
+      for (const m of mice) if (m.st === 'disc' && !m.jump) { m.jump = { t: -0.12 * n, h: 70, dur: 0.5, spin: 1 }; n++; }
+      confetti(300, 160, 26, 300, false); stars(rand(150, 450), rand(150, 300), 8, 160);
+      B.om = Math.min(3, B.om + 0.6);
+    }
+  }
+  if (f.t > 3.4 && !f.f.bow) { f.f.bow = 1; if (catStanding()) setAct(aPose('bow', 1.6)); SND.success(true); }
+  if (f.t > 5.2 && !f.f.close) { f.f.close = 1; closeCurtain(() => newCycle(false)); }
+}
+function drawAudience() {
+  const k = G.t - G.audienceT;
+  if (k > 7) { G.audienceT = -1; return; }
+  const up = sm(k / 0.5) * (k > 6 ? 7 - k : 1);
+  const n = 12;
+  for (let i = 0; i < n; i++) {
+    const x = lerp(EXT.l + 30, EXT.r - 30, i / (n - 1)), y = 676 - up * 26 - Math.abs(Math.sin(G.t * 6 + i)) * 8 * up;
+    F('navy', () => { pc(x, y, 10); pc(x - 8, y - 9, 5.5); pc(x + 8, y - 9, 5.5); pe(x, y + 18, 11, 12); }, 0.8);
+    F('pink', () => { pc(x - 8, y - 9, 3); pc(x + 8, y - 9, 3); }, 0.8);
+    Ln(() => { const a = Math.sin(G.t * 8 + i) * 0.6; X.moveTo(x - 8, y + 12); X.lineTo(x - 18, y + 2 - a * 8); X.moveTo(x + 8, y + 12); X.lineTo(x + 18, y + 2 + a * 8); }, 3, 'navy', 0.8 * up);
+  }
+}
+
+/* ============================================================
+   幕・記憶・アンコール
+   ============================================================ */
+function closeCurtain(cb) { G.curtain.dir = 1; G.curtain.cb = cb; G.curtain.hold = 0; SND.whoosh(); }
+function updCurtain(dt) {
+  const c = G.curtain;
+  if (c.dir === 1) {
+    c.v = Math.min(1, c.v + dt / 0.5);
+    if (c.v >= 1) { if (c.cb) { const f = c.cb; c.cb = null; f(); } c.hold += dt; if (c.hold > 0.3) c.dir = -1; }
+  } else if (c.dir === -1) {
+    c.v = Math.max(0, c.v - dt / 0.6);
+    if (c.v <= 0) c.dir = 0;
+  }
+}
+function snapshot() {
+  const map = { drop: 'hanging', seek: 'rolled', reach: 'rolled', tieing: 'bridge', untie: 'hanging', lower: 'tiedProp', swing: 'hanging' };
+  const rm = map[R.mode] || R.mode;
+  const cs = cat.sup.t;
+  let csup;
+  if (cs === 'step' || cs === 'bridge' || cs === 'rstair' || cs === 'disc') csup = Object.assign({}, cat.sup);
+  else if (cs === 'roof') csup = { t: 'step', i: Math.min(8, ST.n - 1) };
+  else csup = { t: G.phase === 'ball' ? 'disc' : 'floor' };
+  if (csup.t === 'bridge' && rm !== 'bridge') csup = { t: 'floor' };
+  if (csup.t === 'step' && csup.i >= ST.n) csup = { t: 'floor' };
+  return JSON.parse(JSON.stringify({
+    phase: G.phase, n: ST.n, door: DOOR.to,
+    R: { mode: rm, x: R.x, lenT: rm === 'hanging' ? Math.max(220, R.lenT) : R.lenT, tie: rm === 'bridge' ? (R.tie >= 0 ? R.tie : ST.n - 1) : -1, peg: R.peg, prop: R.prop },
+    props: props.map(p => ({ x: p.x, tied: p.tied && rm === 'tiedProp' })),
+    mice: mice.map(m => ({ id: m.id, home: m.home, st: m.st === 'come' ? 'joined' : (m.st === 'peek' ? 'hidden' : (m.st === 'skydrop' ? 'disc' : m.st)), quirk: m.quirk, col: m.col, x: m.x, phi: m.phi })),
+    cat: { sup: csup, x: clamp(cat.x, 70, 380) },
+    ball: { Lt: B.Lt, lampT: B.lampT, om: B.om }
+  }));
+}
+function restore(s) {
+  G.phase = s.phase; G.trans = s.phase === 'ball' ? 1 : 0;
+  ROOF.o = ROOF.to = s.phase === 'ball' ? 1 : 0; ROOF.peek = 0; ROOF.pv = 0;
+  ST.n = s.n; for (let i = 0; i < STEP_MAX; i++) { ST.grow[i] = i < s.n ? 1 : 0; ST.jig[i] = 0; ST.jv[i] = 0; }
+  ST.bounce = 0; ST.bv = 0; ST.ghost = 0; ST.gv = 0;
+  DOOR.to = s.door; DOOR.o = s.door;
+  SP.A = 0; SP.V = 0; SP.charge = 0; SP.pending = 0;
+  props.forEach((p, i) => { const q = s.props[i]; if (!q) return; p.x = q.x; p.tied = q.tied; p.vx = 0; p.hv = 0; p.hop = 0; p.spin = 0; p.rot = 0; });
+  R.mode = s.R.mode; R.x = R.tx = s.R.x; R.lenT = s.R.lenT; R.tie = s.R.tie; R.peg = { x: s.R.peg.x, y: s.R.peg.y }; R.prop = s.R.prop;
+  ropeB = null; ropeMid = null;
+  B.Lt = s.ball.Lt; B.L = s.ball.Lt; B.om = s.ball.om; B.bounce = 0; B.bv = 0; B.lampT = s.ball.lampT; B.lamp = s.ball.lampT;
+  for (let k = 0; k < 12; k++) B.grow[k] = (k + 1) / 12 <= B.Lt + 1e-3 ? 1 : 0;
+  if (R.mode === 'hanging') { R.len = R.lenT; ropeReset(R.x, 132, R.x, 132 + R.len); }
+  else if (R.mode === 'bridge') { const e = bridgeEnds(); ropeReset(e.ax, e.ay, e.bx, e.by); R.len = Math.hypot(e.bx - e.ax, e.by - e.ay) * 1.015; }
+  else if (R.mode === 'tiedProp') { R.len = R.lenT; ropeReset(R.x, 132, R.x, 132 + R.len); }
+  else if (R.mode === 'ball') { R.len = B.lamp ? lampLen() : 10; ropeReset(300, ropeTopY(), 300, ropeTopY() + R.len); }
+  else R.len = 0;
+  R.coil = R.mode === 'rolled' ? 1 : 0.3;
+  mice.length = 0;
+  for (const q of s.mice) {
+    const m = makeMouse(q.id, q.home, q.quirk, q.col);
+    m.st = q.st; m.phi = q.phi;
+    if (q.st === 'joined') { m.x = q.x; m.sup = 'floor'; m.y = floorY(m.x); }
+    mice.push(m);
+  }
+  cat.act = null; cat.queue.length = 0; cat.sw = null;
+  cat.sup = Object.assign({}, s.cat.sup); cat.x = s.cat.x;
+  if (cat.sup.t === 'disc') cat.x = 300;
+  const p = supPos(cat.sup); cat.x = p.x; cat.y = p.y;
+  cat.spin = 0; cat.rot = 0; cat.ground = 1; cat.idleT = 0; cat.anchor = -30;
+  G.finale = null; G.lastRollT = -99; G.roofCool = G.t + 6; G.lampAt = 0;
+}
+function recTap(k) {
+  const now = G.t;
+  let r = G.rec;
+  if (!r || r.ended || now - r.lastT > 4.5 || r.phase !== G.phase || r.taps.length >= 12) {
+    G.style = (Math.random() * 4) | 0;
+    r = G.rec = { snap: snapshot(), taps: [], t0: now, lastT: now, score: 0, phase: G.phase, style: G.style, ended: false };
+  }
+  r.taps.push({ i: k, dt: +(now - r.t0).toFixed(3) }); r.lastT = now;
+}
+function catRestful() { return (!cat.act || (cat.act.kind === 'pose' && cat.act.intr)) && ['floor', 'step', 'disc', 'rstair', 'bridge'].includes(cat.sup.t); }
+function updAct() {
+  const r = G.rec;
+  if (!r || r.ended || G.replay || r.score <= 0) return;
+  if (G.t - G.lastInputT < 3.2 || !catRestful()) return;
+  if ((G.phase !== 'indoor' && G.phase !== 'ball') || G.curtain.dir !== 0 || G.finale) return;
+  if (cat.sup.t === 'bridge') return;
+  r.ended = true;
+  const ph = G.phase, fav = G.fav[ph];
+  if (!fav || r.score >= 2 || r.score >= fav.score * 0.5) G.fav[ph] = { snap: r.snap, taps: r.taps.slice(), style: r.style, score: r.score };
+  setAct(aPose('bow', 1.3));
+  cat.queue = [aCall(() => { G.mb.ready = 1; G.mb.readyT = G.t; cat.lookAt = { x: MBOX.x, y: MBOX.y }; cat.lookT = 3.5; SND.mbox([7, 9, 11]); })];
+}
+function startEncore() {
+  const ph = G.phase === 'ball' ? 'ball' : 'indoor', fav = G.fav[ph];
+  G.lastInputT = G.t;
+  if (!fav || G.curtain.dir !== 0 || G.finale || (G.phase !== 'indoor' && G.phase !== 'ball')) { G.mb.wig = 1; SND.tiny(); return; }
+  G.mb.ready = 0; G.mb.play = 1; SND.mbox([4, 7, 9, 7, 11, 9]); G.rec = null;
+  for (let k = 0; k < 5; k++) note(MBOX.x + rand(-10, 10), MBOX.y - 20, 'gold');
+  closeCurtain(() => { restore(fav.snap); G.style = fav.style; G.replay = { taps: fav.taps, i: 0, t0: G.t + 0.95, done: 0 }; });
+}
+function updReplay() {
+  const r = G.replay;
+  if (!r || G.curtain.dir === 1) return;
+  while (r.i < r.taps.length && G.t - r.t0 >= r.taps[r.i].dt) {
+    const tp = r.taps[r.i++], I = INST[tp.i];
+    for (let k = 0; k < 3; k++) note(lerp(MBOX.x, I.x, k / 3), lerp(MBOX.y - 20, I.y - 60, k / 3), 'gold');
+    play(tp.i, true);
+  }
+  if (r.i >= r.taps.length) {
+    if (!r.done) r.done = G.t;
+    if (G.t - r.done > 2.5 && catRestful() && cat.sup.t !== 'bridge') {
+      G.replay = null; G.mb.play = 0;
+      setAct(aPose('bow', 1.4));
+      cat.queue = [aCall(() => { G.mb.ready = 1; G.mb.readyT = G.t; cat.lookAt = { x: MBOX.x, y: MBOX.y }; cat.lookT = 3; })];
+      stars(cat.x, cat.y - 60, 10, 160); SND.success(false);
+    }
+  }
+}
+
+/* ============================================================
+   言葉のない誘導（次に触るものはいつも一つ）
+   ============================================================ */
+function recommend() {
+  const base = recommendBase();
+  if ((G.hintMiss || 0) < 3) return base;
+  const alt = ['xylo', 'bell', 'drum'].filter(k => k !== base);
+  return alt[((G.hintMiss - 3) >> 1) % 2];
+}
+function recommendBase() {
+  const f = G.found;
+  if (G.phase === 'ball') {
+    if (!B.lampT) return 'bell';
+    if (!f.d6b) return 'xylo';
+    if (!f.whirl) return 'drum';
+    if (!f.orbit) return (cat.sup.t === 'rstair' && cat.sup.k >= 5) ? 'bell' : 'xylo';
+    return ['drum', 'xylo', 'bell'][((G.t / 8) | 0) % 3];
+  }
+  if (!G.anyTap) return 'drum';
+  if (cat.sup.t === 'swing') return f.d4b ? (ST.n >= 2 ? 'xylo' : 'bell') : 'drum';
+  if (R.mode === 'bridge') return f.d2b ? 'bell' : 'drum';
+  if (R.mode === 'tiedProp') return f.propbat ? 'bell' : 'drum';
+  const under = R.mode === 'hanging' && cat.sup.t === 'floor' && Math.abs(cat.x - R.x) < 150;
+  if (R.mode === 'hanging') { if (!f.d4 && under) return 'bell'; if (!f.d2) return 'xylo'; if (!f.d4) return 'bell'; }
+  if (!f.d1) return 'drum';
+  if (!f.d4 && R.mode === 'rolled') return 'bell';
+  if (G.t - G.lastRollT < 12 && !f.d3b) return 'bell';
+  if (!f.d3) return G.lastInst === 'xylo' ? 'drum' : 'xylo';
+  if (mice.some(m => m.st === 'joined') && !f.d5b) return 'drum';
+  if (ST.n < 5 || !DOOR.to) return 'xylo';
+  if (!f.d2 || !f.d4) return R.mode === 'rolled' ? 'bell' : (!f.d2 ? 'xylo' : 'bell');
+  return 'xylo';
+}
+function updHint(dt) {
+  const idle = G.t - G.lastInputT;
+  let tg = recommend();
+  if (G.mb.ready > 0 && G.t - G.mb.readyT < 9) tg = 'mbox';
+  const quiet = !!(G.replay || G.curtain.dir !== 0 || G.finale || G.phase === 'toBall');
+  const str = quiet ? 0 : (!G.anyTap ? (idle > 3 ? 1 : 0.6) : (idle > 4 ? clamp((idle - 4) / 2.5, 0.25, 1) : 0.22));
+  G.hint.target = tg; G.hint.str = appr(G.hint.str, str, 3, dt);
+  for (const k of ['drum', 'xylo', 'bell']) IA[k].bob = (k === tg) ? Math.abs(Math.sin(G.t * 4.2)) * 8 * G.hint.str : appr(IA[k].bob, 0, 6, dt);
+  const h = G.hand;
+  if (h.t >= 0) { h.t += dt; if (h.t > 2.6) h.t = -1; }
+  else if (!quiet) {
+    if (!G.anyTap && idle > 4.2 && (!h.shown0 || idle - h.last0 > 10)) { h.shown0 = true; h.last0 = idle; h.t = 0; h.target = tg; }
+    else if (G.anyTap && idle > 18 && !h.shownIdle) { h.shownIdle = true; h.t = 0; h.target = tg; }
+  }
+}
+function updInst(dt) {
+  const d = IA.drum;
+  d.dv += (-(d.dent - 0.3) * 260 - 10 * d.dv) * dt; d.dent += d.dv * dt;
+  d.sq = appr(d.sq, 0, 8, dt); d.wig = appr(d.wig, 0, 5, dt);
+  const x = IA.xylo;
+  for (let i = 0; i < 6; i++) {
+    if (x.d[i] > 0) { x.d[i] -= dt; if (x.d[i] <= 0) { x.d[i] = 0; x.v[i] = 1; } }
+    else x.v[i] *= Math.exp(-4 * dt);
+  }
+  x.wig = appr(x.wig, 0, 5, dt);
+  const b = IA.bell;
+  b.av += (-b.ang * 60 - 2.2 * b.av) * dt; b.ang += b.av * dt;
+  b.cv += (-(b.clap + b.ang * 1.6) * 90 - 4 * b.cv) * dt; b.clap += b.cv * dt;
+  b.wig = appr(b.wig, 0, 5, dt);
+  const m = G.mb;
+  m.lid = appr(m.lid, (m.play || m.ready > 0) ? 0.55 : 0, 4, dt);
+  m.wig = appr(m.wig, 0, 5, dt);
+  if (m.ready > 0 && G.t - m.readyT > 25) m.ready = 0;
+  if (m.play && Math.random() < dt * 3) note(MBOX.x + rand(-12, 12), MBOX.y - 24, 'gold');
+}
+
+/* ============================================================
+   サイクル（毎回少しずつ違う舞台）
+   ============================================================ */
+function newCycle(first) {
+  if (!first) G.cycle++;
+  setRegistration();
+  const cols = ['red', 'teal', 'pink', 'plum'].filter(c => c !== G.ribbonCol);
+  G.ribbonCol = pick(cols);
+  G.stepCols = STEP_COLS.map((c, i) => i % 3 === (G.cycle % 3) ? pick(['red', 'teal', 'yellow', 'pink']) : c);
+  makeProps();
+  const qs = ['shy', 'bouncy', 'spinny'].sort(() => Math.random() - 0.5);
+  mice.length = 0;
+  mice.push(makeMouse(0, 'curtain', qs[0], pick(['yellow', 'pink', 'teal'])));
+  mice.push(makeMouse(1, 'door', qs[1], pick(['yellow', 'pink', 'teal'])));
+  G.found = {}; G.phase = 'indoor'; G.trans = 0; G.tt = 0;
+  ROOF.o = 0; ROOF.to = 0; ROOF.peek = 0; ROOF.pv = 0;
+  ST.n = 2;
+  for (let i = 0; i < STEP_MAX; i++) { ST.grow[i] = i < 2 ? 1 : 0; ST.jig[i] = 0; ST.jv[i] = 0; }
+  ST.bounce = ST.bv = ST.ghost = ST.gv = 0;
+  DOOR.o = DOOR.to = 0;
+  R.mode = 'rolled'; R.x = R.tx = rand(168, 236); R.len = 0; R.lenT = 0; R.coil = 1; R.prop = -1; R.tie = -1;
+  ropeB = null; ropeMid = null;
+  SP.A = SP.V = 0; SP.charge = 0; SP.pending = 0;
+  B.ang = 0; B.om = 0.3; B.L = 0; B.Lt = 0; B.lampT = 0; B.lamp = 0; B.bounce = B.bv = 0; B.orbit = 0;
+  for (let k = 0; k < 12; k++) B.grow[k] = 0;
+  cat.act = null; cat.queue.length = 0; cat.sup = { t: 'floor' }; cat.x = 262; cat.y = FLOOR;
+  cat.spin = 0; cat.rot = 0; cat.anchor = -30; cat.ground = 1; cat.sw = null; cat.idleT = 0; cat.climbNow = false;
+  G.catPref = Math.random(); G.style = (Math.random() * 4) | 0;
+  G.finale = null; G.ballSucc = 0; G.rec = null; G.replay = null; G.lastRollT = -99; G.roofCool = 0; G.lampAt = 0;
+  G.lastInputT = G.t;
+  if (!first) {
+    buildBackgrounds();
+    if (G.fav.indoor) { G.mb.ready = 1; G.mb.readyT = G.t; cat.lookAt = { x: MBOX.x, y: MBOX.y }; cat.lookT = 3; }
+  }
+}
+
+/* ============================================================
+   更新と描画
+   ============================================================ */
+function update(dt) {
+  G.t += dt;
+  SP.V += (-300 * SP.A - 11 * SP.V) * dt; SP.A += SP.V * dt;
+  for (let i = 0; i < STEP_MAX; i++) {
+    ST.grow[i] = i < ST.n ? Math.min(1, ST.grow[i] + dt * 2.4) : Math.max(0, ST.grow[i] - dt * 3);
+    ST.jv[i] += (-420 * ST.jig[i] - 12 * ST.jv[i]) * dt; ST.jig[i] += ST.jv[i] * dt;
+  }
+  ST.bv += (-150 * ST.bounce - 5 * ST.bv) * dt; ST.bounce += ST.bv * dt;
+  ST.gv += (-70 * ST.ghost - 6 * ST.gv) * dt; ST.ghost += ST.gv * dt;
+  if (ST.ghost < 0) { ST.ghost = 0; if (ST.gv < 0) ST.gv = 0; }
+  DOOR.o = appr(DOOR.o, DOOR.to, 4, dt); DOOR.rattle = appr(DOOR.rattle, 0, 3, dt); DOOR.glint = appr(DOOR.glint, 0, 1.5, dt);
+  if (ST.n >= 5 && !DOOR.to && Math.random() < dt * 0.25) DOOR.glint = 1;
+  ROOF.pv += (-90 * ROOF.peek - 7 * ROOF.pv) * dt; ROOF.peek += ROOF.pv * dt;
+  G.curtainV += (-40 * G.curtainSway - 4 * G.curtainV) * dt; G.curtainSway += G.curtainV * dt;
+  updProps(dt);
+  catUpdate(dt);
+  updRibbon(dt);
+  for (const m of mices()) updMouse(m, dt);
+  updBall(dt);
+  updTransform(dt);
+  updFinale(dt);
+  updCurtain(dt);
+  updReplay();
+  updAct();
+  if (G.phase === 'ball' && !G.finale && G.found.d6 && G.ballSucc >= 40 && ['d6b', 'whirl', 'orbit', 'star', 'sweep', 'shadowhop'].filter(k => G.found[k]).length >= 5 && G.t - G.lastInputT > 2.5 && catRestful() && G.curtain.dir === 0 && !G.replay) startFinale();
+  updHint(dt);
+  updInst(dt);
+  updParticles(dt);
+}
+function mices() { return mice.slice(); }
+function render() {
+  X = ctx;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  const tr = G.trans;
+  if (tr < 0.999) ctx.drawImage(bgIndoor, 0, 0);
+  if (tr > 0.001) { ctx.globalAlpha = tr; ctx.drawImage(bgBall, 0, 0); ctx.globalAlpha = 1; }
+  ctx.setTransform(DPR * S, 0, 0, DPR * S, DPR * S * BX, DPR * S * BY);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const ia = 1 - tr;
+  if (ia > 0.001) {
+    ctx.globalAlpha = ia;
+    drawDoor();
+    for (const m of mice) if (m.home === 'door' && m.st === 'hidden' && DOOR.o > 0.05) {
+      ctx.save(); bp(); pr(576, stepTop(4).y - 60, 24, 60); ctx.clip(); drawMouse(m); ctx.restore();
+    }
+    drawSpool(); drawPeg(); drawStairs();
+    if (R.mode !== 'rolled' && R.mode !== 'ball') drawRibbon(G.ribbonCol, 7, ia);
+    drawDeck();
+    for (const m of mice) if (m.home === 'curtain' && (m.st === 'hidden' || m.st === 'peek') && !m.hop) drawMouse(m);
+    drawInnerCurtain();
+    drawProps();
+    ctx.globalAlpha = 1;
+  }
+  drawRoof();
+  if (tr > 0.001) {
+    ctx.globalAlpha = tr;
+    drawDisc();
+    const hx = cat.headX, hy = cat.headY;
+    drawShadows();
+    cat.headX = hx; cat.headY = hy;
+    drawRStair(); drawLamp();
+    ctx.globalAlpha = 1;
+  }
+  const chars = [];
+  for (const m of mice) {
+    if (m.hop || m.st === 'come' || m.st === 'joined' || m.st === 'disc' || m.st === 'skydrop') chars.push(m);
+    else if (m.home === 'door' && m.st === 'peek') chars.push(m);
+  }
+  chars.push(cat);
+  chars.sort((a, b) => a.y - b.y);
+  for (const c of chars) { if (c === cat) drawCat(cat); else drawMouse(c); }
+  if (G.audienceT >= 0) drawAudience();
+  drawMBox();
+  drawInstruments();
+  drawParticles();
+  drawHand();
+  drawFrontCurtain();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'multiply'; ctx.globalAlpha = 0.6;
+  ctx.fillStyle = grainPat; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+}
+
+/* ============================================================
+   入力（Pointer Events・マルチタッチ）
+   ============================================================ */
+function firstNudge() {
+  if (cat.sup.t === 'floor' && catFree()) setAct(aJump({ to: () => ({ x: cat.x, y: floorY(cat.x) }), sup: { t: 'floor' }, ph: 40, dur: 0.42, pose: 'star', crouch: 0.03 }));
+  cat.lookAt = { x: INST.drum.x, y: INST.drum.y }; cat.lookT = 2;
+  IA.drum.wig = 1; SND.mew();
+  G.hand.t = 0; G.hand.target = 'drum';
+}
+function bgTap(p) {
+  ring(p.x, p.y, 6, 'navy', 0.5, 70); SND.tiny();
+  if (G.phase === 'indoor' && p.x < 72 && p.y > 100 && p.y < 580) { G.curtainV += 3; }
+  for (const pr0 of props) if (!pr0.tied && Math.hypot(p.x - pr0.x, p.y - propY(pr0)) < 34) { pr0.hv = 120; pr0.wig = 1; }
+  for (const m of mice) if (Math.hypot(p.x - m.x, p.y - (m.y - 18)) < 34 && !m.jump && !m.hop && (m.st === 'joined' || m.st === 'disc')) { m.jump = { t: 0, h: 20, dur: 0.3, spin: 0 }; SND.squeak(); }
+  if (!DOOR.to && G.phase === 'indoor' && p.x > 560 && Math.abs(p.y - (stepTop(4).y - 30)) < 40) DOOR.rattle = 1;
+  if (Math.hypot(p.x - cat.x, p.y - (cat.y - 45)) < 56) {
+    SND.mew(); cat.blink = 0.25; cat.mood = 1;
+    if (catFree() && ['floor', 'step', 'disc', 'rstair'].includes(cat.sup.t)) { setAct(aPose('releve', 0.6)); cat.queue = [aPose('clap', 0.5)]; }
+  }
+}
+function tap(p) {
+  const hit = (I) => { const dx = p.x - I.x, dy = (p.y - I.y + 8) / 0.95; return dx * dx + dy * dy < I.r * I.r; };
+  for (const k of ['drum', 'xylo', 'bell']) if (hit(INST[k])) { play(k, false); return; }
+  if (Math.hypot(p.x - MBOX.x, p.y - MBOX.y) < MBOX.r) {
+    if (!G.firstTapDone) { G.firstTapDone = true; firstNudge(); }
+    startEncore(); return;
+  }
+  if (!G.firstTapDone) { G.firstTapDone = true; firstNudge(); }
+  bgTap(p);
+}
+const ptrs = new Map();
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  audioStart();
+  const p = toBox(e.clientX, e.clientY);
+  ptrs.set(e.pointerId, p);
+  G.finger = { x: p.x, y: p.y, t: G.t };
+  tap(p);
+}, { passive: false });
+cv.addEventListener('pointermove', e => {
+  if (!ptrs.has(e.pointerId)) return;
+  const p = toBox(e.clientX, e.clientY);
+  ptrs.set(e.pointerId, p); G.finger = { x: p.x, y: p.y, t: G.t };
+}, { passive: true });
+const endPtr = e => { ptrs.delete(e.pointerId); };
+cv.addEventListener('pointerup', e => { endPtr(e); audioStart(); });
+cv.addEventListener('pointercancel', endPtr);
+cv.addEventListener('pointerleave', endPtr);
+const stop = e => { if (e.cancelable) e.preventDefault(); };
+document.addEventListener('touchstart', stop, { passive: false });
+document.addEventListener('touchmove', stop, { passive: false });
+document.addEventListener('touchend', e => { stop(e); audioStart(); }, { passive: false });
+document.addEventListener('gesturestart', stop, { passive: false });
+document.addEventListener('gesturechange', stop, { passive: false });
+document.addEventListener('dblclick', stop, { passive: false });
+document.addEventListener('contextmenu', stop);
+document.addEventListener('selectstart', stop);
+document.addEventListener('wheel', stop, { passive: false });
+
+/* ============================================================
+   ループ（requestAnimationFrame のみ・非表示で停止）
+   ============================================================ */
+const ERR = [];
+let last = performance.now(), running = true, raf = 0, speed = 1, relayoutT = 0;
+function frame(now) {
+  raf = 0;
+  if (!running) return;
+  let dt = clamp((now - last) / 1000, 0, 0.05);
+  last = now;
+  try {
+    if (relayoutT && now >= relayoutT) { relayoutT = 0; layout(); }
+    const sp = Math.max(1, speed | 0);
+    for (let i = 0; i < sp; i++) update(dt);
+    render();
+  } catch (err) {
+    if (ERR.length < 20) ERR.push(String(err && err.stack || err));
+  }
+  raf = requestAnimationFrame(frame);
+}
+function requestRelayout() { relayoutT = performance.now() + 120; if (!raf && running) raf = requestAnimationFrame(frame); }
+window.addEventListener('resize', requestRelayout);
+window.addEventListener('orientationchange', requestRelayout);
+if (window.visualViewport) window.visualViewport.addEventListener('resize', requestRelayout);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    running = false;
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    try { if (AU.c && AU.c.state === 'running') { const pr2 = AU.c.suspend(); if (pr2 && pr2.catch) pr2.catch(() => { }); } } catch (e) { /* 無視 */ }
+  } else {
+    running = true; last = performance.now();
+    try { if (AU.c) { const pr2 = AU.c.resume(); if (pr2 && pr2.catch) pr2.catch(() => { }); } } catch (e) { /* 無視 */ }
+    if (!raf) raf = requestAnimationFrame(frame);
+  }
+});
+window.addEventListener('pageshow', () => { if (!document.hidden && !raf) { running = true; last = performance.now(); raf = requestAnimationFrame(frame); } });
+
+/* 検証用の窓口（画面には何も表示しない） */
+window.__kb = {
+  G, ST, R, B, SP, DOOR, ROOF, cat, mice, props, INST, MBOX, ERR,
+  get speed() { return speed; }, set speed(v) { speed = v; },
+  tapBox(x, y) { const p = { x, y }; G.finger = { x, y, t: G.t }; tap(p); },
+  toScreen(x, y) { return { x: (x + BX) * S, y: (y + BY) * S }; },
+  play(k) { play(k, false); },
+  snapshot, P,
+  info() { return { phase: G.phase, n: ST.n, door: DOOR.to, ribbon: R.mode, cat: cat.sup.t + (cat.sup.i != null ? cat.sup.i : '') + (cat.sup.k != null ? cat.sup.k : ''), act: cat.act ? cat.act.kind : null, mice: mice.map(m => m.st), found: Object.keys(G.found), fav: !!G.fav.indoor, favBall: !!G.fav.ball, mb: G.mb.ready, cycle: G.cycle, particles: P.length, lamp: B.lampT, L: B.Lt, ballSucc: G.ballSucc, hint: G.hint.target }; }
+};
+window.__kbLog = [];
+
+layout();
+newCycle(true);
+raf = requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
